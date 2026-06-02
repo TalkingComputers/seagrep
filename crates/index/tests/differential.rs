@@ -1,5 +1,5 @@
 use holys3_core::{scan_matching_docs, Corpus, DocId};
-use holys3_index::{search_matching_docs, Index};
+use holys3_index::{build_to_dir, search_matching_docs, IndexReader};
 use std::collections::BTreeSet;
 
 struct MemCorpus(Vec<(DocId, String)>, Vec<Vec<u8>>);
@@ -7,6 +7,7 @@ impl Corpus for MemCorpus {
     fn docs(&self) -> &[(DocId, String)] {
         &self.0
     }
+
     fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
         Ok(self.1[id as usize].clone())
     }
@@ -31,20 +32,22 @@ fn corpus() -> MemCorpus {
 #[test]
 fn index_equals_scan_for_many_patterns() {
     let c = corpus();
-    let idx = Index::build(&c).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    build_to_dir(&c, dir.path()).unwrap();
+    let reader = IndexReader::open(dir.path()).unwrap();
     let patterns = [
-        "world",          // selective literal
-        "handleClick",    // long literal
-        "quick.*fox",     // literal + wildcard
-        "EMAIL",          // uppercase literal
-        r"\w+@\w+",       // no usable literal -> QAll path
-        ".*",             // QAll
-        "zzzznotpresent", // selective, zero matches
-        "ab",             // short literal -> QAll
-        "second line",    // literal with space
+        "world",
+        "handleClick",
+        "quick.*fox",
+        "EMAIL",
+        r"\w+@\w+",
+        ".*",
+        "zzzznotpresent",
+        "ab",
+        "second line",
     ];
     for p in patterns {
-        let indexed: BTreeSet<DocId> = search_matching_docs(&idx, &c, p).unwrap();
+        let indexed: BTreeSet<DocId> = search_matching_docs(&reader, &c, p).unwrap();
         let re = regex::bytes::Regex::new(p).unwrap();
         let oracle = scan_matching_docs(&c, &re).unwrap();
         assert_eq!(indexed, oracle, "pattern `{p}`: index != scan");

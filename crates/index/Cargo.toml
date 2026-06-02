@@ -10,3 +10,8 @@ anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
 regex.workspace = true
+fst = "0.4.7"
+memmap2 = "0.9.10"
+
+[dev-dependencies]
+tempfile = "3.27.0"
