@@ -308,7 +308,6 @@ pub fn is_index_key(prefix: &str, key: &str) -> bool {
 pub struct S3Corpus {
     client: S3Client,
     bucket: String,
-    objects: Vec<ObjectMeta>,
     docs: Vec<(DocId, String)>,
     rt: tokio::runtime::Handle,
 }
@@ -328,7 +327,20 @@ impl S3Corpus {
         S3Corpus {
             client,
             bucket,
-            objects,
+            docs,
+            rt,
+        }
+    }
+
+    pub fn from_docs(
+        client: S3Client,
+        bucket: String,
+        docs: Vec<(DocId, String)>,
+        rt: tokio::runtime::Handle,
+    ) -> S3Corpus {
+        S3Corpus {
+            client,
+            bucket,
             docs,
             rt,
         }
@@ -341,7 +353,7 @@ impl Corpus for S3Corpus {
     }
 
     fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
-        let key = self.objects[id as usize].key.clone();
+        let key = self.docs[id as usize].1.clone();
         tokio::task::block_in_place(|| self.rt.block_on(self.client.get(&self.bucket, &key, None)))
     }
 }
