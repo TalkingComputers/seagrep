@@ -34,7 +34,7 @@ enum Cmd {
         #[arg(long)]
         files_only: bool,
     },
-    /// Report distinct trigrams + term-dict bytes (resolves spec section 5 A/B).
+    /// Report distinct grams + term-dict bytes (resolves spec section 5 A/B).
     Stats {
         #[arg(long, default_value = "holys3.idx")]
         index: PathBuf,
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         Cmd::Stats { index } => {
             let idx = Index::load(&index)?;
             let s = idx.stats();
-            println!("distinct_trigrams={}", s.distinct_trigrams);
+            println!("distinct_grams={}", s.distinct_grams);
             println!("termdict_bytes_estimate={}", s.termdict_bytes_estimate);
             println!("total_postings={}", s.total_postings);
             Ok(())
