@@ -1,7 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{matches_in, Corpus, Strategy};
-use holys3_index::{build_to_dir, IndexReader, LocalCorpus};
+use holys3_index::{
+    build_to_dir, build_to_store, compute_build_id, IndexReader, LocalCorpus, StoreIndexReader,
+};
+use holys3_s3::{build_index_namespace, is_index_key, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
+use holys3_sigv4::resolve;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -21,9 +25,11 @@ enum Cmd {
         bucket: Option<String>,
         #[arg(long, default_value = "")]
         prefix: String,
+        #[arg(long)]
+        region: Option<String>,
         #[arg(long, default_value = "holys3.idxdir")]
         out: PathBuf,
-        #[arg(long, value_enum, default_value = "sparse")]
+        #[arg(long, value_enum, default_value = "trigram")]
         strategy: StrategyArg,
     },
     /// Search a pattern using a prebuilt index.
@@ -31,6 +37,12 @@ enum Cmd {
         pattern: String,
         #[arg(long)]
         local_dir: Option<PathBuf>,
+        #[arg(long)]
+        bucket: Option<String>,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long)]
+        region: Option<String>,
         #[arg(long, default_value = "holys3.idxdir")]
         index: PathBuf,
         #[arg(long)]
@@ -64,6 +76,36 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
     build_to_dir(&corpus, out, strategy)?;
     eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
+    Ok(())
+}
+
+async fn build_s3(
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    strategy: Strategy,
+) -> Result<()> {
+    let prefix = build_prefix(&prefix);
+    let region = read_region(region)?;
+    let creds = resolve("default")?;
+    let client = S3Client::new(region, creds);
+    let objects = select_user_objects(client.list(&bucket, &prefix).await?, &prefix);
+    let object_ids = objects
+        .iter()
+        .map(|object| (object.key.clone(), object.etag.clone()))
+        .collect::<Vec<_>>();
+    let build_id = compute_build_id(&object_ids);
+    let rt = tokio::runtime::Handle::current();
+    let corpus = S3Corpus::new(client.clone(), bucket.clone(), objects, rt.clone());
+    let store = S3BlobStore::new(client, bucket.clone(), prefix.clone(), rt);
+    build_to_store(&corpus, &store, strategy, &build_id)?;
+    eprintln!(
+        "indexed {} docs -> s3://{}/{}/builds/{}",
+        corpus.docs().len(),
+        bucket,
+        build_index_namespace(&prefix),
+        build_id
+    );
     Ok(())
 }
 
@@ -103,7 +145,90 @@ fn search_local(
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn build_prefix(prefix: &str) -> String {
+    prefix
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn read_region(region: Option<String>) -> Result<String> {
+    match region {
+        Some(region) => Ok(region),
+        None => Ok(std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")?),
+    }
+}
+
+fn select_user_objects(objects: Vec<ObjectMeta>, prefix: &str) -> Vec<ObjectMeta> {
+    objects
+        .into_iter()
+        .filter(|object| !is_index_key(prefix, &object.key))
+        .collect()
+}
+
+fn build_cache_dir(bucket: &str, prefix: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::from(std::env::var("HOME")?);
+    path.push(".cache");
+    path.push("holys3");
+    path.push(bucket);
+    let prefix = prefix.replace('/', "__");
+    if !prefix.is_empty() {
+        path.push(prefix);
+    }
+    Ok(path)
+}
+
+fn search_s3(
+    pattern: &str,
+    bucket: String,
+    prefix: String,
+    region: Option<String>,
+    files_only: bool,
+    stats: bool,
+) -> Result<()> {
+    let prefix = build_prefix(&prefix);
+    let region = read_region(region)?;
+    let creds = resolve("default")?;
+    let client = S3Client::new(region, creds);
+    let rt = tokio::runtime::Handle::current();
+    let store = S3BlobStore::new(client.clone(), bucket.clone(), prefix.clone(), rt.clone());
+    let cache_dir = build_cache_dir(&bucket, &prefix)?;
+    let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
+    let q = holys3_query::plan(pattern, reader.strategy())?;
+    let re = regex::bytes::Regex::new(pattern)?;
+    let candidates = reader.candidates(&q)?;
+    if stats {
+        let index_stats = reader.stats();
+        eprintln!(
+            "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
+            candidates.len(),
+            reader.docs().len(),
+            reader.strategy(),
+            index_stats.distinct_grams,
+            index_stats.terms_fst_bytes,
+            index_stats.postings_bytes
+        );
+    }
+    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt);
+    for id in candidates {
+        let bytes = corpus.fetch(id)?;
+        let key = &corpus.docs()[id as usize].1;
+        if files_only {
+            if re.is_match(&bytes) {
+                println!("{key}");
+            }
+        } else {
+            for matched in matches_in(id, &bytes, &re) {
+                println!("{key}:{}:{}:{}", matched.line, matched.col, matched.text);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Index {
             local_dir: Some(dir),
@@ -112,10 +237,12 @@ fn main() -> Result<()> {
             ..
         } => build_local(&dir, &out, strategy.into()),
         Cmd::Index {
-            bucket: Some(_), ..
-        } => {
-            anyhow::bail!("S3 indexing is wired via holys3-s3::S3Corpus; enable in Stage 1 follow-up with creds")
-        }
+            bucket: Some(bucket),
+            prefix,
+            region,
+            strategy,
+            ..
+        } => build_s3(bucket, prefix, region, strategy.into()).await,
         Cmd::Index { .. } => anyhow::bail!("provide --local-dir or --bucket"),
         Cmd::Search {
             pattern,
@@ -123,10 +250,18 @@ fn main() -> Result<()> {
             index,
             files_only,
             stats,
+            ..
         } => search_local(&pattern, &dir, &index, files_only, stats),
-        Cmd::Search { .. } => {
-            anyhow::bail!("provide --local-dir (S3 search is a Stage 1 follow-up)")
-        }
+        Cmd::Search {
+            pattern,
+            bucket: Some(bucket),
+            prefix,
+            region,
+            files_only,
+            stats,
+            ..
+        } => search_s3(&pattern, bucket, prefix, region, files_only, stats),
+        Cmd::Search { .. } => anyhow::bail!("provide --local-dir or --bucket"),
         Cmd::Stats { index } => {
             let reader = IndexReader::open(&index)?;
             let s = reader.stats();
