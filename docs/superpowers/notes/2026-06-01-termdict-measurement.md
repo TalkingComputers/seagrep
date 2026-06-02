@@ -106,3 +106,55 @@ stage2_sparse_target_index_size = 88615500 * 153.606 = 13611872514 bytes = 12.68
 For reference, a 2 GiB bucket extrapolates to about `2452125390` bytes = `2338.53` MiB for the Stage 2 sparse term dict.
 
 Section 5 Option B still holds. The measured sparse term dict is larger than the Stage 1 trigram term dict and extrapolates far beyond a few hundred MB at both 2 GiB and 10 GiB bucket sizes, so the dict should stay in S3 via the FST blueprint rather than being fetched eagerly into memory.
+
+## Stage 3a measured FST term dictionary
+
+Re-ran against the same corpus path with on-disk FST term dict keyed by sparse gram bytes:
+
+```bash
+cargo run --release -p holys3 -- index --local-dir /Users/parsabahraminejad/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.41.0 --out /tmp/fst.idxdir
+cargo run --release -p holys3 -- stats --index /tmp/fst.idxdir
+ls -l /tmp/fst.idxdir
+```
+
+```text
+indexed 1959 docs -> /tmp/fst.idxdir
+real 30.72
+user 27.49
+sys 1.11
+distinct_grams=4988667
+terms_fst_bytes=192783815
+postings_bytes=93793736
+total 560328
+-rw-r--r--@ 1 parsabahraminejad  wheel     305413 Jun  2 04:49 manifest.bin
+-rw-r--r--@ 1 parsabahraminejad  wheel   93793736 Jun  2 04:49 postings.bin
+-rw-r--r--@ 1 parsabahraminejad  wheel  192783815 Jun  2 04:49 terms.fst
+```
+
+- Distinct sparse grams: `4988667`
+- Stage 2 flat term-dict estimate: `4988667 * 16 = 79818672` bytes = `76.12` MiB
+- Stage 3a compressed FST term dict: `192783815` bytes = `183.85` MiB
+- Postings file: `93793736` bytes = `89.45` MiB
+- Manifest file: `305413` bytes = `0.29` MiB
+- Total index files: `286882964` bytes = `273.59` MiB
+
+Compared to the Stage 2 flat estimate:
+
+```text
+fst_over_flat = 192783815 / 79818672 = 2.42x
+flat_over_fst = 79818672 / 192783815 = 0.41x
+```
+
+The measured FST is not smaller than the 16-byte flat estimate for this corpus; it is `2.42x` larger. The 16-byte estimate stored fixed-size hashed gram keys, while Stage 3a stores exact byte grams in the FST and eliminates hash-collision false positives.
+
+## Stage 3a 10 GiB extrapolation
+
+```text
+target_bytes = 10 * 1024^3 = 10737418240
+scale = 10737418240 / 69902336 = 153.606
+stage3a_fst_target_termdict = 192783815 * 153.606 = 29612750732 bytes = 28240.92 MiB = 27.58 GiB
+stage3a_postings_target = 93793736 * 153.606 = 14407280634 bytes = 13739.85 MiB = 13.42 GiB
+stage3a_total_index_target = 286882964 * 153.606 = 44066944635 bytes = 42025.51 MiB = 41.04 GiB
+```
+
+For this measured corpus, the Stage 3a compressed FST term dictionary does not make the in-S3 dict comfortably affordable. The FST removes hash collisions and supports mmap lookup, but its measured byte-key dictionary is larger than the Stage 2 flat hash-key estimate and extrapolates poorly at 10 GiB.
