@@ -2,6 +2,7 @@ use holys3_core::{trigrams, Corpus, DocId};
 use holys3_query::Query;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Index {
@@ -78,6 +79,63 @@ impl Index {
             total_postings: self.postings.values().map(|v| v.len()).sum(),
         }
     }
+}
+
+/// Corpus backed by all UTF-8-ish files under a directory (recursive).
+pub struct LocalCorpus {
+    docs: Vec<(DocId, String)>,
+    paths: Vec<PathBuf>,
+}
+
+impl LocalCorpus {
+    pub fn new(root: &std::path::Path) -> anyhow::Result<LocalCorpus> {
+        let mut paths = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            for entry in std::fs::read_dir(&p)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort(); // deterministic doc ids
+        let docs = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i as DocId, p.to_string_lossy().into_owned()))
+            .collect();
+        Ok(LocalCorpus { docs, paths })
+    }
+}
+
+impl Corpus for LocalCorpus {
+    fn docs(&self) -> &[(DocId, String)] {
+        &self.docs
+    }
+    fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
+        Ok(std::fs::read(&self.paths[id as usize])?)
+    }
+}
+
+/// Full indexed search: plan -> candidates -> fetch -> verify. Returns matching doc ids.
+pub fn search_matching_docs(
+    idx: &Index,
+    corpus: &dyn Corpus,
+    pattern: &str,
+) -> anyhow::Result<BTreeSet<DocId>> {
+    let q = holys3_query::plan(pattern)?;
+    let re = regex::bytes::Regex::new(pattern)?;
+    let mut hits = BTreeSet::new();
+    for id in idx.candidates(&q) {
+        let bytes = corpus.fetch(id)?;
+        if re.is_match(&bytes) {
+            hits.insert(id);
+        }
+    }
+    Ok(hits)
 }
 
 #[derive(Debug)]

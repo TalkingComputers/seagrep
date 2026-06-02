@@ -9,3 +9,4 @@ holys3-query = { path = "../query" }
 anyhow.workspace = true
 serde.workspace = true
 postcard.workspace = true
+regex.workspace = true
