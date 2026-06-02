@@ -75,6 +75,10 @@ holys3-cli       index / search / plan entrypoints, cost guardrail, output forma
 
 ## 5. Index storage (in S3 + hot footer)
 
+### Gram representation for the S3 dict — RESOLVED (2026-06-02 bake-off): TRIGRAM, not sparse
+
+> The dict-in-S3 model inverts Cursor's on-device tradeoff: dict **size** is the dominant cost, not query-lookup count. Bake-off (`docs/superpowers/notes/2026-06-02-dict-bakeoff.md`) on a 9.8 MB normal corpus: trigram `terms.fst` = **93 KB** (→ ~97 MiB at 10 GiB bucket, cacheable) vs sparse = **20.4 MB** (→ ~20.8 GiB, not cacheable) — **219× bigger** — while selectivity was **near-identical** on real (≥3-char) literals. So holys3's S3 term dict uses **trigram** grams. Sparse stays in the codebase (the `Strategy` enum, fully differential-tested) for a possible future on-device mode, but is NOT the S3 dict. This supersedes the earlier "sparse" assumption below.
+
 ### Term-dictionary storage — RESOLVED (Stage 1 measurement): Option B (FST blueprint, dict in S3)
 
 > Decided 2026-06-02 from a real measurement (`docs/superpowers/notes/2026-06-01-termdict-measurement.md`): indexing a 67 MB corpus gave 243,823 trigrams / 3.72 MiB term-dict; extrapolated to a 10 GiB bucket the trigram dict is ~571 MiB and the **sparse dict ~1.1 GB** — too large for a cheap "download-once, cache locally" full dict. Stages 2–3 therefore use **Option B**: an FST term dict kept in S3 with a small (~MB) blueprint in the footer, fetched by ranged GET. Original analysis retained below.
