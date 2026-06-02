@@ -29,19 +29,16 @@ pub fn pair_weight(a: u8, b: u8) -> u32 {
     rapidhash::v3::rapidhash_v3(&[a, b]) as u32
 }
 
-/// build_all — every sparse n-gram: substring data[i..=j+1] whose boundary
-/// pair-weights at positions i and j both strictly exceed every interior
-/// pair-weight. Index-time. Returns sorted, deduped (hash, gram_len).
-pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
+/// build_all as raw gram byte strings (sorted, deduped). Index-time.
+pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
     if data.len() < 2 {
-        return Vec::new();
+        return out;
     }
     let weights: Vec<u32> = data.windows(2).map(|w| pair_weight(w[0], w[1])).collect();
     let n = weights.len();
-    let mut ngrams = Vec::new();
     for i in 0..n {
-        let gram = &data[i..i + 2];
-        ngrams.push((hash_ngram(gram), gram.len()));
+        out.push(data[i..i + 2].to_vec());
         let mut interior_max: u32 = 0;
         for j in (i + 1)..n {
             if j > i + 1 {
@@ -53,34 +50,30 @@ pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
             if weights[j] > interior_max {
                 let end = j + 2;
                 if end <= data.len() {
-                    let gram = &data[i..end];
-                    ngrams.push((hash_ngram(gram), gram.len()));
+                    out.push(data[i..end].to_vec());
                 }
             }
         }
     }
-    ngrams.sort_unstable();
-    ngrams.dedup();
-    ngrams
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
-/// build_covering — minimal covering set via monotone-stack partitioning.
-/// Query-time. covering(L) ⊆ all(F) whenever L is a substring of F.
-pub fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
+/// build_covering as raw gram byte strings (sorted, deduped). Query-time.
+pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
     if data.len() < 2 {
-        return Vec::new();
+        return out;
     }
     let weights: Vec<u32> = data.windows(2).map(|w| pair_weight(w[0], w[1])).collect();
-    let mut ngrams = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     for i in 0..weights.len() {
         while let Some(&top) = stack.last() {
             if weights[top] <= weights[i] {
-                let start = top;
                 let end = i + 2;
                 if end <= data.len() {
-                    let gram = &data[start..end];
-                    ngrams.push((hash_ngram(gram), gram.len()));
+                    out.push(data[top..end].to_vec());
                 }
                 if weights[top] == weights[i] {
                     stack.pop();
@@ -98,21 +91,38 @@ pub fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
         if let Some(&prev) = stack.last() {
             let end = top + 2;
             if end <= data.len() {
-                let gram = &data[prev..end];
-                ngrams.push((hash_ngram(gram), gram.len()));
+                out.push(data[prev..end].to_vec());
             }
         }
     }
     if let Some(&pos) = stack.last() {
         let end = pos + 2;
         if end <= data.len() {
-            let gram = &data[pos..end];
-            ngrams.push((hash_ngram(gram), gram.len()));
+            out.push(data[pos..end].to_vec());
         }
     }
-    ngrams.sort_unstable();
-    ngrams.dedup();
-    ngrams
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// build_all — every sparse n-gram: substring data[i..=j+1] whose boundary
+/// pair-weights at positions i and j both strictly exceed every interior
+/// pair-weight. Index-time. Returns sorted, deduped (hash, gram_len).
+pub fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
+    sparse_grams_all_bytes(data)
+        .iter()
+        .map(|g| (hash_ngram(g), g.len()))
+        .collect()
+}
+
+/// build_covering — minimal covering set via monotone-stack partitioning.
+/// Query-time. covering(L) ⊆ all(F) whenever L is a substring of F.
+pub fn extract_sparse_ngrams_covering(data: &[u8]) -> Vec<(u64, usize)> {
+    sparse_grams_covering_bytes(data)
+        .iter()
+        .map(|g| (hash_ngram(g), g.len()))
+        .collect()
 }
 
 /// A source of documents. Implemented by a local dir (tests) and S3 (prod).
@@ -240,6 +250,18 @@ mod sparse_tests {
         assert!(
             missing.is_empty(),
             "covering(pattern) must be subset of all(content); missing: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn covering_bytes_subset_of_all_bytes() {
+        let pattern = b"MODIFIED_CONSTANT";
+        let content = b"fn main() {\n let x = MODIFIED_CONSTANT;\n}\n";
+        let all: HashSet<Vec<u8>> = sparse_grams_all_bytes(content).into_iter().collect();
+        let cov: HashSet<Vec<u8>> = sparse_grams_covering_bytes(pattern).into_iter().collect();
+        assert!(
+            cov.is_subset(&all),
+            "covering bytes must be subset of all bytes"
         );
     }
 
