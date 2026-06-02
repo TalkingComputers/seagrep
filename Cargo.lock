@@ -99,6 +99,7 @@ dependencies = [
  "holys3-core",
  "holys3-query",
  "postcard",
+ "regex",
  "serde",
 ]
 
