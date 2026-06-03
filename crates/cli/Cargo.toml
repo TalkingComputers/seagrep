@@ -2,6 +2,7 @@
 name = "holys3"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "holys3"

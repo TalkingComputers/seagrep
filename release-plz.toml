@@ -1,0 +1,14 @@
+# release-plz configuration. https://release-plz.dev/docs/config
+[workspace]
+# All crates share one version and are bumped together.
+release_always = false
+# Keep the changelog in Keep a Changelog style, grouped by Conventional Commit type.
+changelog_update = true
+# crates.io trusted publishing handles auth; no token needed in the manifest.
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[changelog]
+# git-cliff-compatible commit parsers. Conventional Commits -> grouped sections.
+protect_breaking_commits = true
