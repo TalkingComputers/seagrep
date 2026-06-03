@@ -2,6 +2,7 @@
 name = "holys3-query"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 holys3-core = { path = "../core" }

@@ -5,6 +5,7 @@ members = ["crates/core", "crates/query", "crates/index", "crates/sigv4", "crate
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1"

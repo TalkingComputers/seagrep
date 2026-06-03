@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "00 04 * * 1"
+
+# Drop the write-all permissions GitHub grants by default; jobs only need
+# to read code. https://docs.github.com/en/actions/security-guides/automatic-token-authentication
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rust: stable }
+          - { os: macos-latest, rust: stable }
+          - { os: windows-latest, rust: stable }
+          - { os: ubuntu-latest, rust: beta }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --locked --workspace --all-targets
+      # Live S3 integration tests self-skip unless HOLYS3_TEST_BUCKET is set,
+      # so the full workspace test run is safe without cloud credentials.
+      - name: Run tests
+        run: cargo test --locked --workspace
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          MSRV=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "holys3") | .rust_version')
+          echo "version=$MSRV" | tee -a "$GITHUB_OUTPUT"
+      - name: Install Rust (${{ steps.msrv.outputs.version }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check on MSRV
+        run: cargo check --locked --workspace --all-targets
+
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --document-private-items --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate code coverage
+        run: cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # Single required status check to gate merges; depends on every other job.
+  ci-success:
+    name: ci-success
+    if: always()
+    needs: [test, msrv, rustfmt, clippy, docs, deny, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs passed
+        run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
