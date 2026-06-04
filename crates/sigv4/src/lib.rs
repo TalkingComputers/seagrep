@@ -127,6 +127,7 @@ pub fn sign_get(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn sign_get_with_payload_hash(
     creds: &Credentials,
     region: &str,

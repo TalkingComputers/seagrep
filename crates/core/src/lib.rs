@@ -30,7 +30,7 @@ pub fn hash_ngram(gram: &[u8]) -> u64 {
 
 /// Deterministic weight of an adjacent byte pair. Drives sparse-ngram
 /// boundary selection. Only affects selectivity, never correctness.
-pub fn pair_weight(a: u8, b: u8) -> u32 {
+pub(crate) fn pair_weight(a: u8, b: u8) -> u32 {
     rapidhash::v3::rapidhash_v3(&[a, b]) as u32
 }
 
