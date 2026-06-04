@@ -9,11 +9,11 @@ use gen::{
 };
 use holys3_core::{Corpus, DocId, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, IndexReader, LocalCorpus, MmapIndexReader, StoreIndexReader,
+    build_to_dir, build_to_store, search_with_stats, IndexReader, LocalCorpus, MmapIndexReader,
+    StoreIndexReader,
 };
 use holys3_s3::{build_index_namespace, FetchConfig, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
-use regex::bytes::Regex;
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -455,27 +455,13 @@ fn measure_search(
     pattern: &str,
 ) -> Result<SearchMeasurement> {
     let start = Instant::now();
-    let q = holys3_query::plan(pattern, reader.strategy())?;
-    let candidates = reader.candidates(&q)?;
-    let re = Regex::new(pattern)?;
-    let ids = candidates.iter().copied().collect::<Vec<_>>();
-    let mut hits = BTreeSet::new();
-    let mut bytes_fetched = 0u64;
-    for (id, bytes) in corpus.fetch_many(&ids)? {
-        let bytes = bytes?;
-        bytes_fetched = bytes_fetched
-            .checked_add(u64::try_from(bytes.len())?)
-            .context("bytes fetched overflow")?;
-        if re.is_match(&bytes) {
-            hits.insert(id);
-        }
-    }
+    let stats = search_with_stats(reader, corpus, pattern)?;
     Ok(SearchMeasurement {
         elapsed: start.elapsed(),
-        hits,
-        candidates: candidates.len(),
-        total_docs: reader.docs().len(),
-        bytes_fetched,
+        hits: stats.hits,
+        candidates: stats.candidates,
+        total_docs: stats.total_docs,
+        bytes_fetched: u64::try_from(stats.bytes_fetched)?,
     })
 }
 
