@@ -162,6 +162,11 @@ pub trait Corpus {
     fn docs(&self) -> &[(DocId, String)];
     /// Fetch the full bytes of one document.
     fn fetch(&self, id: DocId) -> Result<Vec<u8>>;
+    /// Fetch many docs concurrently. Result order is NOT guaranteed; each item carries its `DocId`.
+    /// Per-item Result so one bad object doesn't abort a large batch. Default = sequential.
+    fn fetch_many(&self, ids: &[DocId]) -> Result<Vec<(DocId, Result<Vec<u8>>)>> {
+        Ok(ids.iter().map(|&id| (id, self.fetch(id))).collect())
+    }
 }
 
 pub trait BlobStore {
