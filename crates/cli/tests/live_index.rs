@@ -1,6 +1,6 @@
 use holys3_core::{Corpus, DocId, Strategy};
 use holys3_index::{build_to_store, compute_build_id, search, StoreIndexReader};
-use holys3_s3::{is_index_key, S3BlobStore, S3Client, S3Corpus};
+use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -27,12 +27,25 @@ async fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     let build_id = compute_build_id(&object_ids);
     let rt = tokio::runtime::Handle::current();
-    let corpus = S3Corpus::new(client.clone(), bucket.clone(), objects, rt.clone());
-    let store = S3BlobStore::new(client.clone(), bucket.clone(), String::new(), rt.clone());
+    let cfg = FetchConfig::default();
+    let corpus = S3Corpus::new(
+        client.clone(),
+        bucket.clone(),
+        objects,
+        rt.clone(),
+        cfg.clone(),
+    )?;
+    let store = S3BlobStore::new(
+        client.clone(),
+        bucket.clone(),
+        String::new(),
+        rt.clone(),
+        cfg.clone(),
+    )?;
     build_to_store(&corpus, &store, Strategy::Trigram, &build_id)?;
     let cache_dir = tempfile::tempdir()?;
     let reader = StoreIndexReader::open(
-        Box::new(S3BlobStore::new(client, bucket, String::new(), rt)),
+        Box::new(S3BlobStore::new(client, bucket, String::new(), rt, cfg)?),
         cache_dir.path(),
     )?;
     assert_hit(&reader, &corpus, "world", "b.txt")?;
