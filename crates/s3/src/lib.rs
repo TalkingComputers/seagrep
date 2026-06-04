@@ -15,10 +15,8 @@ pub use fetch::FetchConfig;
 
 static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
     LazyLock::new(|| {
-        match time::format_description::parse("[year][month][day]T[hour][minute][second]Z") {
-            Ok(format) => format,
-            Err(error) => panic!("invalid amz date format: {error}"),
-        }
+        time::format_description::parse("[year][month][day]T[hour][minute][second]Z")
+            .expect("invalid amz date format")
     });
 
 pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
@@ -228,10 +226,9 @@ impl S3Client {
     /// Timestamp helper: returns (`amz_date`, `date`).
     fn now() -> (String, String) {
         let dt = time::OffsetDateTime::now_utc();
-        let amz = match dt.format(FORMAT.as_slice()) {
-            Ok(amz) => amz,
-            Err(error) => panic!("failed to format amz date: {error}"),
-        };
+        let amz = dt
+            .format(FORMAT.as_slice())
+            .expect("invalid amz date format");
         let date = amz[..8].to_string();
         (amz, date)
     }
