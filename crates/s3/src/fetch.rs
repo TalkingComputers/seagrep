@@ -36,6 +36,7 @@ pub(crate) struct AimdLimiter {
     semaphore: Arc<Semaphore>,
     limit: AtomicUsize,
     cap: usize,
+    pending_shrink: AtomicUsize,
 }
 
 impl AimdLimiter {
@@ -44,11 +45,19 @@ impl AimdLimiter {
             semaphore: Arc::new(Semaphore::new(start)),
             limit: AtomicUsize::new(start),
             cap,
+            pending_shrink: AtomicUsize::new(0),
         }
     }
 
     pub(crate) async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
-        Ok(Arc::clone(&self.semaphore).acquire_owned().await?)
+        loop {
+            let permit = Arc::clone(&self.semaphore).acquire_owned().await?;
+            if self.consume_pending_shrink() {
+                permit.forget();
+                continue;
+            }
+            return Ok(permit);
+        }
     }
 
     pub(crate) fn on_success(&self) {
@@ -79,16 +88,46 @@ impl AimdLimiter {
             {
                 Ok(_) => {
                     let diff = current - next;
-                    if let Ok(diff) = u32::try_from(diff) {
-                        if let Ok(permits) = self.semaphore.try_acquire_many(diff) {
-                            permits.forget();
-                        }
+                    let removed = self.forget_available(diff);
+                    if removed < diff {
+                        self.pending_shrink
+                            .fetch_add(diff - removed, Ordering::AcqRel);
                     }
                     return;
                 }
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    fn consume_pending_shrink(&self) -> bool {
+        let mut current = self.pending_shrink.load(Ordering::Relaxed);
+        while current > 0 {
+            match self.pending_shrink.compare_exchange(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+        false
+    }
+
+    fn forget_available(&self, target: usize) -> usize {
+        let mut forgotten = 0;
+        while forgotten < target {
+            match self.semaphore.try_acquire() {
+                Ok(permit) => {
+                    permit.forget();
+                    forgotten += 1;
+                }
+                Err(_) => return forgotten,
+            }
+        }
+        forgotten
     }
 }
 
@@ -202,8 +241,8 @@ async fn get_once(
     let permit = limiter.acquire().await?;
     let resp = client.send_get(http, bucket, key, None).await?;
     if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        limiter.on_throttle();
         drop(permit);
+        limiter.on_throttle();
         return Ok(GetAttempt::SlowDown);
     }
     let resp = resp.error_for_status()?;
@@ -275,5 +314,29 @@ mod tests {
         drop(second);
 
         assert_eq!(budget.tokens.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn throttle_with_checked_out_permits_applies_pending_shrink_on_acquire() {
+        let limiter = AimdLimiter::new(4, 4);
+        let mut permits = Vec::new();
+        for _ in 0..4 {
+            permits.push(limiter.acquire().await.unwrap());
+        }
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+
+        limiter.on_throttle();
+
+        assert_eq!(limiter.limit.load(Ordering::Relaxed), 2);
+        assert_eq!(limiter.pending_shrink.load(Ordering::Relaxed), 2);
+
+        drop(permits);
+        let permit = limiter.acquire().await.unwrap();
+
+        assert_eq!(limiter.pending_shrink.load(Ordering::Relaxed), 0);
+
+        drop(permit);
+
+        assert_eq!(limiter.semaphore.available_permits(), 2);
     }
 }
