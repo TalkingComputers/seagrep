@@ -31,6 +31,14 @@ pub struct IndexStats {
     pub postings_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchStats {
+    pub hits: BTreeSet<DocId>,
+    pub candidates: usize,
+    pub total_docs: usize,
+    pub bytes_fetched: usize,
+}
+
 pub trait IndexReader {
     fn docs(&self) -> &[(DocId, String)];
     fn strategy(&self) -> Strategy;
@@ -444,17 +452,34 @@ pub fn search(
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<BTreeSet<DocId>> {
+    Ok(search_with_stats(reader, corpus, pattern)?.hits)
+}
+
+pub fn search_with_stats(
+    reader: &dyn IndexReader,
+    corpus: &dyn Corpus,
+    pattern: &str,
+) -> Result<SearchStats> {
     let q = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
     let ids = reader.candidates(&q)?.into_iter().collect::<Vec<_>>();
-    Ok(corpus
-        .fetch_many(&ids)?
-        .par_iter()
-        .filter_map(|(id, bytes)| match bytes {
-            Ok(bytes) if re.is_match(bytes) => Some(*id),
-            _ => None,
-        })
-        .collect())
+    let mut hits = BTreeSet::new();
+    let mut bytes_fetched = 0usize;
+    for (id, bytes) in corpus.fetch_many(&ids)? {
+        let bytes = bytes?;
+        bytes_fetched = bytes_fetched
+            .checked_add(bytes.len())
+            .context("bytes fetched overflow")?;
+        if re.is_match(&bytes) {
+            hits.insert(id);
+        }
+    }
+    Ok(SearchStats {
+        hits,
+        candidates: ids.len(),
+        total_docs: reader.docs().len(),
+        bytes_fetched,
+    })
 }
 
 #[cfg(test)]
@@ -502,5 +527,19 @@ mod tests {
             let (_d, r) = build_tmp(&c, strategy);
             assert_eq!(r.candidates(&Query::All).unwrap(), BTreeSet::from([0]));
         }
+    }
+
+    #[test]
+    fn search_stats_counts_candidates_and_bytes() {
+        let c = MemCorpus(
+            vec![(0, "x".into()), (1, "y".into())],
+            vec![b"abc world".to_vec(), b"nomatch".to_vec()],
+        );
+        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let stats = search_with_stats(&r, &c, "world").unwrap();
+        assert_eq!(stats.hits, BTreeSet::from([0]));
+        assert_eq!(stats.candidates, 1);
+        assert_eq!(stats.total_docs, 2);
+        assert_eq!(stats.bytes_fetched, b"abc world".len());
     }
 }
