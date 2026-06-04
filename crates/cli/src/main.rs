@@ -2,13 +2,14 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{matches_in, Corpus, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search, IndexReader, LocalCorpus,
-    MmapIndexReader, StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search_with_regex_stats, IndexReader,
+    LocalCorpus, MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, is_index_key, normalize_prefix, region_from_env,
     s3_client_from_env, ObjectMeta, S3BlobStore, S3Corpus,
 };
+use regex::bytes::Regex;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -140,22 +141,17 @@ fn search_local(
 ) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
     let reader = MmapIndexReader::open(index)?;
+    let re = Regex::new(pattern)?;
+    let search_stats = search_with_regex_stats(&reader, &corpus, pattern, &re)?;
     if stats {
-        let q = holys3_query::plan(pattern, reader.strategy())?;
-        let candidates = reader.candidates(&q)?;
         eprintln!(
             "candidates={} total={} strategy={:?}",
-            candidates.len(),
-            reader.docs().len(),
+            search_stats.candidates,
+            search_stats.total_docs,
             reader.strategy()
         );
     }
-    print_hits(
-        &corpus,
-        search(&reader, &corpus, pattern)?,
-        pattern,
-        files_only,
-    )
+    print_hits(&corpus, search_stats.hits, &re, files_only)
 }
 
 fn read_region(region: Option<String>) -> Result<String> {
@@ -207,33 +203,28 @@ fn search_s3(
     )?;
     let cache_dir = build_cache_dir(&bucket, &prefix)?;
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
+    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt, cfg)?;
+    let re = Regex::new(pattern)?;
+    let search_stats = search_with_regex_stats(&reader, &corpus, pattern, &re)?;
     if stats {
-        let q = holys3_query::plan(pattern, reader.strategy())?;
-        let candidates = reader.candidates(&q)?;
         let index_stats = reader.stats();
         eprintln!(
             "candidates={} total={} strategy={:?} distinct_grams={} terms_fst_bytes={} postings_bytes={}",
-            candidates.len(),
-            reader.docs().len(),
+            search_stats.candidates,
+            search_stats.total_docs,
             reader.strategy(),
             index_stats.distinct_grams,
             index_stats.terms_fst_bytes,
             index_stats.postings_bytes
         );
     }
-    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt, cfg)?;
-    print_hits(
-        &corpus,
-        search(&reader, &corpus, pattern)?,
-        pattern,
-        files_only,
-    )
+    print_hits(&corpus, search_stats.hits, &re, files_only)
 }
 
 fn print_hits(
     corpus: &dyn Corpus,
     hits: std::collections::BTreeSet<holys3_core::DocId>,
-    pattern: &str,
+    re: &Regex,
     files_only: bool,
 ) -> Result<()> {
     if files_only {
@@ -242,11 +233,10 @@ fn print_hits(
         }
         return Ok(());
     }
-    let re = regex::bytes::Regex::new(pattern)?;
     for id in hits {
         let bytes = corpus.fetch(id)?;
         let key = &corpus.docs()[id as usize].1;
-        for matched in matches_in(id, &bytes, &re) {
+        for matched in matches_in(id, &bytes, re) {
             println!("{key}:{}:{}:{}", matched.line, matched.col, matched.text);
         }
     }

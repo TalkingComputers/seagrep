@@ -432,8 +432,17 @@ pub fn search_with_stats(
     corpus: &dyn Corpus,
     pattern: &str,
 ) -> Result<SearchStats> {
-    let q = holys3_query::plan(pattern, reader.strategy())?;
     let re = regex::bytes::Regex::new(pattern)?;
+    search_with_regex_stats(reader, corpus, pattern, &re)
+}
+
+pub fn search_with_regex_stats(
+    reader: &dyn IndexReader,
+    corpus: &dyn Corpus,
+    pattern: &str,
+    re: &regex::bytes::Regex,
+) -> Result<SearchStats> {
+    let q = holys3_query::plan(pattern, reader.strategy())?;
     let ids = reader.candidates(&q)?.into_iter().collect::<Vec<_>>();
     let mut hits = BTreeSet::new();
     let mut bytes_fetched = 0usize;
@@ -497,6 +506,18 @@ mod tests {
             let (_d, r) = build_tmp(&c, strategy);
             assert_eq!(r.candidates(&Query::All).unwrap(), BTreeSet::from([0]));
         }
+    }
+
+    #[test]
+    fn search_with_regex_stats_reuses_compiled_pattern() {
+        let c = MemCorpus::new(
+            vec![(0, "x".into()), (1, "y".into())],
+            vec![b"abc world".to_vec(), b"nomatch".to_vec()],
+        );
+        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let re = regex::bytes::Regex::new("world").unwrap();
+        let stats = search_with_regex_stats(&r, &c, "world", &re).unwrap();
+        assert_eq!(stats.hits, BTreeSet::from([0]));
     }
 
     #[test]
