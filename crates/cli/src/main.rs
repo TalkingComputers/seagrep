@@ -6,8 +6,8 @@ use holys3_index::{
     MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
-    build_index_namespace, is_index_key, normalize_prefix, ObjectMeta, S3BlobStore, S3Client,
-    S3Corpus,
+    build_index_namespace, is_index_key, normalize_prefix, FetchConfig, ObjectMeta, S3BlobStore,
+    S3Client, S3Corpus,
 };
 use holys3_sigv4::resolve;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,8 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, value_enum, default_value = "trigram")]
         strategy: StrategyArg,
+        #[arg(long, default_value_t = 750, value_parser = parse_concurrency)]
+        concurrency: usize,
     },
     /// Search a pattern using a prebuilt index.
     Search {
@@ -53,6 +55,8 @@ enum Cmd {
         files_only: bool,
         #[arg(long)]
         stats: bool,
+        #[arg(long, default_value_t = 750, value_parser = parse_concurrency)]
+        concurrency: usize,
     },
     /// Report distinct grams + term-dict bytes (resolves spec section 5 A/B).
     Stats {
@@ -83,13 +87,32 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
     Ok(())
 }
 
+fn build_fetch_config(concurrency: usize) -> FetchConfig {
+    let default = FetchConfig::default();
+    FetchConfig {
+        start: default.start.min(concurrency),
+        cap: concurrency,
+        ..default
+    }
+}
+
+fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let concurrency = value.parse::<usize>().map_err(|err| err.to_string())?;
+    if concurrency == 0 {
+        return Err("concurrency must be greater than 0".to_owned());
+    }
+    Ok(concurrency)
+}
+
 async fn build_s3(
     bucket: String,
     prefix: String,
     region: Option<String>,
     strategy: Strategy,
+    concurrency: usize,
 ) -> Result<()> {
     let prefix = normalize_prefix(&prefix);
+    let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
     let creds = resolve("default")?;
     let client = S3Client::new(region, creds);
@@ -100,8 +123,14 @@ async fn build_s3(
         .collect::<Vec<_>>();
     let build_id = compute_build_id(&object_ids);
     let rt = tokio::runtime::Handle::current();
-    let corpus = S3Corpus::new(client.clone(), bucket.clone(), objects, rt.clone());
-    let store = S3BlobStore::new(client, bucket.clone(), prefix.clone(), rt);
+    let corpus = S3Corpus::new(
+        client.clone(),
+        bucket.clone(),
+        objects,
+        rt.clone(),
+        cfg.clone(),
+    )?;
+    let store = S3BlobStore::new(client, bucket.clone(), prefix.clone(), rt, cfg)?;
     build_to_store(&corpus, &store, strategy, &build_id)?;
     eprintln!(
         "indexed {} docs -> s3://{}/{}/builds/{}",
@@ -173,13 +202,21 @@ fn search_s3(
     region: Option<String>,
     files_only: bool,
     stats: bool,
+    concurrency: usize,
 ) -> Result<()> {
     let prefix = normalize_prefix(&prefix);
+    let cfg = build_fetch_config(concurrency);
     let region = read_region(region)?;
     let creds = resolve("default")?;
     let client = S3Client::new(region, creds);
     let rt = tokio::runtime::Handle::current();
-    let store = S3BlobStore::new(client.clone(), bucket.clone(), prefix.clone(), rt.clone());
+    let store = S3BlobStore::new(
+        client.clone(),
+        bucket.clone(),
+        prefix.clone(),
+        rt.clone(),
+        cfg.clone(),
+    )?;
     let cache_dir = build_cache_dir(&bucket, &prefix)?;
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
     if stats {
@@ -196,7 +233,7 @@ fn search_s3(
             index_stats.postings_bytes
         );
     }
-    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt);
+    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt, cfg)?;
     print_hits(
         &corpus,
         search(&reader, &corpus, pattern)?,
@@ -242,8 +279,9 @@ async fn main() -> Result<()> {
             prefix,
             region,
             strategy,
+            concurrency,
             ..
-        } => build_s3(bucket, prefix, region, strategy.into()).await,
+        } => build_s3(bucket, prefix, region, strategy.into(), concurrency).await,
         Cmd::Index { .. } => anyhow::bail!("provide --local-dir or --bucket"),
         Cmd::Search {
             pattern,
@@ -260,8 +298,17 @@ async fn main() -> Result<()> {
             region,
             files_only,
             stats,
+            concurrency,
             ..
-        } => search_s3(&pattern, bucket, prefix, region, files_only, stats),
+        } => search_s3(
+            &pattern,
+            bucket,
+            prefix,
+            region,
+            files_only,
+            stats,
+            concurrency,
+        ),
         Cmd::Search { .. } => anyhow::bail!("provide --local-dir or --bucket"),
         Cmd::Stats { index } => {
             let reader = MmapIndexReader::open(&index)?;
