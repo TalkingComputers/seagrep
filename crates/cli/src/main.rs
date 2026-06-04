@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use holys3_core::{matches_in, Corpus, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search, LocalCorpus, MmapIndexReader,
-    StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search, IndexReader, LocalCorpus,
+    MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{build_index_namespace, is_index_key, ObjectMeta, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
