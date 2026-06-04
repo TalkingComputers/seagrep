@@ -1,0 +1,111 @@
+2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
+fn parse_event(line: &str) -> anyhow::Result<Event> {
+    let (level, body) = line.split_once(' ').context("missing level")?;
+    Ok(Event { level: level.to_owned(), body: body.to_owned() })
+}
+2026-06-04T00:00:03Z WARN retryable timeout while fetching object key=logs/app/00000017.log
+2026-06-04T00:00:04Z INFO user_id=42 customer_id=abc123 request_id=deadbeef status=ok
+pub fn scan_matching_docs(corpus: &dyn Corpus, re: &regex::bytes::Regex) -> Result<BTreeSet<DocId>> {
+    let mut hits = BTreeSet::new();
+    for &(id, _) in corpus.docs() {
+        let bytes = corpus.fetch(id)?;
+        if re.is_match(&bytes) {
+            hits.insert(id);
+        }
+    }
+    Ok(hits)
+}
+CRITICAL: worker panicked while compacting postings block offset=4096 count=128
+2026-06-04T00:00:05Z INFO metrics candidates=128 total=4096 bytes=8388608 hits=17
+let canonical_query = params.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v))).collect::<Vec<_>>().join("&");
+2026-06-04T00:00:06Z ERROR42 object=object-000042.log line=27 message="needle found"
+2026-06-04T00:00:07Z INFO rustc=1.95.0 cargo=1.95.0 target=aarch64-apple-darwin
+impl BlobStore for LocalBlobStore {
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let mut file = std::fs::File::open(self.root.join(name))?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; usize::try_from(len)?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
+2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
+2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
+fn parse_event(line: &str) -> anyhow::Result<Event> {
+    let (level, body) = line.split_once(' ').context("missing level")?;
+    Ok(Event { level: level.to_owned(), body: body.to_owned() })
+}
+2026-06-04T00:00:03Z WARN retryable timeout while fetching object key=logs/app/00000017.log
+2026-06-04T00:00:04Z INFO user_id=42 customer_id=abc123 request_id=deadbeef status=ok
+pub fn scan_matching_docs(corpus: &dyn Corpus, re: &regex::bytes::Regex) -> Result<BTreeSet<DocId>> {
+    let mut hits = BTreeSet::new();
+    for &(id, _) in corpus.docs() {
+        let bytes = corpus.fetch(id)?;
+        if re.is_match(&bytes) {
+            hits.insert(id);
+        }
+    }
+    Ok(hits)
+}
+CRITICAL: worker panicked while compacting postings block offset=4096 count=128
+2026-06-04T00:00:05Z INFO metrics candidates=128 total=4096 bytes=8388608 hits=17
+let canonical_query = params.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v))).collect::<Vec<_>>().join("&");
+2026-06-04T00:00:06Z ERROR42 object=object-000042.log line=27 message="needle found"
+2026-06-04T00:00:07Z INFO rustc=1.95.0 cargo=1.95.0 target=aarch64-apple-darwin
+impl BlobStore for LocalBlobStore {
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let mut file = std::fs::File::open(self.root.join(name))?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; usize::try_from(len)?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
+2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
+2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
+fn parse_event(line: &str) -> anyhow::Result<Event> {
+    let (level, body) = line.split_once(' ').context("missing level")?;
+    Ok(Event { level: level.to_owned(), body: body.to_owned() })
+}
+2026-06-04T00:00:03Z WARN retryable timeout while fetching object key=logs/app/00000017.log
+2026-06-04T00:00:04Z INFO user_id=42 customer_id=abc123 request_id=deadbeef status=ok
+pub fn scan_matching_docs(corpus: &dyn Corpus, re: &regex::bytes::Regex) -> Result<BTreeSet<DocId>> {
+    let mut hits = BTreeSet::new();
+    for &(id, _) in corpus.docs() {
+        let bytes = corpus.fetch(id)?;
+        if re.is_match(&bytes) {
+            hits.insert(id);
+        }
+    }
+    Ok(hits)
+}
+CRITICAL: worker panicked while compacting postings block offset=4096 count=128
+2026-06-04T00:00:05Z INFO metrics candidates=128 total=4096 bytes=8388608 hits=17
+let canonical_query = params.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v))).collect::<Vec<_>>().join("&");
+2026-06-04T00:00:06Z ERROR42 object=object-000042.log line=27 message="needle found"
+2026-06-04T00:00:07Z INFO rustc=1.95.0 cargo=1.95.0 target=aarch64-apple-darwin
+impl BlobStore for LocalBlobStore {
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        let mut file = std::fs::File::open(self.root.join(name))?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; usize::try_from(len)?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+2026-06-04T00:00:08Z DEBUG plan alternation=(timeout|panicked|denied) literal_extractor=complete
+2026-06-04T00:00:09Z INFO cache hit build_id=0123456789abcdef terms_fst=65536 postings=524288
+2026-06-04T00:00:01Z INFO holys3 indexer start bucket=bench prefix=logs shard=0001
+2026-06-04T00:00:02Z DEBUG request_id=01HX path=/api/search pattern=ERROR42 strategy=trigram
+fn parse_event(line: &str) -> anyhow::Result<Event> {
+    let (level, body) = line.split_once(' ').context("missing level")?;
+    Ok(Event { level: level.to_owned(), body: body.to_owned() })
+}
+2026-06-04T00:00:03Z WARN retryable timeout while fetching object key=logs/app/00000017.log
+2026-06-04T00:00:04Z INFO user_id=42 customer_id=abc123 request_id=deadbeef status=ok
+pub fn scan_matching_docs(corpus: &dyn Corpus, re: &regex::bytes::Regex) -> Result<BTr

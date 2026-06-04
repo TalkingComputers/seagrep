@@ -38,7 +38,8 @@ pub trait IndexReader {
     fn stats(&self) -> IndexStats;
 }
 
-fn eval_query(
+#[doc(hidden)]
+pub fn eval_query(
     q: &Query,
     all_docs: &BTreeSet<DocId>,
     offset: &dyn Fn(&[u8]) -> Option<u64>,
@@ -71,6 +72,31 @@ fn eval_query(
             Ok(out)
         }
     }
+}
+
+#[doc(hidden)]
+pub fn decode_postings_block(postings: &[u8], offset: u64) -> Result<BTreeSet<DocId>> {
+    let o = usize::try_from(offset).context("postings offset does not fit usize")?;
+    let count_end = o.checked_add(4).context("postings count offset overflow")?;
+    let count_bytes: [u8; 4] = postings
+        .get(o..count_end)
+        .context("truncated postings.bin count")?
+        .try_into()?;
+    let count = u32::from_le_bytes(count_bytes) as usize;
+    let ids_len = count
+        .checked_mul(4)
+        .context("postings block byte length overflow")?;
+    let ids_end = count_end
+        .checked_add(ids_len)
+        .context("postings block end overflow")?;
+    let ids_bytes = postings
+        .get(count_end..ids_end)
+        .context("truncated postings.bin ids")?;
+    let mut set = BTreeSet::new();
+    for chunk in ids_bytes.chunks_exact(4) {
+        set.insert(u32::from_le_bytes(chunk.try_into()?));
+    }
+    Ok(set)
 }
 
 fn build_index_bytes(
@@ -202,29 +228,7 @@ impl MmapIndexReader {
     }
 
     fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
-        let o = usize::try_from(offset).context("postings offset does not fit usize")?;
-        let count_end = o.checked_add(4).context("postings count offset overflow")?;
-        let count_bytes: [u8; 4] = self
-            .postings
-            .get(o..count_end)
-            .context("truncated postings.bin count")?
-            .try_into()?;
-        let count = u32::from_le_bytes(count_bytes) as usize;
-        let ids_len = count
-            .checked_mul(4)
-            .context("postings block byte length overflow")?;
-        let ids_end = count_end
-            .checked_add(ids_len)
-            .context("postings block end overflow")?;
-        let ids_bytes = self
-            .postings
-            .get(count_end..ids_end)
-            .context("truncated postings.bin ids")?;
-        let mut set = BTreeSet::new();
-        for chunk in ids_bytes.chunks_exact(4) {
-            set.insert(u32::from_le_bytes(chunk.try_into()?));
-        }
-        Ok(set)
+        decode_postings_block(&self.postings, offset)
     }
 
     pub fn stats(&self) -> IndexStats {
