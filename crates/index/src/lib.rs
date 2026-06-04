@@ -37,6 +37,41 @@ pub trait IndexReader {
     fn stats(&self) -> IndexStats;
 }
 
+fn eval_query(
+    q: &Query,
+    all_docs: &BTreeSet<DocId>,
+    offset: &dyn Fn(&[u8]) -> Option<u64>,
+    read_block: &dyn Fn(u64) -> Result<BTreeSet<DocId>>,
+) -> Result<BTreeSet<DocId>> {
+    match q {
+        Query::All => Ok(all_docs.clone()),
+        Query::None => Ok(BTreeSet::new()),
+        Query::Gram(g) => match offset(g) {
+            Some(off) => read_block(off),
+            None => Ok(BTreeSet::new()),
+        },
+        Query::And(subs) => {
+            let mut it = subs.iter();
+            let Some(first) = it.next() else {
+                return Ok(all_docs.clone());
+            };
+            let mut out = eval_query(first, all_docs, offset, read_block)?;
+            for sub in it {
+                let set = eval_query(sub, all_docs, offset, read_block)?;
+                out = out.intersection(&set).copied().collect();
+            }
+            Ok(out)
+        }
+        Query::Or(subs) => {
+            let mut out = BTreeSet::new();
+            for sub in subs {
+                out.extend(eval_query(sub, all_docs, offset, read_block)?);
+            }
+            Ok(out)
+        }
+    }
+}
+
 fn build_index_bytes(
     corpus: &dyn Corpus,
     strategy: Strategy,
@@ -161,41 +196,30 @@ impl MmapIndexReader {
         self.docs.iter().map(|&(id, _)| id).collect()
     }
 
-    fn read_block(&self, offset: u64) -> BTreeSet<DocId> {
-        let o = offset as usize;
-        let count = u32::from_le_bytes(self.postings[o..o + 4].try_into().unwrap()) as usize;
+    fn read_block(&self, offset: u64) -> Result<BTreeSet<DocId>> {
+        let o = usize::try_from(offset).context("postings offset does not fit usize")?;
+        let count_end = o.checked_add(4).context("postings count offset overflow")?;
+        let count_bytes: [u8; 4] = self
+            .postings
+            .get(o..count_end)
+            .context("truncated postings.bin count")?
+            .try_into()?;
+        let count = u32::from_le_bytes(count_bytes) as usize;
+        let ids_len = count
+            .checked_mul(4)
+            .context("postings block byte length overflow")?;
+        let ids_end = count_end
+            .checked_add(ids_len)
+            .context("postings block end overflow")?;
+        let ids_bytes = self
+            .postings
+            .get(count_end..ids_end)
+            .context("truncated postings.bin ids")?;
         let mut set = BTreeSet::new();
-        let base = o + 4;
-        for k in 0..count {
-            let p = base + k * 4;
-            set.insert(u32::from_le_bytes(
-                self.postings[p..p + 4].try_into().unwrap(),
-            ));
+        for chunk in ids_bytes.chunks_exact(4) {
+            set.insert(u32::from_le_bytes(chunk.try_into()?));
         }
-        set
-    }
-
-    fn candidate_set(&self, q: &Query) -> BTreeSet<DocId> {
-        match q {
-            Query::All => self.all_docs(),
-            Query::None => BTreeSet::new(),
-            Query::Gram(g) => match self.map.get(g) {
-                Some(off) => self.read_block(off),
-                None => BTreeSet::new(),
-            },
-            Query::And(subs) => {
-                let mut it = subs.iter().map(|s| self.candidate_set(s));
-                match it.next() {
-                    None => self.all_docs(),
-                    Some(first) => it.fold(first, |a, s| a.intersection(&s).copied().collect()),
-                }
-            }
-            Query::Or(subs) => subs.iter().flat_map(|s| self.candidate_set(s)).collect(),
-        }
-    }
-
-    pub fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        Ok(self.candidate_set(q))
+        Ok(set)
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -217,7 +241,10 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        Ok(self.candidate_set(q))
+        let all_docs = self.all_docs();
+        eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
+            self.read_block(offset)
+        })
     }
 
     fn stats(&self) -> IndexStats {
@@ -309,44 +336,17 @@ impl StoreIndexReader {
         let bytes_len = u64::from(count)
             .checked_mul(4)
             .context("postings block byte length overflow")?;
+        let ids_offset = offset
+            .checked_add(4)
+            .context("postings ids offset overflow")?;
         let ids_bytes = self
             .store
-            .get_range(&self.store_postings_name, offset + 4, bytes_len)?;
+            .get_range(&self.store_postings_name, ids_offset, bytes_len)?;
         let mut set = BTreeSet::new();
         for chunk in ids_bytes.chunks_exact(4) {
             set.insert(u32::from_le_bytes(chunk.try_into()?));
         }
         Ok(set)
-    }
-
-    pub fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        match q {
-            Query::All => Ok(self.all_docs()),
-            Query::None => Ok(BTreeSet::new()),
-            Query::Gram(g) => match self.map.get(g) {
-                Some(off) => self.read_block(off),
-                None => Ok(BTreeSet::new()),
-            },
-            Query::And(subs) => {
-                let mut it = subs.iter();
-                let Some(first) = it.next() else {
-                    return Ok(self.all_docs());
-                };
-                let mut out = self.candidates(first)?;
-                for sub in it {
-                    let set = self.candidates(sub)?;
-                    out = out.intersection(&set).copied().collect();
-                }
-                Ok(out)
-            }
-            Query::Or(subs) => {
-                let mut out = BTreeSet::new();
-                for sub in subs {
-                    out.extend(self.candidates(sub)?);
-                }
-                Ok(out)
-            }
-        }
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -368,7 +368,10 @@ impl IndexReader for StoreIndexReader {
     }
 
     fn candidates(&self, q: &Query) -> Result<BTreeSet<DocId>> {
-        StoreIndexReader::candidates(self, q)
+        let all_docs = self.all_docs();
+        eval_query(q, &all_docs, &|gram| self.map.get(gram), &|offset| {
+            self.read_block(offset)
+        })
     }
 
     fn stats(&self) -> IndexStats {
