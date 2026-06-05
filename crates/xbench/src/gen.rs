@@ -125,19 +125,19 @@ fn object_bytes(rng: &mut DeterministicRng, index: usize, size: usize) -> Vec<u8
     let mut bytes = (0..size)
         .map(|offset| if offset % 80 == 79 { b'\n' } else { rng.byte() })
         .collect::<Vec<_>>();
-    if index % 2 == 0 {
+    if index.is_multiple_of(2) {
         write_token(&mut bytes, 32, b"needle");
     }
-    if index % 3 == 0 {
+    if index.is_multiple_of(3) {
         write_token(&mut bytes, 96, b"longliteralbenchmarktoken");
     }
-    if index % 5 == 0 {
+    if index.is_multiple_of(5) {
         write_token(&mut bytes, 160, b"alpha");
     }
-    if index % 7 == 0 {
+    if index.is_multiple_of(7) {
         write_token(&mut bytes, 192, b"beta");
     }
-    if index % 11 == 0 {
+    if index.is_multiple_of(11) {
         write_token(&mut bytes, 0, b"ANCHOR_START");
     }
     bytes
