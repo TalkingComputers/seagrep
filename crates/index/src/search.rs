@@ -118,7 +118,9 @@ pub fn search_streaming(
     };
     let wants_matches = sink.wants_matches();
     let keys_ref = &keys;
-    let verify = |idx: usize, bytes: Vec<u8>| -> Result<()> {
+    // `re` is cloned per worker: the meta engine's shared scratch Cache
+    // contends under exactly this all-threads-search workload.
+    let verify = |re: &regex::bytes::Regex, idx: usize, bytes: Vec<u8>| -> Result<()> {
         let key = &keys_ref[idx];
         let text = match decode_body(key, bytes) {
             Ok(text) => text,
@@ -128,7 +130,7 @@ pub fn search_streaming(
             }
         };
         let matches = if wants_matches {
-            let matches = matches_in(&text, &re);
+            let matches = matches_in(&text, re);
             if matches.is_empty() {
                 return Ok(());
             }
@@ -148,8 +150,13 @@ pub fn search_streaming(
 
     let feed_result = std::thread::scope(|scope| -> Result<()> {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                let received = match lock(&rx) {
+            let re = re.clone();
+            let rx = &rx;
+            let stopped = &stopped;
+            let record_error = &record_error;
+            let verify = &verify;
+            scope.spawn(move || loop {
+                let received = match lock(rx) {
                     Ok(guard) => guard.recv(),
                     Err(err) => {
                         record_error(err);
@@ -165,8 +172,9 @@ pub fn search_streaming(
                 // catch_unwind keeps a panicking verify (or sink) from
                 // breaking the drain invariant — and from poisoning the rx
                 // mutex, since the panic never crosses the recv lock.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(idx, bytes)))
-                {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    verify(&re, idx, bytes)
+                })) {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => record_error(err),
                     Err(_) => record_error(anyhow::anyhow!("a search worker panicked")),
