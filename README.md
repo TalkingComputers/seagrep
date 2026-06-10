@@ -82,7 +82,7 @@ Builds an index for either a local directory or an S3 bucket prefix.
 - `--out <OUT>`: local index directory. Defaults to `holys3.idxdir`.
 - `--strategy trigram|sparse`: index strategy. Defaults to `trigram`.
 
-For S3, the index is written in-bucket under `.holys3/` or `<prefix>/.holys3/`.
+For S3, the index is written in-bucket under `.holys3/` or `<prefix>/.holys3/` as content-addressed segments. Index runs are incremental: only new or changed objects are fetched and indexed, deletions take effect immediately, and a run against an unchanged bucket costs one listing and nothing else. Small segments merge automatically to keep per-query overhead flat.
 
 ### `search`
 
