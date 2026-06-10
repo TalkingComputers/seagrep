@@ -150,34 +150,32 @@ pub fn search_streaming(
 
     let feed_result = std::thread::scope(|scope| -> Result<()> {
         for _ in 0..workers {
-            let re = re.clone();
-            let rx = &rx;
-            let stopped = &stopped;
-            let record_error = &record_error;
-            let verify = &verify;
-            scope.spawn(move || loop {
-                let received = match lock(rx) {
-                    Ok(guard) => guard.recv(),
-                    Err(err) => {
-                        record_error(err);
+            scope.spawn(|| {
+                let re = re.clone();
+                loop {
+                    let received = match lock(&rx) {
+                        Ok(guard) => guard.recv(),
+                        Err(err) => {
+                            record_error(err);
+                            return;
+                        }
+                    };
+                    let Ok((idx, bytes)) = received else {
                         return;
+                    };
+                    if stopped.load(Ordering::Relaxed) {
+                        continue;
                     }
-                };
-                let Ok((idx, bytes)) = received else {
-                    return;
-                };
-                if stopped.load(Ordering::Relaxed) {
-                    continue;
-                }
-                // catch_unwind keeps a panicking verify (or sink) from
-                // breaking the drain invariant — and from poisoning the rx
-                // mutex, since the panic never crosses the recv lock.
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    verify(&re, idx, bytes)
-                })) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => record_error(err),
-                    Err(_) => record_error(anyhow::anyhow!("a search worker panicked")),
+                    // catch_unwind keeps a panicking verify (or sink) from
+                    // breaking the drain invariant — and from poisoning the rx
+                    // mutex, since the panic never crosses the recv lock.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        verify(&re, idx, bytes)
+                    })) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => record_error(err),
+                        Err(_) => record_error(anyhow::anyhow!("a search worker panicked")),
+                    }
                 }
             });
         }

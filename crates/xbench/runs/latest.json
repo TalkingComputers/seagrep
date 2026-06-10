@@ -1,16 +1,16 @@
 {
   "seed": 1,
   "objects": 1000,
-  "object_size": 4096,
-  "total_bytes": 4096000,
-  "iterations": 5,
-  "warmup": 1,
+  "object_size": 16384,
+  "total_bytes": 16384000,
+  "iterations": 15,
+  "warmup": 3,
   "concurrency": 64,
   "backend": {
     "kind": "s3",
-    "bucket": "holys3-test-381235349110-ue2",
-    "region": "us-east-2",
-    "endpoint": null
+    "bucket": "holys3-bench",
+    "region": "us-east-1",
+    "endpoint": "http://127.0.0.1:9000"
   },
   "scenarios": [
     {
@@ -21,11 +21,11 @@
       "candidates": 500,
       "total_docs": 1000,
       "prune_ratio": 0.5,
-      "bytes_fetched": 2048000,
-      "p50_ms": 701.29025,
-      "p95_ms": 717.2111669999999,
-      "p99_ms": 717.2111669999999,
-      "sequential_p50_ms": 32973.388209
+      "bytes_fetched": 8192000,
+      "p50_ms": 219.61566699999997,
+      "p95_ms": 235.141459,
+      "p99_ms": 235.141459,
+      "sequential_p50_ms": 119.428333
     },
     {
       "name": "long_literal",
@@ -35,11 +35,11 @@
       "candidates": 334,
       "total_docs": 1000,
       "prune_ratio": 0.334,
-      "bytes_fetched": 1368064,
-      "p50_ms": 628.257,
-      "p95_ms": 659.393167,
-      "p99_ms": 659.393167,
-      "sequential_p50_ms": 21123.512125
+      "bytes_fetched": 5472256,
+      "p50_ms": 206.4745,
+      "p95_ms": 230.636208,
+      "p99_ms": 230.636208,
+      "sequential_p50_ms": 70.84725
     },
     {
       "name": "alternation",
@@ -49,11 +49,11 @@
       "candidates": 314,
       "total_docs": 1000,
       "prune_ratio": 0.314,
-      "bytes_fetched": 1286144,
-      "p50_ms": 524.768875,
-      "p95_ms": 551.145167,
-      "p99_ms": 551.145167,
-      "sequential_p50_ms": 19874.6995
+      "bytes_fetched": 5144576,
+      "p50_ms": 27.499167,
+      "p95_ms": 226.651125,
+      "p99_ms": 226.651125,
+      "sequential_p50_ms": 66.247833
     },
     {
       "name": "anchored",
@@ -63,11 +63,11 @@
       "candidates": 91,
       "total_docs": 1000,
       "prune_ratio": 0.091,
-      "bytes_fetched": 372736,
-      "p50_ms": 215.665208,
-      "p95_ms": 233.89070900000002,
-      "p99_ms": 233.89070900000002,
-      "sequential_p50_ms": 5820.549042
+      "bytes_fetched": 1490944,
+      "p50_ms": 4.1537500000000005,
+      "p95_ms": 204.80725,
+      "p99_ms": 204.80725,
+      "sequential_p50_ms": 19.67475
     },
     {
       "name": "no_match",
@@ -78,10 +78,10 @@
       "total_docs": 1000,
       "prune_ratio": 0.0,
       "bytes_fetched": 0,
-      "p50_ms": 0.014583,
-      "p95_ms": 0.022708,
-      "p99_ms": 0.022708,
-      "sequential_p50_ms": 0.011375
+      "p50_ms": 0.002875,
+      "p95_ms": 0.003625,
+      "p99_ms": 0.003625,
+      "sequential_p50_ms": 0.00275
     },
     {
       "name": "QAll",
@@ -91,11 +91,11 @@
       "candidates": 1000,
       "total_docs": 1000,
       "prune_ratio": 1.0,
-      "bytes_fetched": 4096000,
-      "p50_ms": 1175.817375,
-      "p95_ms": 1193.037959,
-      "p99_ms": 1193.037959,
-      "sequential_p50_ms": 68261.17816699999
+      "bytes_fetched": 16384000,
+      "p50_ms": 261.01962499999996,
+      "p95_ms": 299.75262499999997,
+      "p99_ms": 299.75262499999997,
+      "sequential_p50_ms": 283.940417
     },
     {
       "name": "dot_star_gap",
@@ -105,11 +105,11 @@
       "candidates": 100,
       "total_docs": 1000,
       "prune_ratio": 0.1,
-      "bytes_fetched": 409600,
-      "p50_ms": 278.56575,
-      "p95_ms": 294.92204100000004,
-      "p99_ms": 294.92204100000004,
-      "sequential_p50_ms": 6857.6127910000005
+      "bytes_fetched": 1638400,
+      "p50_ms": 5.0701670000000005,
+      "p95_ms": 206.41825,
+      "p99_ms": 206.41825,
+      "sequential_p50_ms": 32.108667
     }
   ]
 }

@@ -16,8 +16,37 @@ static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static
     });
 
 /// Hedge window for small ranged reads (index blocks): ~2x a slow S3
-/// first-byte latency.
+/// first-byte latency. Reads below `SMALL_READ_MAX` qualify.
 const SMALL_READ_HEDGE: Duration = Duration::from_millis(300);
+const SMALL_READ_MAX: u64 = 4 * 1024 * 1024;
+
+/// Ranges within this gap of each other merge into one ranged GET: a request
+/// round trip costs more than transferring the gap bytes.
+const RANGE_COALESCE_GAP: u64 = 512 * 1024;
+
+/// Where an input range landed after coalescing: (merged index, byte start).
+type Placement = (usize, usize);
+
+/// Merge sorted (offset, len) ranges whose gap is at most `max_gap` and
+/// return, per input range, which merged range holds it and at what offset.
+fn coalesce_ranges(ranges: &[(u64, u64)], max_gap: u64) -> (Vec<(u64, u64)>, Vec<Placement>) {
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    let mut placements = Vec::with_capacity(ranges.len());
+    for &(offset, len) in ranges {
+        let next = merged.len();
+        match merged.last_mut() {
+            Some((m_off, m_len)) if offset <= *m_off + *m_len + max_gap => {
+                placements.push((next - 1, (offset - *m_off) as usize));
+                *m_len = (offset + len).max(*m_off + *m_len) - *m_off;
+            }
+            _ => {
+                placements.push((next, 0));
+                merged.push((offset, len));
+            }
+        }
+    }
+    (merged, placements)
+}
 
 fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -381,7 +410,7 @@ impl S3Client {
         range: Option<(u64, u64)>,
     ) -> Result<Option<Vec<u8>>> {
         let hedge_after = match range {
-            Some((start, end)) if end.saturating_sub(start) < 4 * 1024 * 1024 => {
+            Some((start, end)) if end.saturating_sub(start) < SMALL_READ_MAX => {
                 SMALL_READ_HEDGE.min(self.0.cfg.hedge_after)
             }
             _ => self.0.cfg.hedge_after,
@@ -456,16 +485,23 @@ impl S3Client {
     }
 
     /// Fetch many byte ranges of one object concurrently, preserving order.
-    /// `None` = object does not exist.
+    /// `None` = object does not exist. Nearby ranges merge into one GET
+    /// (`RANGE_COALESCE_GAP`) before fetching; each requested range is then
+    /// sliced back out of its merged blob.
     pub fn get_ranges(
         &self,
         bucket: &str,
         key: &str,
         ranges: &[(u64, u64)],
     ) -> Result<Option<Vec<Vec<u8>>>> {
-        self.0.rt.block_on(async {
-            let mut out: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
-            let mut fetches = stream::iter(ranges.iter().enumerate().map(
+        let mut order: Vec<usize> = (0..ranges.len()).collect();
+        order.sort_by_key(|&i| ranges[i]);
+        let sorted: Vec<(u64, u64)> = order.iter().map(|&i| ranges[i]).collect();
+        let (merged, placements) = coalesce_ranges(&sorted, RANGE_COALESCE_GAP);
+        let merged = &merged;
+        let blobs = self.0.rt.block_on(async {
+            let mut blobs: Vec<Option<Vec<u8>>> = vec![None; merged.len()];
+            let mut fetches = stream::iter(merged.iter().enumerate().map(
                 |(i, &(start, len))| async move {
                     let range = byte_range(start, len)?;
                     let bytes = self.fetch_hedged(bucket, key, Some(range)).await?;
@@ -476,17 +512,31 @@ impl S3Client {
             while let Some(result) = fetches.next().await {
                 let (i, bytes) = result?;
                 match bytes {
-                    Some(bytes) => out[i] = Some(bytes),
+                    Some(bytes) => blobs[i] = Some(bytes),
                     None => return Ok(None),
                 }
             }
             drop(fetches);
-            Ok(Some(
-                out.into_iter()
-                    .map(|bytes| bytes.expect("all ranges fetched"))
-                    .collect(),
-            ))
-        })
+            Ok::<_, anyhow::Error>(Some(blobs))
+        })?;
+        let Some(blobs) = blobs else {
+            return Ok(None);
+        };
+        let mut out: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
+        for (k, &original) in order.iter().enumerate() {
+            let (blob_idx, start) = placements[k];
+            let len = usize::try_from(sorted[k].1)?;
+            let blob = blobs[blob_idx].as_ref().expect("all ranges fetched");
+            let slice = blob.get(start..start + len).with_context(|| {
+                format!(
+                    "coalesced read of {key} is {} bytes, range needs {}",
+                    blob.len(),
+                    start + len
+                )
+            })?;
+            out[original] = slice.to_vec();
+        }
+        Ok(Some(out))
     }
 
     /// Stream objects to `consume` as fetches complete (unordered). `None`
@@ -637,4 +687,24 @@ fn byte_range(start: u64, len: u64) -> Result<(u64, u64)> {
         .and_then(|v| v.checked_sub(1))
         .ok_or_else(|| anyhow::anyhow!("invalid empty S3 range"))?;
     Ok((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::coalesce_ranges;
+
+    #[test]
+    fn coalesce_merges_within_gap_and_places_blocks() {
+        let ranges = [(0u64, 100u64), (150, 50), (10_000, 8), (10_008, 4)];
+        let (merged, placements) = coalesce_ranges(&ranges, 64);
+        assert_eq!(merged, vec![(0, 200), (10_000, 12)]);
+        assert_eq!(placements, vec![(0, 0), (0, 150), (1, 0), (1, 8)]);
+
+        let (merged, placements) = coalesce_ranges(&ranges, 0);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(placements[3], (2, 8));
+
+        let (merged, _) = coalesce_ranges(&[], 64);
+        assert!(merged.is_empty());
+    }
 }

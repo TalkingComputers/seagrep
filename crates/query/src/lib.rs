@@ -47,14 +47,13 @@ fn side_query(seq: &regex_syntax::hir::literal::Seq, strategy: Strategy) -> Opti
 pub fn plan(pattern: &str, strategy: Strategy) -> anyhow::Result<Query> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
     let hir = regex_syntax::parse(pattern)?;
-    let prefixes = Extractor::new().extract(&hir);
-    let mut suffix_extractor = Extractor::new();
-    suffix_extractor.kind(ExtractKind::Suffix);
-    let suffixes = suffix_extractor.extract(&hir);
-    let mut sides: Vec<Query> = [prefixes, suffixes]
-        .iter()
-        .filter_map(|seq| side_query(seq, strategy))
-        .collect();
+    let mut sides: Vec<Query> = [
+        Extractor::new().extract(&hir),
+        Extractor::new().kind(ExtractKind::Suffix).extract(&hir),
+    ]
+    .iter()
+    .filter_map(|seq| side_query(seq, strategy))
+    .collect();
     sides.dedup();
     match sides.len() {
         0 => Ok(Query::All),

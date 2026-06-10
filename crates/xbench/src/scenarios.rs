@@ -18,36 +18,3 @@ pub(crate) fn read_scenarios(path: &Path) -> Result<Vec<Scenario>> {
     let file: ScenarioFile = toml::from_str(&body)?;
     Ok(file.scenarios)
 }
-
-pub(crate) fn default_scenarios() -> Vec<Scenario> {
-    vec![
-        Scenario {
-            name: "short_literal".to_owned(),
-            pattern: "needle".to_owned(),
-        },
-        Scenario {
-            name: "long_literal".to_owned(),
-            pattern: "longliteralbenchmarktoken".to_owned(),
-        },
-        Scenario {
-            name: "alternation".to_owned(),
-            pattern: "alpha|beta".to_owned(),
-        },
-        Scenario {
-            name: "anchored".to_owned(),
-            pattern: "^ANCHOR_START".to_owned(),
-        },
-        Scenario {
-            name: "no_match".to_owned(),
-            pattern: "UNMATCHABLE_TOKEN".to_owned(),
-        },
-        Scenario {
-            name: "QAll".to_owned(),
-            pattern: ".*".to_owned(),
-        },
-        Scenario {
-            name: "dot_star_gap".to_owned(),
-            pattern: "(?s)needle.*alpha".to_owned(),
-        },
-    ]
-}

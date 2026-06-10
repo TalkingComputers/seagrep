@@ -1,4 +1,4 @@
-use crate::scenarios::default_scenarios;
+use crate::scenarios::read_scenarios;
 use anyhow::{Context, Result};
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,12 @@ pub(crate) fn manifest_path() -> PathBuf {
 
 pub(crate) fn local_index_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runs/local-index")
+}
+
+/// The canonical scenario list. Seed-time expected hits and run-time queries
+/// both read this file, so a scenario is added in exactly one place.
+pub(crate) fn scenarios_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scenarios/queries.toml")
 }
 
 pub(crate) fn reports_dir() -> PathBuf {
@@ -149,7 +155,7 @@ fn write_token(bytes: &mut [u8], offset: usize, token: &[u8]) {
 
 fn expected_hits(docs: &[Vec<u8>]) -> Result<BTreeMap<String, usize>> {
     let mut hits = BTreeMap::new();
-    for scenario in default_scenarios() {
+    for scenario in read_scenarios(&scenarios_path())? {
         let re = Regex::new(&scenario.pattern)?;
         let count = docs.iter().filter(|bytes| re.is_match(bytes)).count();
         hits.insert(scenario.name, count);

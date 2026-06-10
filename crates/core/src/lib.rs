@@ -121,10 +121,7 @@ pub fn sparse_grams_all_bytes(data: &[u8]) -> Vec<Vec<u8>> {
                 break;
             }
             if weights[j] > interior_max {
-                let end = j + 2;
-                if end <= data.len() {
-                    out.push(data[i..end].to_vec());
-                }
+                out.push(data[i..j + 2].to_vec());
             }
         }
     }
@@ -144,10 +141,7 @@ pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     for i in 0..weights.len() {
         while let Some(&top) = stack.last() {
             if weights[top] <= weights[i] {
-                let end = i + 2;
-                if end <= data.len() {
-                    out.push(data[top..end].to_vec());
-                }
+                out.push(data[top..i + 2].to_vec());
                 if weights[top] == weights[i] {
                     stack.pop();
                     break;
@@ -162,17 +156,11 @@ pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     while stack.len() > 1 {
         let top = stack.pop().unwrap();
         if let Some(&prev) = stack.last() {
-            let end = top + 2;
-            if end <= data.len() {
-                out.push(data[prev..end].to_vec());
-            }
+            out.push(data[prev..top + 2].to_vec());
         }
     }
     if let Some(&pos) = stack.last() {
-        let end = pos + 2;
-        if end <= data.len() {
-            out.push(data[pos..end].to_vec());
-        }
+        out.push(data[pos..pos + 2].to_vec());
     }
     out.sort_unstable();
     out.dedup();
@@ -198,16 +186,6 @@ pub fn grams_query(data: &[u8], s: Strategy) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod invariant_grams {
     use super::{hash_ngram, sparse_grams_all_bytes, sparse_grams_covering_bytes};
-
-    pub(super) fn trigrams(bytes: &[u8]) -> Vec<u32> {
-        let mut v: Vec<u32> = bytes
-            .windows(3)
-            .map(|w| (w[0] as u32) << 16 | (w[1] as u32) << 8 | w[2] as u32)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
 
     pub(super) fn extract_sparse_ngrams_all(data: &[u8]) -> Vec<(u64, usize)> {
         sparse_grams_all_bytes(data)
@@ -407,28 +385,22 @@ pub fn scan_matching_docs(
 
 #[cfg(test)]
 mod tests {
-    use super::invariant_grams::trigrams;
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn trigrams_basic() {
-        // "abcab" -> abc, bca, cab ; "abc" appears once after dedup
-        let t = trigrams(b"abcab");
-        let abc = (b'a' as u32) << 16 | (b'b' as u32) << 8 | b'c' as u32;
-        let bca = (b'b' as u32) << 16 | (b'c' as u32) << 8 | b'a' as u32;
-        let cab = (b'c' as u32) << 16 | (b'a' as u32) << 8 | b'b' as u32;
-        assert_eq!(t, {
-            let mut e = vec![abc, bca, cab];
-            e.sort_unstable();
-            e
-        });
+        // "abcab" -> abc, bca, cab sorted; "abc" appears once after dedup
+        assert_eq!(
+            trigram_grams_bytes(b"abcab"),
+            vec![b"abc".to_vec(), b"bca".to_vec(), b"cab".to_vec()]
+        );
     }
 
     #[test]
     fn trigrams_short_is_empty() {
-        assert!(trigrams(b"ab").is_empty());
-        assert!(trigrams(b"").is_empty());
+        assert!(trigram_grams_bytes(b"ab").is_empty());
+        assert!(trigram_grams_bytes(b"").is_empty());
     }
 
     #[test]
