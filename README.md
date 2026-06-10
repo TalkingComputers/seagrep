@@ -124,18 +124,19 @@ The index narrows candidates. The verifier decides matches.
 
 ## Benchmarks
 
-**Real-world S3** — end-to-end search latency over 200 synthetic 4 KiB objects, indexed search (concurrency 64) vs a sequential (`--concurrency 1`) baseline. Two effects compound: the trigram index **prunes** the candidate set, and concurrent ranged fetch **fans out** the survivors.
+**Real-world S3** — end-to-end search latency over 1000 synthetic 4 KiB objects, indexed search (concurrency 64) vs a sequential (`--concurrency 1`) baseline. Two effects compound: the trigram index **prunes** the candidate set, and concurrent ranged fetch **fans out** the survivors.
 
 | scenario      | pattern                     | hits | candidates/total | p50 ms | seq p50 ms |               speedup |
 | ------------- | --------------------------- | ---: | ---------------: | -----: | ---------: | --------------------: |
-| no_match      | `UNMATCHABLE_TOKEN`         |    0 |            0/200 |    0.0 |        0.0 | index fetches nothing |
-| QAll          | `.*`                        |  200 |          200/200 |    328 |      14290 |                 43.5x |
-| short_literal | `needle`                    |  100 |          100/200 |    814 |       7593 |                  9.3x |
-| alternation   | `alpha\|beta`               |   63 |           63/200 |   1045 |       5371 |                  5.1x |
-| long_literal  | `longliteralbenchmarktoken` |   67 |           67/200 |   3537 |       7927 |                  2.2x |
-| anchored      | `^ANCHOR_START`             |   19 |           19/200 |   1710 |       3008 |                  1.8x |
+| no_match      | `UNMATCHABLE_TOKEN`         |    0 |           0/1000 |    0.0 |        0.0 | index fetches nothing |
+| QAll          | `.*`                        | 1000 |        1000/1000 |   1176 |      68261 |                 58.1x |
+| short_literal | `needle`                    |  500 |         500/1000 |    701 |      32973 |                 47.0x |
+| alternation   | `alpha\|beta`               |  314 |         314/1000 |    525 |      19875 |                 37.9x |
+| long_literal  | `longliteralbenchmarktoken` |  334 |         334/1000 |    628 |      21124 |                 33.6x |
+| anchored      | `^ANCHOR_START`             |   91 |          91/1000 |    216 |       5821 |                 27.0x |
+| dot_star_gap  | `(?s)needle.*alpha`         |  100 |         100/1000 |    279 |       6858 |                 24.6x |
 
-A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** faster than sequential. Caveat: laptop → `us-east-2` over the public internet (per-object RTT dominates; in-region EC2 is far lower), fixed seed 42, 5 iterations; `long_literal`'s 3.5 s is real-network tail variance. Reproduce against your bucket with `make bench-s3`.
+A non-matching query fetches **zero** objects; `.*` over all 1000 is **58x** faster than sequential, and `(?s)needle.*alpha` shows the planner constraining on both sides of the gap (100 candidates, not the 500 containing `needle`). Caveat: laptop → `us-east-2` over the public internet via an SSO profile (per-object RTT dominates; in-region EC2 is far lower), fixed seed 1, 5 iterations. Reproduce against your bucket with `make bench-s3`.
 
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
