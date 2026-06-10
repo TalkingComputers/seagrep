@@ -1,23 +1,14 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! S3 client, blob store, and corpus implementations.
 
+mod client;
 pub mod fetch;
 
 use anyhow::Context;
-use fetch::{fetch_one_hedged, AimdLimiter, RetryBudget};
-use futures::stream::{self, StreamExt};
 use holys3_core::{BlobStore, Corpus, DocId};
-use holys3_sigv4::{encode_query_component, sign_get, sign_request, Credentials, SignedHeaders};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
+pub use client::S3Client;
 pub use fetch::FetchConfig;
-
-static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static>>> =
-    LazyLock::new(|| {
-        time::format_description::parse("[year][month][day]T[hour][minute][second]Z")
-            .expect("invalid amz date format")
-    });
 
 pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
     let default = FetchConfig::default();
@@ -28,42 +19,17 @@ pub fn build_fetch_config(concurrency: usize) -> FetchConfig {
     }
 }
 
-fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .pool_max_idle_per_host(pool_max_idle)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .tcp_keepalive(Duration::from_secs(30))
-        .http2_adaptive_window(true)
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(20))
-        .build()
-}
-
-fn apply_signed(
-    req: reqwest::RequestBuilder,
-    signed: &SignedHeaders,
-    host: &str,
-    session_token: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let req = req
-        .header("host", host)
-        .header("x-amz-date", &signed.x_amz_date)
-        .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
-        .header("authorization", &signed.authorization);
-    match session_token {
-        Some(token) => req.header("x-amz-security-token", token),
-        None => req,
-    }
-}
-
 pub fn region_from_env() -> anyhow::Result<String> {
     std::env::var("AWS_REGION").context("provide --region or set AWS_REGION")
 }
 
-pub fn s3_client_from_env(region: &str, endpoint: Option<String>) -> anyhow::Result<S3Client> {
-    let creds = holys3_sigv4::resolve("default")?;
-    let path_style = endpoint.is_some();
-    S3Client::new(region.to_owned(), creds, endpoint, path_style)
+pub fn s3_client_from_env(
+    region: &str,
+    endpoint: Option<String>,
+    cfg: FetchConfig,
+) -> anyhow::Result<S3Client> {
+    let creds = holys3_sigv4::resolve()?;
+    S3Client::new(region.to_owned(), creds, endpoint, cfg)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,306 +90,6 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
     Ok((objs, next))
 }
 
-#[derive(Clone)]
-pub struct S3Client {
-    pub region: String,
-    pub creds: Credentials,
-    pub endpoint: Option<String>,
-    pub path_style: bool,
-    http: reqwest::Client,
-    retry_http: reqwest::Client,
-}
-
-impl S3Client {
-    pub fn new(
-        region: String,
-        creds: Credentials,
-        endpoint: Option<String>,
-        path_style: bool,
-    ) -> anyhow::Result<S3Client> {
-        Ok(S3Client {
-            region,
-            creds,
-            endpoint,
-            path_style,
-            http: build_http(FetchConfig::default().cap)?,
-            retry_http: build_http(0)?,
-        })
-    }
-
-    pub fn with_fetch_config(&self, cfg: &FetchConfig) -> anyhow::Result<S3Client> {
-        Ok(S3Client {
-            region: self.region.clone(),
-            creds: self.creds.clone(),
-            endpoint: self.endpoint.clone(),
-            path_style: self.path_style,
-            http: build_http(cfg.cap)?,
-            retry_http: build_http(0)?,
-        })
-    }
-
-    fn endpoint_host(endpoint: &str) -> anyhow::Result<String> {
-        let url = reqwest::Url::parse(endpoint)?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("S3 endpoint missing host: {endpoint}"))?;
-        match url.port() {
-            Some(port) => Ok(format!("{host}:{port}")),
-            None => Ok(host.to_owned()),
-        }
-    }
-
-    fn host(&self, bucket: &str) -> anyhow::Result<String> {
-        match &self.endpoint {
-            Some(endpoint) => Self::endpoint_host(endpoint),
-            None => Ok(format!("{bucket}.s3.{}.amazonaws.com", self.region)),
-        }
-    }
-
-    fn object_path(&self, bucket: &str, key: &str) -> anyhow::Result<String> {
-        match &self.endpoint {
-            Some(_) => {
-                anyhow::ensure!(
-                    self.path_style,
-                    "custom S3 endpoint requires path-style addressing"
-                );
-                Ok(format!("/{bucket}/{key}"))
-            }
-            None => Ok(format!("/{key}")),
-        }
-    }
-
-    fn list_path(&self, bucket: &str) -> anyhow::Result<String> {
-        match &self.endpoint {
-            Some(_) => {
-                anyhow::ensure!(
-                    self.path_style,
-                    "custom S3 endpoint requires path-style addressing"
-                );
-                Ok(format!("/{bucket}/"))
-            }
-            None => Ok("/".to_owned()),
-        }
-    }
-
-    fn request_url(&self, host: &str, path: &str, query: &str) -> String {
-        let base = match &self.endpoint {
-            Some(endpoint) => endpoint.trim_end_matches('/').to_owned(),
-            None => format!("https://{host}"),
-        };
-        if query.is_empty() {
-            format!("{base}{path}")
-        } else {
-            format!("{base}{path}?{query}")
-        }
-    }
-
-    /// Timestamp helper: returns (`amz_date`, `date`).
-    fn now() -> (String, String) {
-        let dt = time::OffsetDateTime::now_utc();
-        let amz = dt
-            .format(FORMAT.as_slice())
-            .expect("invalid amz date format");
-        let date = amz[..8].to_string();
-        (amz, date)
-    }
-
-    pub(crate) async fn send_get(
-        &self,
-        http: &reqwest::Client,
-        bucket: &str,
-        key: &str,
-        range: Option<(u64, u64)>,
-    ) -> anyhow::Result<reqwest::Response> {
-        let host = self.host(bucket)?;
-        let path = self.object_path(bucket, key)?;
-        let (amz, date) = Self::now();
-        let range_hdr = range.map(|(a, b)| format!("bytes={a}-{b}"));
-        let extra: Vec<(&str, &str)> = match &range_hdr {
-            Some(r) => vec![("range", r.as_str())],
-            None => vec![],
-        };
-        let signed = sign_get(
-            &self.creds,
-            &self.region,
-            &host,
-            &path,
-            "",
-            &extra,
-            &amz,
-            &date,
-        );
-        let mut req = apply_signed(
-            http.get(self.request_url(&host, &path, "")),
-            &signed,
-            &host,
-            self.creds.session_token.as_deref(),
-        );
-        if let Some(r) = &range_hdr {
-            req = req.header("range", r);
-        }
-        Ok(req.send().await?)
-    }
-
-    pub async fn get(
-        &self,
-        bucket: &str,
-        key: &str,
-        range: Option<(u64, u64)>,
-    ) -> anyhow::Result<Vec<u8>> {
-        let resp = self
-            .send_get(&self.http, bucket, key, range)
-            .await?
-            .error_for_status()?;
-        Ok(resp.bytes().await?.to_vec())
-    }
-
-    pub async fn get_range(
-        &self,
-        bucket: &str,
-        key: &str,
-        start: u64,
-        len: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let end = start
-            .checked_add(len)
-            .and_then(|v| v.checked_sub(1))
-            .ok_or_else(|| anyhow::anyhow!("invalid empty S3 range"))?;
-        self.get(bucket, key, Some((start, end))).await
-    }
-
-    pub async fn put(&self, bucket: &str, key: &str, body: &[u8]) -> anyhow::Result<()> {
-        let host = self.host(bucket)?;
-        let path = self.object_path(bucket, key)?;
-        let (amz, date) = Self::now();
-        let signed = sign_request(
-            "PUT",
-            &self.creds,
-            &self.region,
-            &host,
-            &path,
-            "",
-            &[],
-            &amz,
-            &date,
-            "UNSIGNED-PAYLOAD",
-        );
-        let req = apply_signed(
-            self.http.put(self.request_url(&host, &path, "")),
-            &signed,
-            &host,
-            self.creds.session_token.as_deref(),
-        )
-        .body(body.to_vec());
-        req.send().await?.error_for_status()?;
-        Ok(())
-    }
-
-    pub async fn list(&self, bucket: &str, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
-        let host = self.host(bucket)?;
-        let path = self.list_path(bucket)?;
-        let mut all = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut params = vec![("list-type", "2".to_owned()), ("prefix", prefix.to_owned())];
-            if let Some(t) = &token {
-                params.push(("continuation-token", t.clone()));
-            }
-            params.sort_by(|a, b| a.0.cmp(b.0));
-            let canonical_query = params
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}={}",
-                        encode_query_component(k),
-                        encode_query_component(v)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-            let (amz, date) = Self::now();
-            let signed = sign_get(
-                &self.creds,
-                &self.region,
-                &host,
-                &path,
-                &canonical_query,
-                &[],
-                &amz,
-                &date,
-            );
-            let req = apply_signed(
-                self.http
-                    .get(self.request_url(&host, &path, &canonical_query)),
-                &signed,
-                &host,
-                self.creds.session_token.as_deref(),
-            );
-            let body = req.send().await?.error_for_status()?.text().await?;
-            let (objs, next) = parse_list_v2(&body)?;
-            all.extend(objs);
-            match next {
-                Some(t) => token = Some(t),
-                None => break,
-            }
-        }
-        Ok(all)
-    }
-}
-
-pub struct S3BlobStore {
-    client: S3Client,
-    bucket: String,
-    prefix: String,
-    rt: tokio::runtime::Handle,
-}
-
-impl S3BlobStore {
-    pub fn new(
-        client: S3Client,
-        bucket: String,
-        prefix: String,
-        rt: tokio::runtime::Handle,
-        cfg: FetchConfig,
-    ) -> anyhow::Result<S3BlobStore> {
-        Ok(S3BlobStore {
-            client: client.with_fetch_config(&cfg)?,
-            bucket,
-            prefix,
-            rt,
-        })
-    }
-
-    fn build_key(&self, name: &str) -> String {
-        build_index_key(&self.prefix, name)
-    }
-}
-
-impl BlobStore for S3BlobStore {
-    fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(self.client.put(&self.bucket, &self.build_key(name), bytes))
-        })
-    }
-
-    fn get(&self, name: &str) -> anyhow::Result<Vec<u8>> {
-        tokio::task::block_in_place(|| {
-            self.rt
-                .block_on(self.client.get(&self.bucket, &self.build_key(name), None))
-        })
-    }
-
-    fn get_range(&self, name: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(
-                self.client
-                    .get_range(&self.bucket, &self.build_key(name), start, len),
-            )
-        })
-    }
-}
-
 pub fn build_index_key(prefix: &str, name: &str) -> String {
     format!(
         "{}/{}",
@@ -449,8 +115,72 @@ pub fn normalize_prefix(prefix: &str) -> String {
         .join("/")
 }
 
+/// `ListObjectsV2` prefix with directory semantics: "foo" must not match
+/// sibling keys like "foobar/x".
+pub fn list_prefix(prefix: &str) -> String {
+    let normalized = normalize_prefix(prefix);
+    if normalized.is_empty() {
+        normalized
+    } else {
+        format!("{normalized}/")
+    }
+}
+
 pub fn is_index_key(prefix: &str, key: &str) -> bool {
     key.starts_with(&format!("{}/", build_index_namespace(prefix)))
+}
+
+/// Index blob storage under `<prefix>/.holys3/` in the bucket.
+pub struct S3BlobStore {
+    client: S3Client,
+    bucket: String,
+    prefix: String,
+}
+
+impl S3BlobStore {
+    pub fn new(client: S3Client, bucket: String, prefix: String) -> S3BlobStore {
+        S3BlobStore {
+            client,
+            bucket,
+            prefix,
+        }
+    }
+
+    fn build_key(&self, name: &str) -> String {
+        build_index_key(&self.prefix, name)
+    }
+
+    fn blob_context(&self, name: &str) -> String {
+        format!(
+            "index blob s3://{}/{} not found — run `holys3 index` first",
+            self.bucket,
+            self.build_key(name)
+        )
+    }
+}
+
+impl BlobStore for S3BlobStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.client.put(&self.bucket, &self.build_key(name), bytes)
+    }
+
+    fn get(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        self.client
+            .get(&self.bucket, &self.build_key(name))?
+            .with_context(|| self.blob_context(name))
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        self.client
+            .get_range(&self.bucket, &self.build_key(name), start, len)?
+            .with_context(|| self.blob_context(name))
+    }
+
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.client
+            .get_ranges(&self.bucket, &self.build_key(name), ranges)?
+            .with_context(|| self.blob_context(name))
+    }
 }
 
 /// Corpus over an S3 prefix. Loads object list eagerly; fetches bytes on demand.
@@ -458,46 +188,24 @@ pub struct S3Corpus {
     client: S3Client,
     bucket: String,
     docs: Vec<(DocId, String)>,
-    rt: tokio::runtime::Handle,
-    cfg: FetchConfig,
 }
 
 impl S3Corpus {
-    pub fn new(
-        client: S3Client,
-        bucket: String,
-        objects: Vec<ObjectMeta>,
-        rt: tokio::runtime::Handle,
-        cfg: FetchConfig,
-    ) -> anyhow::Result<S3Corpus> {
+    pub fn new(client: S3Client, bucket: String, objects: &[ObjectMeta]) -> S3Corpus {
         let docs = objects
             .iter()
             .enumerate()
             .map(|(i, o)| (i as DocId, o.key.clone()))
             .collect();
-        Ok(S3Corpus {
-            client: client.with_fetch_config(&cfg)?,
-            bucket,
-            docs,
-            rt,
-            cfg,
-        })
+        S3Corpus::from_docs(client, bucket, docs)
     }
 
-    pub fn from_docs(
-        client: S3Client,
-        bucket: String,
-        docs: Vec<(DocId, String)>,
-        rt: tokio::runtime::Handle,
-        cfg: FetchConfig,
-    ) -> anyhow::Result<S3Corpus> {
-        Ok(S3Corpus {
-            client: client.with_fetch_config(&cfg)?,
+    pub fn from_docs(client: S3Client, bucket: String, docs: Vec<(DocId, String)>) -> S3Corpus {
+        S3Corpus {
+            client,
             bucket,
             docs,
-            rt,
-            cfg,
-        })
+        }
     }
 }
 
@@ -507,50 +215,44 @@ impl Corpus for S3Corpus {
     }
 
     fn fetch(&self, id: DocId) -> anyhow::Result<Vec<u8>> {
-        let mut docs = self.fetch_many(&[id])?;
-        let (fetched_id, bytes) = docs.pop().context("fetch_many returned no result")?;
-        anyhow::ensure!(
-            fetched_id == id,
-            "fetch_many returned doc {fetched_id} for requested doc {id}"
-        );
-        Ok(bytes)
+        let key = &self.docs[id as usize].1;
+        self.client
+            .get(&self.bucket, key)?
+            .with_context(|| format!("s3://{}/{key} not found", self.bucket))
     }
 
+    /// Concurrent batch fetch. Objects deleted since indexing (404) are
+    /// skipped with a warning — the index entry is stale, not the search.
     fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
+        let mut docs = Vec::with_capacity(ids.len());
+        self.fetch_each(ids, &mut |id, bytes| {
+            docs.push((id, bytes));
+            Ok(())
+        })?;
+        Ok(docs)
+    }
+
+    /// Concurrent streaming fetch with the same stale-404 skip policy.
+    fn fetch_each(
+        &self,
+        ids: &[DocId],
+        consume: &mut dyn FnMut(DocId, Vec<u8>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let keys = ids
             .iter()
             .map(|&id| (id, self.docs[id as usize].1.clone()))
             .collect::<Vec<_>>();
-        let client = self.client.clone();
-        let bucket = self.bucket.clone();
-        let cfg = self.cfg.clone();
-        tokio::task::block_in_place(|| {
-            self.rt.block_on(async move {
-                let limiter = Arc::new(AimdLimiter::new(cfg.start, cfg.cap));
-                let budget = Arc::new(RetryBudget::new(cfg.retry_tokens));
-                let results = stream::iter(keys.into_iter().map(|(id, key)| {
-                    let client = client.clone();
-                    let bucket = bucket.clone();
-                    let limiter = Arc::clone(&limiter);
-                    let budget = Arc::clone(&budget);
-                    let cfg = cfg.clone();
-                    async move {
-                        (
-                            id,
-                            fetch_one_hedged(&client, &bucket, &key, &limiter, &budget, &cfg).await,
-                        )
-                    }
-                }))
-                .buffer_unordered(cfg.buffer)
-                .collect::<Vec<_>>()
-                .await;
-                let mut fetched = Vec::with_capacity(results.len());
-                for (id, result) in results {
-                    fetched.push((id, result?));
+        self.client
+            .get_each(&self.bucket, keys, &mut |id, bytes| match bytes {
+                Some(bytes) => consume(id, bytes),
+                None => {
+                    eprintln!(
+                        "warning: s3://{}/{} vanished since indexing; skipping",
+                        self.bucket, self.docs[id as usize].1
+                    );
+                    Ok(())
                 }
-                Ok(fetched)
             })
-        })
     }
 }
 
@@ -597,7 +299,6 @@ mod tests {
         let cfg = build_fetch_config(16);
         assert_eq!(cfg.start, 16);
         assert_eq!(cfg.cap, 16);
-        assert_eq!(cfg.buffer, FetchConfig::default().buffer);
     }
 
     #[test]
@@ -609,5 +310,13 @@ mod tests {
         );
         assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
         assert!(!is_index_key("root/path", "root/path/file.txt"));
+    }
+
+    #[test]
+    fn list_prefix_uses_directory_semantics() {
+        assert_eq!(list_prefix(""), "");
+        assert_eq!(list_prefix("foo"), "foo/");
+        assert_eq!(list_prefix("foo/"), "foo/");
+        assert_eq!(list_prefix("/a//b/"), "a/b/");
     }
 }

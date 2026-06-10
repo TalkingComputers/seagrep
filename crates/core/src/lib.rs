@@ -1,12 +1,72 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Shared types, gram extraction, storage traits, and scan verification.
 
-use anyhow::Result as AnyhowResult;
+use anyhow::{Context, Result as AnyhowResult};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 pub type DocId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    Raw,
+    Gzip,
+    Zstd,
+}
+
+/// Detect compression by magic bytes; key extensions are not trusted.
+/// Gzip requires the deflate method byte (1f 8b 08) — the only method the
+/// format defines. Zstd covers both regular frames (28 b5 2f fd) and
+/// skippable frames (5? 2a 4d 18), which may legally come first.
+pub fn detect_codec(bytes: &[u8]) -> Codec {
+    if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
+        Codec::Gzip
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+        || (bytes.len() >= 4
+            && bytes[0] & 0xf0 == 0x50
+            && bytes[1] == 0x2a
+            && bytes[2] == 0x4d
+            && bytes[3] == 0x18)
+    {
+        Codec::Zstd
+    } else {
+        Codec::Raw
+    }
+}
+
+/// Transparently decompress an object body. Gzip uses `MultiGzDecoder`
+/// because AWS log deliveries (ALB, `CloudTrail`, `CloudFront`) concatenate
+/// gzip members; a single-member decoder silently truncates them. A decode
+/// error after some members already decoded (trailing padding or a truncated
+/// tail) salvages the decoded text with a warning — for grep, partial
+/// coverage beats dropping the object.
+pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
+    match detect_codec(&bytes) {
+        Codec::Raw => Ok(bytes),
+        Codec::Gzip => {
+            let mut out = Vec::new();
+            match std::io::Read::read_to_end(
+                &mut flate2::read::MultiGzDecoder::new(bytes.as_slice()),
+                &mut out,
+            ) {
+                Ok(_) => Ok(out),
+                Err(err) if !out.is_empty() => {
+                    eprintln!(
+                        "warning: {key}: gzip stream ends in garbage ({err}); \
+                         searching the {} bytes that decoded",
+                        out.len()
+                    );
+                    Ok(out)
+                }
+                Err(err) => {
+                    Err(anyhow::Error::new(err).context(format!("gzip decode failed for {key}")))
+                }
+            }
+        }
+        Codec::Zstd => zstd::stream::decode_all(bytes.as_slice())
+            .with_context(|| format!("zstd decode failed for {key}")),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Strategy {
@@ -162,10 +222,27 @@ pub trait Corpus {
     fn docs(&self) -> &[(DocId, String)];
     /// Fetch the full bytes of one document.
     fn fetch(&self, id: DocId) -> AnyhowResult<Vec<u8>>;
-    /// Fetch many docs concurrently. Result order is NOT guaranteed; each item carries its `DocId`.
-    /// Fail-fast: the first fetch error aborts the batch. Default = sequential.
+    /// Fetch many docs concurrently. Result order is NOT guaranteed; each item
+    /// carries its `DocId`. Implementations may return fewer docs than
+    /// requested when a doc vanished between indexing and fetching.
+    /// Default = sequential, fail-fast.
     fn fetch_many(&self, ids: &[DocId]) -> anyhow::Result<Vec<(DocId, Vec<u8>)>> {
         ids.iter().map(|&id| Ok((id, self.fetch(id)?))).collect()
+    }
+
+    /// Stream docs to `consume` as fetches complete (order NOT guaranteed).
+    /// Implementations may fetch concurrently and may skip vanished docs.
+    /// The first `consume` error aborts the remaining fetches.
+    /// Default = sequential.
+    fn fetch_each(
+        &self,
+        ids: &[DocId],
+        consume: &mut dyn FnMut(DocId, Vec<u8>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        for &id in ids {
+            consume(id, self.fetch(id)?)?;
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +250,14 @@ pub trait BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
     fn get(&self, name: &str) -> AnyhowResult<Vec<u8>>;
     fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>>;
+    /// Fetch many byte ranges of one blob, preserving order. Implementations
+    /// may fetch concurrently. Default = sequential.
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> AnyhowResult<Vec<Vec<u8>>> {
+        ranges
+            .iter()
+            .map(|&(start, len)| self.get_range(name, start, len))
+            .collect()
+    }
 }
 
 #[cfg(any(test, feature = "testutil"))]
@@ -247,22 +332,25 @@ pub struct Match {
     pub text: String,
 }
 
-/// Run `re` over `bytes`, returning one Match per matching line occurrence.
+/// Run `re` over `bytes`, returning one Match per matching occurrence.
+/// Single pass: line numbers are tracked incrementally across matches.
 pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Match> {
     let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    let mut counted_to = 0usize;
     for m in re.find_iter(bytes) {
         let start = m.start();
-        let line_start = bytes[..start]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |p| p + 1);
-        let line_end = bytes[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(bytes.len(), |p| start + p);
+        let gap = &bytes[counted_to..start];
+        line += memchr::memchr_iter(b'\n', gap).count();
+        if let Some(p) = memchr::memrchr(b'\n', gap) {
+            line_start = counted_to + p + 1;
+        }
+        counted_to = start;
+        let line_end = memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |p| start + p);
         out.push(Match {
             doc,
-            line: bytes[..start].iter().filter(|&&b| b == b'\n').count() + 1,
+            line,
             col: start - line_start + 1,
             text: String::from_utf8_lossy(&bytes[line_start..line_end]).into_owned(),
         });
@@ -274,14 +362,15 @@ pub fn matches_in(doc: DocId, bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Mat
 pub fn scan_matching_docs(
     corpus: &dyn Corpus,
     re: &regex::bytes::Regex,
-) -> AnyhowResult<BTreeSet<DocId>> {
-    let mut hits = BTreeSet::new();
+) -> AnyhowResult<Vec<DocId>> {
+    let mut hits = Vec::new();
     for &(id, _) in corpus.docs() {
         let bytes = corpus.fetch(id)?;
         if re.is_match(&bytes) {
-            hits.insert(id);
+            hits.push(id);
         }
     }
+    hits.sort_unstable();
     Ok(hits)
 }
 
@@ -336,6 +425,10 @@ mod tests {
         store.put("builds/a/postings.bin", b"abcdef")?;
         assert_eq!(store.get("builds/a/postings.bin")?, b"abcdef");
         assert_eq!(store.get_range("builds/a/postings.bin", 2, 3)?, b"cde");
+        assert_eq!(
+            store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?,
+            vec![b"ab".to_vec(), b"ef".to_vec()]
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -452,7 +545,7 @@ mod corpus_tests {
             vec![b"hello world".to_vec(), b"nothing here".to_vec()],
         );
         let re = regex::bytes::Regex::new("world").unwrap();
-        assert_eq!(scan_matching_docs(&c, &re).unwrap(), BTreeSet::from([0]));
+        assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec![0]);
     }
 
     #[test]
@@ -471,6 +564,69 @@ mod corpus_tests {
                 text: "bar baz".into()
             }]
         );
+    }
+
+    #[test]
+    fn matches_in_tracks_lines_across_matches() {
+        let bytes = b"alpha x\nbeta\nx gamma x\nx";
+        let re = regex::bytes::Regex::new("x").unwrap();
+        let m = matches_in(1, bytes, &re);
+        let positions: Vec<(usize, usize, &str)> =
+            m.iter().map(|m| (m.line, m.col, m.text.as_str())).collect();
+        assert_eq!(
+            positions,
+            vec![
+                (1, 7, "alpha x"),
+                (3, 1, "x gamma x"),
+                (3, 9, "x gamma x"),
+                (4, 1, "x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_body_handles_raw_gzip_multimember_and_zstd() {
+        use std::io::Write;
+
+        assert_eq!(
+            decode_body("k", b"plain text".to_vec()).unwrap(),
+            b"plain text"
+        );
+
+        let gz = |data: &[u8]| {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut multi = gz(b"first member\n");
+        multi.extend(gz(b"second member\n"));
+        assert_eq!(
+            decode_body("k.gz", multi).unwrap(),
+            b"first member\nsecond member\n"
+        );
+
+        let zst = zstd::stream::encode_all(&b"zstd body"[..], 0).unwrap();
+        assert_eq!(decode_body("k.zst", zst).unwrap(), b"zstd body");
+
+        let truncated = gz(b"data")[..6].to_vec();
+        let err = decode_body("bad.gz", truncated).unwrap_err();
+        assert!(err.to_string().contains("bad.gz"));
+    }
+
+    #[test]
+    fn fetch_each_streams_in_order_for_default_impl() {
+        use crate::testutil::MemCorpus;
+        let c = MemCorpus::new(
+            vec![(0, "a".into()), (1, "b".into())],
+            vec![b"one".to_vec(), b"two".to_vec()],
+        );
+        let mut seen = Vec::new();
+        c.fetch_each(&[1, 0], &mut |id, bytes| {
+            seen.push((id, bytes));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(1, b"two".to_vec()), (0, b"one".to_vec())]);
     }
 
     #[test]

@@ -1,20 +1,22 @@
-use crate::S3Client;
 use anyhow::Result;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Shrink the AIMD window at most once per cooldown so one burst of 503s
+/// counts as a single congestion event instead of collapsing the limit to 1.
+const SHRINK_COOLDOWN_MS: u64 = 500;
 
 #[derive(Clone)]
 pub struct FetchConfig {
     pub start: usize,
     pub cap: usize,
-    pub buffer: usize,
     pub max_retries: u32,
     pub backoff_base_ms: u64,
     pub backoff_cap_ms: u64,
     pub hedge_after: Duration,
-    pub retry_tokens: usize,
+    pub hedge_tokens: usize,
 }
 
 impl Default for FetchConfig {
@@ -22,12 +24,11 @@ impl Default for FetchConfig {
         FetchConfig {
             start: 64,
             cap: 750,
-            buffer: 1000,
             max_retries: 5,
             backoff_base_ms: 50,
             backoff_cap_ms: 20_000,
             hedge_after: Duration::from_secs(2),
-            retry_tokens: 500,
+            hedge_tokens: 500,
         }
     }
 }
@@ -37,6 +38,8 @@ pub(crate) struct AimdLimiter {
     limit: AtomicUsize,
     cap: usize,
     pending_shrink: AtomicUsize,
+    started: Instant,
+    next_shrink_allowed_ms: AtomicU64,
 }
 
 impl AimdLimiter {
@@ -46,6 +49,8 @@ impl AimdLimiter {
             limit: AtomicUsize::new(start),
             cap,
             pending_shrink: AtomicUsize::new(0),
+            started: Instant::now(),
+            next_shrink_allowed_ms: AtomicU64::new(0),
         }
     }
 
@@ -79,6 +84,21 @@ impl AimdLimiter {
     }
 
     pub(crate) fn on_throttle(&self) {
+        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let allowed = self.next_shrink_allowed_ms.load(Ordering::Relaxed);
+        if now_ms < allowed
+            || self
+                .next_shrink_allowed_ms
+                .compare_exchange(
+                    allowed,
+                    now_ms.saturating_add(SHRINK_COOLDOWN_MS),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
         let mut current = self.limit.load(Ordering::Relaxed);
         while current > 1 {
             let next = current / 2;
@@ -131,30 +151,32 @@ impl AimdLimiter {
     }
 }
 
-pub(crate) struct RetryBudget {
+/// Bounds how many hedged (speculative duplicate) requests run at once.
+/// Tokens return when the hedge completes, win or lose.
+pub(crate) struct HedgeBudget {
     tokens: AtomicUsize,
     cap: usize,
 }
 
-pub(crate) struct RetryToken<'a> {
-    budget: &'a RetryBudget,
+pub(crate) struct HedgeToken<'a> {
+    budget: &'a HedgeBudget,
 }
 
-impl Drop for RetryToken<'_> {
+impl Drop for HedgeToken<'_> {
     fn drop(&mut self) {
         self.budget.refund();
     }
 }
 
-impl RetryBudget {
-    pub(crate) fn new(tokens: usize) -> RetryBudget {
-        RetryBudget {
+impl HedgeBudget {
+    pub(crate) fn new(tokens: usize) -> HedgeBudget {
+        HedgeBudget {
             tokens: AtomicUsize::new(tokens),
             cap: tokens,
         }
     }
 
-    pub(crate) fn try_take(&self) -> Option<RetryToken<'_>> {
+    pub(crate) fn try_take(&self) -> Option<HedgeToken<'_>> {
         let mut current = self.tokens.load(Ordering::Relaxed);
         while current > 0 {
             match self.tokens.compare_exchange(
@@ -163,7 +185,7 @@ impl RetryBudget {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(RetryToken { budget: self }),
+                Ok(_) => return Some(HedgeToken { budget: self }),
                 Err(observed) => current = observed,
             }
         }
@@ -186,112 +208,13 @@ impl RetryBudget {
     }
 }
 
-enum GetAttempt {
-    Bytes(Vec<u8>),
-    SlowDown,
-}
-
-pub(crate) async fn get_with_retry(
-    client: &S3Client,
-    bucket: &str,
-    key: &str,
-    limiter: &AimdLimiter,
-    budget: &RetryBudget,
-    cfg: &FetchConfig,
-) -> Result<Vec<u8>> {
-    let mut attempt = 0;
-    let mut retry_token = None;
-    loop {
-        let http = if attempt == 0 {
-            &client.http
-        } else {
-            &client.retry_http
-        };
-        let result = get_once(client, http, bucket, key, limiter).await;
-        drop(retry_token.take());
-        match result? {
-            GetAttempt::Bytes(bytes) => return Ok(bytes),
-            GetAttempt::SlowDown => {
-                if attempt >= cfg.max_retries {
-                    anyhow::bail!("S3 GET s3://{bucket}/{key} returned HTTP 503");
-                }
-                retry_token = budget.try_take();
-                if retry_token.is_none() {
-                    anyhow::bail!("S3 GET s3://{bucket}/{key} exhausted retry budget");
-                }
-                let exponential = cfg
-                    .backoff_base_ms
-                    .saturating_mul(2_u64.saturating_pow(attempt));
-                let cap = exponential.min(cfg.backoff_cap_ms);
-                let delay = rand::random_range(0..=cap);
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-                attempt += 1;
-            }
-        }
-    }
-}
-
-async fn get_once(
-    client: &S3Client,
-    http: &reqwest::Client,
-    bucket: &str,
-    key: &str,
-    limiter: &AimdLimiter,
-) -> Result<GetAttempt> {
-    let permit = limiter.acquire().await?;
-    let resp = client.send_get(http, bucket, key, None).await?;
-    if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        drop(permit);
-        limiter.on_throttle();
-        return Ok(GetAttempt::SlowDown);
-    }
-    let resp = resp.error_for_status()?;
-    let bytes = resp.bytes().await?.to_vec();
-    limiter.on_success();
-    drop(permit);
-    Ok(GetAttempt::Bytes(bytes))
-}
-
-pub(crate) async fn fetch_one_hedged(
-    client: &S3Client,
-    bucket: &str,
-    key: &str,
-    limiter: &AimdLimiter,
-    budget: &RetryBudget,
-    cfg: &FetchConfig,
-) -> Result<Vec<u8>> {
-    let primary = get_with_retry(client, bucket, key, limiter, budget, cfg);
-    tokio::pin!(primary);
-    tokio::select! {
-        biased;
-        result = &mut primary => result,
-        () = tokio::time::sleep(cfg.hedge_after) => {
-            let Some(hedge_token) = budget.try_take() else {
-                return primary.await;
-            };
-            let hedge = async {
-                let hedge_token_guard = hedge_token;
-                let result = get_with_retry(client, bucket, key, limiter, budget, cfg).await;
-                drop(hedge_token_guard);
-                result
-            };
-            tokio::pin!(hedge);
-            tokio::select! {
-                biased;
-                result = &mut primary => result,
-                result = &mut hedge => result,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn retry_token_drop_refunds_capacity() {
-        let budget = RetryBudget::new(3);
+    fn hedge_token_drop_refunds_capacity() {
+        let budget = HedgeBudget::new(3);
         let token = budget.try_take().unwrap();
 
         assert_eq!(budget.tokens.load(Ordering::Relaxed), 2);
@@ -302,8 +225,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_token_drop_restores_exhausted_capacity() {
-        let budget = RetryBudget::new(2);
+    fn hedge_token_drop_restores_exhausted_capacity() {
+        let budget = HedgeBudget::new(2);
         let first = budget.try_take().unwrap();
         let second = budget.try_take().unwrap();
 
@@ -338,5 +261,16 @@ mod tests {
         drop(permit);
 
         assert_eq!(limiter.semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn throttle_burst_shrinks_once_within_cooldown() {
+        let limiter = AimdLimiter::new(8, 8);
+
+        limiter.on_throttle();
+        limiter.on_throttle();
+        limiter.on_throttle();
+
+        assert_eq!(limiter.limit.load(Ordering::Relaxed), 4);
     }
 }

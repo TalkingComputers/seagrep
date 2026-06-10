@@ -9,12 +9,11 @@ use gen::{
 };
 use holys3_core::{Corpus, DocId, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, search_with_stats, IndexReader, LocalCorpus, MmapIndexReader,
-    StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search_collect, IndexReader, LocalCorpus,
+    MmapIndexReader, StoreIndexReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, s3_client_from_env, ObjectMeta, S3BlobStore,
-    S3Client, S3Corpus,
+    build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
 };
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const S3_PREFIX: &str = "xbench";
-const BUILD_ID: &str = "xbench";
 const DEFAULT_CONCURRENCY: usize = 64;
 
 #[derive(Parser)]
@@ -116,7 +114,7 @@ struct RunSummary {
 
 struct SearchMeasurement {
     elapsed: Duration,
-    hits: BTreeSet<DocId>,
+    hits: Vec<DocId>,
     candidates: usize,
     total_docs: usize,
     bytes_fetched: u64,
@@ -139,8 +137,7 @@ struct S3Backend {
     client: S3Client,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Seed {
             seed,
@@ -152,24 +149,24 @@ async fn main() -> Result<()> {
             println!("objects={}", manifest.objects);
             Ok(())
         }
-        Command::Upload { target } => upload(target).await,
+        Command::Upload { target } => upload(target),
         Command::Run {
             scenarios,
             iterations,
             warmup,
             concurrency,
-        } => run(&scenarios, iterations, warmup, concurrency).await,
+        } => run(&scenarios, iterations, warmup, concurrency),
         Command::Report { out } => report(&out),
         Command::Compare { base, candidate } => compare(&base, &candidate),
         Command::Render { input } => render(&input),
     }
 }
 
-async fn upload(target: UploadTarget) -> Result<()> {
+fn upload(target: UploadTarget) -> Result<()> {
     let manifest = read_manifest()?;
     match target {
         UploadTarget::Dir => upload_dir(&manifest),
-        UploadTarget::S3 => upload_s3(&manifest).await,
+        UploadTarget::S3 => upload_s3(&manifest),
     }
 }
 
@@ -185,56 +182,53 @@ fn upload_dir(manifest: &SeedManifest) -> Result<()> {
     Ok(())
 }
 
-async fn upload_s3(manifest: &SeedManifest) -> Result<()> {
-    let backend = read_s3_backend()?;
-    for doc in &manifest.docs {
-        let bytes = std::fs::read(doc_path(doc))?;
-        backend
-            .client
-            .put(&backend.bucket, &format!("{S3_PREFIX}/{}", doc.key), &bytes)
-            .await?;
-    }
-    let objects = manifest
+fn upload_s3(manifest: &SeedManifest) -> Result<()> {
+    let backend = read_s3_backend(DEFAULT_CONCURRENCY)?;
+    let uploads = manifest
         .docs
         .iter()
-        .map(|doc| ObjectMeta {
-            key: format!("{S3_PREFIX}/{}", doc.key),
-            etag: format!("{:016x}", holys3_core::hash_ngram(doc.key.as_bytes())),
-            size: doc.bytes,
+        .map(|doc| {
+            Ok((
+                format!("{S3_PREFIX}/{}", doc.key),
+                std::fs::read(doc_path(doc))?,
+            ))
         })
+        .collect::<Result<Vec<_>>>()?;
+    backend.client.put_many(&backend.bucket, uploads)?;
+    let manifest_keys = manifest
+        .docs
+        .iter()
+        .map(|doc| format!("{S3_PREFIX}/{}", doc.key))
+        .collect::<BTreeSet<_>>();
+    let objects = backend
+        .client
+        .list(&backend.bucket, &format!("{S3_PREFIX}/"))?
+        .into_iter()
+        .filter(|object| manifest_keys.contains(&object.key))
         .collect::<Vec<_>>();
-    let rt = tokio::runtime::Handle::current();
-    let cfg = build_fetch_config(DEFAULT_CONCURRENCY);
-    let corpus = S3Corpus::new(
-        backend.client.clone(),
-        backend.bucket.clone(),
-        objects,
-        rt.clone(),
-        cfg.clone(),
-    )?;
-    let store = S3BlobStore::new(
-        backend.client,
-        backend.bucket.clone(),
-        S3_PREFIX.to_owned(),
-        rt,
-        cfg,
-    )?;
-    build_to_store(&corpus, &store, Strategy::Sparse, BUILD_ID)?;
+    anyhow::ensure!(
+        objects.len() == manifest.docs.len(),
+        "uploaded {} objects but listed {} of them",
+        manifest.docs.len(),
+        objects.len()
+    );
+    let object_ids = objects
+        .iter()
+        .map(|object| (object.key.clone(), object.etag.clone()))
+        .collect::<Vec<_>>();
+    let build_id = compute_build_id(&object_ids, Strategy::Sparse);
+    let corpus = S3Corpus::new(backend.client.clone(), backend.bucket.clone(), &objects);
+    let store = S3BlobStore::new(backend.client, backend.bucket.clone(), S3_PREFIX.to_owned());
+    build_to_store(&corpus, &store, Strategy::Sparse, &build_id)?;
     println!(
-        "s3://{}/{}/builds/{}",
+        "s3://{}/{}/builds/{build_id}",
         backend.bucket,
-        build_index_namespace(S3_PREFIX),
-        BUILD_ID
+        build_index_namespace(S3_PREFIX)
     );
     Ok(())
 }
 
-async fn run(
-    scenarios_path: &Path,
-    iterations: usize,
-    warmup: usize,
-    concurrency: usize,
-) -> Result<()> {
+fn run(scenarios_path: &Path, iterations: usize, warmup: usize, concurrency: usize) -> Result<()> {
     anyhow::ensure!(iterations > 0, "iterations must be greater than 0");
     anyhow::ensure!(concurrency > 0, "concurrency must be greater than 0");
     let scenarios = read_scenarios(scenarios_path)?;
@@ -290,33 +284,25 @@ fn run_s3(
     warmup: usize,
     concurrency: usize,
 ) -> Result<RunSummary> {
-    let backend = read_s3_backend()?;
-    let rt = tokio::runtime::Handle::current();
-    let cfg = build_fetch_config(concurrency);
-    let single_cfg = build_fetch_config(1);
+    let backend = read_s3_backend(concurrency)?;
+    let single_backend = read_s3_backend(1)?;
     let store = S3BlobStore::new(
         backend.client.clone(),
         backend.bucket.clone(),
         S3_PREFIX.to_owned(),
-        rt.clone(),
-        cfg.clone(),
-    )?;
+    );
     let cache_dir = reports_dir().join("s3-cache");
     let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
     let corpus = S3Corpus::from_docs(
         backend.client.clone(),
         backend.bucket.clone(),
         reader.docs().to_vec(),
-        rt.clone(),
-        cfg,
-    )?;
+    );
     let single_corpus = S3Corpus::from_docs(
-        backend.client.clone(),
+        single_backend.client,
         backend.bucket.clone(),
         reader.docs().to_vec(),
-        rt,
-        single_cfg,
-    )?;
+    );
     let results = run_all(
         &reader,
         &corpus,
@@ -446,7 +432,7 @@ fn measure_search(
     pattern: &str,
 ) -> Result<SearchMeasurement> {
     let start = Instant::now();
-    let stats = search_with_stats(reader, corpus, pattern)?;
+    let (_, stats) = search_collect(reader, corpus, pattern)?;
     Ok(SearchMeasurement {
         elapsed: start.elapsed(),
         hits: stats.hits,
@@ -539,11 +525,11 @@ fn percent_delta(base: f64, candidate: f64) -> f64 {
     ((candidate - base) / base) * 100.0
 }
 
-fn read_s3_backend() -> Result<S3Backend> {
+fn read_s3_backend(concurrency: usize) -> Result<S3Backend> {
     let bucket = std::env::var("HOLYS3_BENCH_BUCKET")?;
     let region = std::env::var("HOLYS3_BENCH_REGION")?;
     let endpoint = read_optional_env("HOLYS3_BENCH_ENDPOINT")?;
-    let client = s3_client_from_env(&region, endpoint.clone())?;
+    let client = s3_client_from_env(&region, endpoint.clone(), build_fetch_config(concurrency))?;
     Ok(S3Backend {
         bucket,
         region,

@@ -1,11 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use holys3_core::{grams_index, grams_query, testutil::MemCorpus, DocId, LocalBlobStore, Strategy};
-use holys3_index::{
-    build_to_dir, build_to_store, decode_postings_block, eval_query, IndexReader, MmapIndexReader,
-    StoreIndexReader,
-};
-use holys3_query::{plan, Query};
-use std::collections::{BTreeMap, BTreeSet};
+use holys3_core::{grams_index, grams_query, testutil::MemCorpus, LocalBlobStore, Strategy};
+use holys3_index::{build_to_dir, build_to_store, IndexReader, MmapIndexReader, StoreIndexReader};
+use holys3_query::plan;
 use std::hint::black_box;
 
 const SAMPLE: &[u8] = include_bytes!("fixtures/sample.txt");
@@ -22,28 +18,6 @@ fn mem_corpus() -> MemCorpus {
         bodies.push(body);
     }
     MemCorpus::new(docs, bodies)
-}
-
-fn postings_fixture() -> (BTreeMap<Vec<u8>, u64>, Vec<u8>, BTreeSet<DocId>) {
-    let mut postings = BTreeMap::new();
-    let mut bytes = Vec::new();
-    let mut all = BTreeSet::new();
-    for id in 0..128_u32 {
-        all.insert(id);
-    }
-    for (gram, docs) in [
-        (b"ERR".to_vec(), vec![1_u32, 3, 5, 8, 13, 21, 34, 55]),
-        (b"tim".to_vec(), vec![2_u32, 3, 5, 7, 11, 13, 17, 19]),
-        (b"han".to_vec(), vec![1_u32, 2, 3, 5, 8, 13, 21]),
-    ] {
-        let offset = bytes.len() as u64;
-        bytes.extend_from_slice(&(docs.len() as u32).to_le_bytes());
-        for id in docs {
-            bytes.extend_from_slice(&id.to_le_bytes());
-        }
-        postings.insert(gram, offset);
-    }
-    (postings, bytes, all)
 }
 
 fn bench_grams(c: &mut Criterion) {
@@ -73,25 +47,6 @@ fn bench_plan(c: &mut Criterion) {
             b.iter(|| plan(black_box(pattern), Strategy::Sparse).expect("benchmark setup failed"));
         });
     }
-}
-
-fn bench_eval_query(c: &mut Criterion) {
-    let (postings, bytes, all) = postings_fixture();
-    let q = Query::And(vec![
-        Query::Gram(b"ERR".to_vec()),
-        Query::Gram(b"han".to_vec()),
-    ]);
-    c.bench_function("eval_query_in_memory_postings", |b| {
-        b.iter(|| {
-            eval_query(
-                black_box(&q),
-                black_box(&all),
-                &|gram| postings.get(gram).copied(),
-                &|offset| decode_postings_block(&bytes, offset),
-            )
-            .expect("benchmark setup failed");
-        });
-    });
 }
 
 fn bench_index_reader(c: &mut Criterion) {
@@ -128,21 +83,5 @@ fn bench_index_reader(c: &mut Criterion) {
     });
 }
 
-fn bench_postings_decode(c: &mut Criterion) {
-    let (_postings, bytes, _all) = postings_fixture();
-    c.bench_function("postings_block_decode", |b| {
-        b.iter(|| {
-            decode_postings_block(black_box(&bytes), black_box(0)).expect("benchmark setup failed");
-        });
-    });
-}
-
-criterion_group!(
-    benches,
-    bench_grams,
-    bench_plan,
-    bench_eval_query,
-    bench_index_reader,
-    bench_postings_decode
-);
+criterion_group!(benches, bench_grams, bench_plan, bench_index_reader);
 criterion_main!(benches);

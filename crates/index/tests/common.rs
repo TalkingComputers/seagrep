@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use holys3_core::{testutil::MemCorpus, DocId};
+use holys3_core::{decode_body, testutil::MemCorpus, Corpus, DocId};
+use std::io::Write;
 
 pub(crate) const PATTERNS: &[&str] = &[
     "world",
@@ -14,7 +15,7 @@ pub(crate) const PATTERNS: &[&str] = &[
     "second line",
 ];
 
-pub(crate) fn corpus() -> MemCorpus {
+fn bodies() -> Vec<Vec<u8>> {
     let bodies: Vec<&[u8]> = vec![
         b"fn handleClick() { return 42; }",
         b"the quick brown fox",
@@ -24,8 +25,52 @@ pub(crate) fn corpus() -> MemCorpus {
         b"",
         b"\xff\xfe binary-ish \x00 bytes world",
     ];
-    let docs = (0..bodies.len())
+    bodies.into_iter().map(|b| b.to_vec()).collect()
+}
+
+fn docs_for(bodies: &[Vec<u8>]) -> Vec<(DocId, String)> {
+    (0..bodies.len())
         .map(|i| (i as DocId, format!("doc{i}")))
+        .collect()
+}
+
+pub(crate) fn corpus() -> MemCorpus {
+    let bodies = bodies();
+    MemCorpus::new(docs_for(&bodies), bodies)
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// Same corpus with every other body gzip-compressed (one of them
+/// multi-member, like real AWS log deliveries).
+pub(crate) fn gzipped_corpus() -> MemCorpus {
+    let bodies = bodies()
+        .into_iter()
+        .enumerate()
+        .map(|(i, body)| match i % 2 {
+            0 => body,
+            _ if i == 1 => {
+                let (a, b) = body.split_at(body.len() / 2);
+                let mut multi = gzip(a);
+                multi.extend(gzip(b));
+                multi
+            }
+            _ => gzip(&body),
+        })
+        .collect::<Vec<_>>();
+    MemCorpus::new(docs_for(&bodies), bodies)
+}
+
+/// The corpus as plain text: what searches must behave as if they saw.
+pub(crate) fn decoded_corpus(c: &dyn Corpus) -> MemCorpus {
+    let docs = c.docs().to_vec();
+    let bodies = docs
+        .iter()
+        .map(|&(id, ref key)| decode_body(key, c.fetch(id).unwrap()).unwrap())
         .collect();
-    MemCorpus::new(docs, bodies.into_iter().map(|b| b.to_vec()).collect())
+    MemCorpus::new(docs, bodies)
 }
