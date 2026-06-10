@@ -15,11 +15,11 @@ Indexed regex search for local files and private S3 buckets.
 
 ## Why
 
-S3 has no native grep. holys3 builds a compact index next to the data, uses it to narrow candidate objects, then verifies matches with Rust regexes over the original bytes.
+S3 has no native grep. holys3 builds a compact index next to the data, uses it to narrow candidate objects, then verifies matches with Rust regexes over the original bytes. Gzip and zstd objects (ALB, CloudTrail, CloudFront, VPC Flow Logs, Vector/Fluentd sinks) are decompressed transparently at both index and search time, and searches can be scoped by key prefix, key regex, or the timestamps embedded in log keys.
 
 Use holys3 when:
 
-- You need regex search over many text objects in a private S3 bucket.
+- You need regex search over many text objects in a private S3 bucket — including gzipped logs.
 - You want the index stored in the same bucket, under `.holys3/`.
 - You want candidate narrowing without trusting the index as the answer.
 
@@ -28,7 +28,7 @@ Use holys3 when:
 Do not use holys3 when:
 
 - You need a managed search service with ranking, analyzers, or faceting.
-- You need to search encrypted or compressed object bodies without extracting text first.
+- You need to search encrypted object bodies.
 - You need a stable library API; the publishable surface is the CLI.
 
 ## Installation
@@ -64,8 +64,8 @@ holys3 search 'TODO|FIXME' --bucket holys3-test-381235349110-ue2 --region us-eas
 ## Usage
 
 ```text
-holys3 index [--local-dir <LOCAL_DIR> | --bucket <BUCKET>] [--prefix <PREFIX>] [--region <REGION>] [--out <OUT>] [--strategy trigram|sparse]
-holys3 search [--local-dir <LOCAL_DIR> | --bucket <BUCKET>] [--prefix <PREFIX>] [--region <REGION>] [--index <INDEX>] [--files-only] [--stats] <PATTERN>
+holys3 index (--local-dir <LOCAL_DIR> | --bucket <BUCKET>) [--prefix <PREFIX>] [--region <REGION>] [--endpoint <URL>] [--concurrency <N>] [--out <OUT>] [--strategy trigram|sparse]
+holys3 search (--local-dir <LOCAL_DIR> | --bucket <BUCKET>) [--prefix <PREFIX>] [--region <REGION>] [--endpoint <URL>] [--concurrency <N>] [--index <INDEX>] [--key-prefix <P>] [--key-regex <RE>] [--since <T>] [--until <T>] [--files-only] [--stats] <PATTERN>
 holys3 stats [--index <INDEX>]
 ```
 
@@ -75,8 +75,10 @@ Builds an index for either a local directory or an S3 bucket prefix.
 
 - `--local-dir <LOCAL_DIR>`: directory to index.
 - `--bucket <BUCKET>`: S3 bucket to index.
-- `--prefix <PREFIX>`: S3 prefix to index. Defaults to empty.
+- `--prefix <PREFIX>`: S3 prefix with directory semantics (`logs` matches `logs/...`, never `logs-old/...`). Defaults to empty.
 - `--region <REGION>`: AWS region. If omitted, `AWS_REGION` is required.
+- `--endpoint <URL>`: S3-compatible endpoint (MinIO, R2, ...). Defaults to AWS.
+- `--concurrency <N>`: peak S3 fetch concurrency. Defaults to 750.
 - `--out <OUT>`: local index directory. Defaults to `holys3.idxdir`.
 - `--strategy trigram|sparse`: index strategy. Defaults to `trigram`.
 
@@ -89,11 +91,18 @@ Searches with a prebuilt index and verifies matches against the original bytes.
 - `<PATTERN>`: Rust regex pattern.
 - `--local-dir <LOCAL_DIR>`: local directory to read candidates from.
 - `--bucket <BUCKET>`: S3 bucket to read candidates from.
-- `--prefix <PREFIX>`: S3 prefix. Defaults to empty.
+- `--prefix <PREFIX>`: S3 prefix with directory semantics. Defaults to empty.
 - `--region <REGION>`: AWS region. If omitted, `AWS_REGION` is required.
+- `--endpoint <URL>`: S3-compatible endpoint (MinIO, R2, ...). Defaults to AWS.
+- `--concurrency <N>`: peak S3 fetch concurrency. Defaults to 750.
 - `--index <INDEX>`: local index directory. Defaults to `holys3.idxdir`.
-- `--files-only`: print only matching file or object keys.
+- `--key-prefix <P>`: only search objects whose key starts with `P`.
+- `--key-regex <RE>`: only search objects whose key matches `RE`.
+- `--since <T>` / `--until <T>`: only search objects whose key-embedded timestamp overlaps the window. `T` is `2026-06-09`, `2026-06-09T14:30[:00][Z]`, or relative like `6h` / `2d` (ago, UTC). Recognized key shapes: `2026/06/09[/14]` paths, `year=2026/month=06/day=09[/hour=14]`, `dt=`/`date=2026-06-09`, ALB/CloudTrail filename stamps (`20260609T2300Z`), and CloudFront/S3-access-log dashed stamps (`2026-06-09-23`). Keys without a recognizable timestamp are searched anyway (with a note on stderr).
+- `--files-only`: print only matching file or object keys (early-exit per object).
 - `--stats`: print candidate and index statistics to stderr.
+
+Results stream per object as verification completes (unordered across objects, like grep over many files). Objects deleted between indexing and searching are skipped with a warning, and gzip/zstd bodies are decompressed transparently. Output is pipe-friendly (`holys3 search ... | head` terminates cleanly).
 
 ### `stats`
 
@@ -103,10 +112,10 @@ Prints local index statistics:
 
 ## How it works
 
-1. The query planner extracts trigrams from the regex literal set.
-2. The index maps trigrams to candidate document ids and narrows the search set.
-3. For S3 indexes, holys3 reads only the needed postings ranges from `.holys3/`.
-4. holys3 fetches candidate objects with ranged GETs where applicable and full GETs for verification.
+1. The query planner extracts grams from the regex literal set.
+2. The term dictionary (an fst) maps each gram to its postings offset _and_ doc count, so selectivity is known before any postings fetch: absent grams answer instantly, and only the rarest grams per AND group are fetched at all.
+3. For S3 indexes, holys3 fetches every needed postings block concurrently — one ranged GET each — from `.holys3/`. Candidates are then pruned by any `--key-prefix`/`--key-regex`/`--since`/`--until` scope before a single object is fetched.
+4. Candidate objects are fetched concurrently with adaptive (AIMD) concurrency, retries, and request hedging; bodies are decompressed (multi-member gzip, zstd) and verified on a worker pool as fetches complete, with results streamed per object; deleted objects are skipped as stale.
 5. The regex verifier runs against original bytes and produces the final answer.
 
 The index narrows candidates. The verifier decides matches.
@@ -129,14 +138,16 @@ A non-matching query fetches **zero** objects; `.*` over all 200 is **43.5x** fa
 **Continuous (CI)** — the table below is regenerated on every push to `main` against a local MinIO (deterministic, reproducible with `make bench-minio`); it tracks regressions rather than headline latency.
 
 <!-- BENCH:START -->
-| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | 50 | 50/100 | 0.500 | 204800 | 94.271 | 101.921 | 101.921 | 114.453 |
-| long_literal | 34 | 34/100 | 0.340 | 139264 | 169.128 | 217.941 | 217.941 | 118.928 |
-| alternation | 32 | 32/100 | 0.320 | 131072 | 47.736 | 81.011 | 81.011 | 60.257 |
-| anchored | 10 | 10/100 | 0.100 | 40960 | 42.291 | 72.336 | 72.336 | 45.838 |
-| no_match | 0 | 0/100 | 0.000 | 0 | 0.118 | 0.147 | 0.147 | 0.112 |
-| QAll | 100 | 100/100 | 1.000 | 409600 | 225.545 | 228.359 | 228.359 | 271.297 |
+
+| scenario      | hits | candidates/total | prune ratio |  bytes |  p50 ms |  p95 ms |  p99 ms | concurrency=1 p50 ms |
+| ------------- | ---: | ---------------: | ----------: | -----: | ------: | ------: | ------: | -------------------: |
+| short_literal |   50 |           50/100 |       0.500 | 204800 |  94.271 | 101.921 | 101.921 |              114.453 |
+| long_literal  |   34 |           34/100 |       0.340 | 139264 | 169.128 | 217.941 | 217.941 |              118.928 |
+| alternation   |   32 |           32/100 |       0.320 | 131072 |  47.736 |  81.011 |  81.011 |               60.257 |
+| anchored      |   10 |           10/100 |       0.100 |  40960 |  42.291 |  72.336 |  72.336 |               45.838 |
+| no_match      |    0 |            0/100 |       0.000 |      0 |   0.118 |   0.147 |   0.147 |                0.112 |
+| QAll          |  100 |          100/100 |       1.000 | 409600 | 225.545 | 228.359 | 228.359 |              271.297 |
+
 <!-- BENCH:END -->
 
 Microbenchmarks (`make bench-micro`): trigram extraction ~330 us, query plan ~0.7 us, postings decode ~44 ns.
