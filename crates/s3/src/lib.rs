@@ -106,7 +106,7 @@ pub fn parse_list_v2(xml: &str) -> anyhow::Result<(Vec<ObjectMeta>, Option<Strin
                 }
             }
             Event::Text(t) => {
-                let txt = t.unescape()?.into_owned();
+                let txt = t.xml10_content()?.into_owned();
                 match cur.as_str() {
                     "Key" if in_contents => key = txt,
                     "ETag" if in_contents => etag = txt.trim_matches('"').to_owned(),
