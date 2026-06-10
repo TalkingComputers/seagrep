@@ -111,7 +111,7 @@ enum Cmd {
         #[arg(long)]
         key_regex: Option<String>,
         /// Only search objects covering times at or after this instant:
-        /// 2026-06-09, 2026-06-09T14:30[:00][Z], or relative like 6h / 2d (ago, UTC).
+        /// `2026-06-09`, `2026-06-09T14:30[:00][Z]`, or relative like 6h / 2d (ago, UTC).
         #[arg(long)]
         since: Option<String>,
         /// Only search objects covering times at or before this instant (same formats).

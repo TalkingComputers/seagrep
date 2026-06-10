@@ -153,7 +153,10 @@ jobs:
           path: bench-comment.md
 
   publish-main:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Runs even when micro's threshold check fails: main pushes refresh the
+    # baseline from CI's own runner (PRs still gate against it), so an
+    # intentional perf-semantics change cannot wedge main permanently red.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && always()
     needs:
       - micro
     runs-on: ubuntu-latest
