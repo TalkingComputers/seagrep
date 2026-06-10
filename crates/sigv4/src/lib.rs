@@ -13,51 +13,6 @@ pub struct Credentials {
     pub session_token: Option<String>,
 }
 
-pub trait CredentialProvider: Send + Sync {
-    fn provide(&self) -> anyhow::Result<Credentials>;
-}
-
-pub struct EnvProvider;
-
-impl CredentialProvider for EnvProvider {
-    fn provide(&self) -> anyhow::Result<Credentials> {
-        from_env().ok_or_else(|| anyhow::anyhow!("env creds not found"))
-    }
-}
-
-pub struct ProfileProvider {
-    pub profile: String,
-}
-
-impl CredentialProvider for ProfileProvider {
-    fn provide(&self) -> anyhow::Result<Credentials> {
-        let path = dirs_home()?.join(".aws/credentials");
-        let body = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
-        from_credentials_file(&body, &self.profile).ok_or_else(|| {
-            anyhow::anyhow!("profile `{}` not found in {}", self.profile, path.display())
-        })
-    }
-}
-
-pub struct ChainProvider(pub Vec<Box<dyn CredentialProvider>>);
-
-impl CredentialProvider for ChainProvider {
-    fn provide(&self) -> anyhow::Result<Credentials> {
-        let mut error = None;
-        for provider in &self.0 {
-            match provider.provide() {
-                Ok(credentials) => return Ok(credentials),
-                Err(err) => error = Some(err),
-            }
-        }
-        let Some(err) = error else {
-            anyhow::bail!("no credential providers configured");
-        };
-        Err(err)
-    }
-}
-
 /// One header to attach to the outgoing request.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SignedHeaders {
@@ -96,11 +51,18 @@ pub fn encode_query_component(s: &str) -> String {
     uri_encode(s, false)
 }
 
+/// Encode a request path for both the canonical request and the request URL.
+/// The same encoded string must be signed and sent.
+pub fn encode_path(path: &str) -> String {
+    uri_encode(path, true)
+}
+
 /// Sign a GET (or HEAD) request with UNSIGNED-PAYLOAD.
 /// `amz_date` is YYYYMMDD'T'HHMMSS'Z' basic format; `date` is "YYYYMMDD".
-/// `canonical_query` must already be sorted+encoded (or empty).
-/// `extra_signed` are additional (lowercase-name, value) header pairs to sign
-/// (e.g. ("range", "bytes=0-9")); `host` is always signed.
+/// `canonical_path` and `canonical_query` must already be encoded (see
+/// [`encode_path`] / [`encode_query_component`]); the exact same strings must
+/// be sent on the wire. `extra_signed` are additional (lowercase-name, value)
+/// header pairs to sign (e.g. ("range", "bytes=0-9")); `host` is always signed.
 #[allow(clippy::too_many_arguments)]
 pub fn sign_get(
     creds: &Credentials,
@@ -190,12 +152,7 @@ pub fn sign_request(
         .collect::<String>();
 
     let canonical_request = format!(
-        "{method}\n{}\n{}\n{}\n{}\n{}",
-        uri_encode(canonical_path, true),
-        canonical_query,
-        canonical_headers,
-        signed_headers,
-        payload_hash
+        "{method}\n{canonical_path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
 
     let scope = format!("{date}/{region}/s3/aws4_request");
@@ -224,8 +181,6 @@ pub fn sign_request(
     }
 }
 
-/// Resolve credentials: env vars first, then a named profile in ~/.aws/credentials.
-/// (`IMDSv2` is added in a later step; not covered by this unit test.)
 pub fn from_env() -> Option<Credentials> {
     let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok()?;
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok()?;
@@ -265,19 +220,22 @@ pub fn from_credentials_file(body: &str, profile: &str) -> Option<Credentials> {
     })
 }
 
-/// Public entry: env, then default profile in ~/.aws/credentials.
-pub fn resolve(profile: &str) -> anyhow::Result<Credentials> {
-    ChainProvider(vec![
-        Box::new(EnvProvider),
-        Box::new(ProfileProvider {
-            profile: profile.to_owned(),
-        }),
-    ])
-    .provide()
-}
-
-fn dirs_home() -> anyhow::Result<std::path::PathBuf> {
-    Ok(std::path::PathBuf::from(std::env::var("HOME")?))
+/// Resolve credentials: env vars first, then `$AWS_PROFILE` (default "default")
+/// in ~/.aws/credentials.
+pub fn resolve() -> anyhow::Result<Credentials> {
+    if let Some(creds) = from_env() {
+        return Ok(creds);
+    }
+    let profile = match std::env::var("AWS_PROFILE") {
+        Ok(profile) => profile,
+        Err(std::env::VarError::NotPresent) => "default".to_owned(),
+        Err(err) => return Err(err.into()),
+    };
+    let path = std::path::PathBuf::from(std::env::var("HOME")?).join(".aws/credentials");
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("no env creds and cannot read {}: {e}", path.display()))?;
+    from_credentials_file(&body, &profile)
+        .ok_or_else(|| anyhow::anyhow!("profile `{profile}` not found in {}", path.display()))
 }
 
 #[cfg(test)]
@@ -363,6 +321,13 @@ mod tests {
         let sig = signed.authorization.rsplit("Signature=").next().unwrap();
         assert_eq!(sig.len(), 64);
         assert!(sig.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn encode_path_escapes_special_chars() {
+        assert_eq!(encode_path("/a/b.txt"), "/a/b.txt");
+        assert_eq!(encode_path("/a b+c#d?e%f"), "/a%20b%2Bc%23d%3Fe%25f");
+        assert_eq!(encode_query_component("a/b"), "a%2Fb");
     }
 }
 

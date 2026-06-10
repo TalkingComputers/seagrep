@@ -1,15 +1,20 @@
+mod scope;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use holys3_core::{Corpus, Match, Strategy};
 use holys3_index::{
-    build_to_dir, build_to_store, compute_build_id, search_matches, IndexReader, LocalCorpus,
-    MmapIndexReader, StoreIndexReader,
+    build_to_dir, build_to_store, compute_build_id, search_streaming, IndexReader, LocalCorpus,
+    MatchSink, MmapIndexReader, SinkFlow, StoreIndexReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, is_index_key, normalize_prefix, region_from_env,
-    s3_client_from_env, ObjectMeta, S3BlobStore, S3Corpus,
+    build_fetch_config, build_index_namespace, list_prefix, normalize_prefix, region_from_env,
+    s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus,
 };
+use scope::Scope;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Parser)]
 #[command(name = "holys3")]
@@ -18,46 +23,106 @@ struct Cli {
     cmd: Cmd,
 }
 
+// Doc comments here are clap help text; markdown formatting would leak into --help.
+#[allow(clippy::doc_markdown)]
+#[derive(clap::Args)]
+#[command(group(ArgGroup::new("source").required(true).args(["local_dir", "bucket"])))]
+struct SourceArgs {
+    /// Local directory to index or search.
+    #[arg(long)]
+    local_dir: Option<PathBuf>,
+    /// S3 bucket to index or search.
+    #[arg(long)]
+    bucket: Option<String>,
+    /// S3 key prefix (directory semantics: "logs" only matches "logs/...").
+    #[arg(long, default_value = "", conflicts_with = "local_dir")]
+    prefix: String,
+    /// AWS region. If omitted, AWS_REGION is required.
+    #[arg(long, conflicts_with = "local_dir")]
+    region: Option<String>,
+    /// Custom S3-compatible endpoint (e.g. http://127.0.0.1:9000 for MinIO).
+    #[arg(long, conflicts_with = "local_dir")]
+    endpoint: Option<String>,
+    /// Peak S3 fetch concurrency.
+    #[arg(long, default_value_t = 750, value_parser = parse_concurrency, conflicts_with = "local_dir")]
+    concurrency: usize,
+}
+
+enum Source {
+    Local(PathBuf),
+    S3(S3Source),
+}
+
+struct S3Source {
+    client: S3Client,
+    bucket: String,
+    prefix: String,
+}
+
+impl SourceArgs {
+    fn open(self) -> Result<Source> {
+        match (self.local_dir, self.bucket) {
+            (Some(dir), None) => Ok(Source::Local(dir)),
+            (None, Some(bucket)) => {
+                let region = match self.region {
+                    Some(region) => region,
+                    None => region_from_env()?,
+                };
+                let client = s3_client_from_env(
+                    &region,
+                    self.endpoint,
+                    build_fetch_config(self.concurrency),
+                )?;
+                Ok(Source::S3(S3Source {
+                    client,
+                    bucket,
+                    prefix: normalize_prefix(&self.prefix),
+                }))
+            }
+            _ => anyhow::bail!("provide --local-dir or --bucket"),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build the index for a local dir (Stage 1 testable path) or an S3 prefix.
+    /// Build the index for a local dir or an S3 prefix.
     Index {
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
-        #[arg(long)]
-        bucket: Option<String>,
-        #[arg(long, default_value = "")]
-        prefix: String,
-        #[arg(long)]
-        region: Option<String>,
-        #[arg(long, default_value = "holys3.idxdir")]
+        #[command(flatten)]
+        source: SourceArgs,
+        /// Local index directory (local source only).
+        #[arg(long, default_value = "holys3.idxdir", conflicts_with = "bucket")]
         out: PathBuf,
         #[arg(long, value_enum, default_value = "trigram")]
         strategy: StrategyArg,
-        #[arg(long, default_value_t = 750, value_parser = parse_concurrency)]
-        concurrency: usize,
     },
     /// Search a pattern using a prebuilt index.
     Search {
         pattern: String,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
-        #[arg(long)]
-        bucket: Option<String>,
-        #[arg(long, default_value = "")]
-        prefix: String,
-        #[arg(long)]
-        region: Option<String>,
-        #[arg(long, default_value = "holys3.idxdir")]
+        #[command(flatten)]
+        source: SourceArgs,
+        /// Local index directory (local source only).
+        #[arg(long, default_value = "holys3.idxdir", conflicts_with = "bucket")]
         index: PathBuf,
+        /// Only search objects whose key starts with this prefix.
+        #[arg(long)]
+        key_prefix: Option<String>,
+        /// Only search objects whose key matches this regex.
+        #[arg(long)]
+        key_regex: Option<String>,
+        /// Only search objects covering times at or after this instant:
+        /// 2026-06-09, 2026-06-09T14:30[:00][Z], or relative like 6h / 2d (ago, UTC).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only search objects covering times at or before this instant (same formats).
+        #[arg(long)]
+        until: Option<String>,
         #[arg(long)]
         files_only: bool,
         #[arg(long)]
         stats: bool,
-        #[arg(long, default_value_t = 750, value_parser = parse_concurrency)]
-        concurrency: usize,
     },
-    /// Report distinct grams + term-dict bytes (resolves spec section 5 A/B).
+    /// Report distinct grams + term-dict bytes for a local index.
     Stats {
         #[arg(long, default_value = "holys3.idxdir")]
         index: PathBuf,
@@ -79,13 +144,6 @@ impl From<StrategyArg> for Strategy {
     }
 }
 
-fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
-    let corpus = LocalCorpus::new(dir)?;
-    build_to_dir(&corpus, out, strategy)?;
-    eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
-    Ok(())
-}
-
 fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
     let concurrency = value.parse::<usize>().map_err(|err| err.to_string())?;
     if concurrency == 0 {
@@ -94,39 +152,38 @@ fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
     Ok(concurrency)
 }
 
-async fn build_s3(
-    bucket: String,
-    prefix: String,
-    region: Option<String>,
-    strategy: Strategy,
-    concurrency: usize,
-) -> Result<()> {
-    let prefix = normalize_prefix(&prefix);
-    let cfg = build_fetch_config(concurrency);
-    let region = read_region(region)?;
-    let client = s3_client_from_env(&region, None)?;
-    let objects = select_user_objects(client.list(&bucket, &prefix).await?, &prefix);
+fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
+    let corpus = LocalCorpus::new(dir)?;
+    build_to_dir(&corpus, out, strategy)?;
+    eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
+    Ok(())
+}
+
+fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
+    let namespace = format!("{}/", build_index_namespace(&src.prefix));
+    Ok(src
+        .client
+        .list(&src.bucket, &list_prefix(&src.prefix))?
+        .into_iter()
+        .filter(|object| !object.key.starts_with(&namespace))
+        .collect())
+}
+
+fn build_s3(src: S3Source, strategy: Strategy) -> Result<()> {
+    let objects = list_user_objects(&src)?;
     let object_ids = objects
         .iter()
         .map(|object| (object.key.clone(), object.etag.clone()))
         .collect::<Vec<_>>();
-    let build_id = compute_build_id(&object_ids);
-    let rt = tokio::runtime::Handle::current();
-    let corpus = S3Corpus::new(
-        client.clone(),
-        bucket.clone(),
-        objects,
-        rt.clone(),
-        cfg.clone(),
-    )?;
-    let store = S3BlobStore::new(client, bucket.clone(), prefix.clone(), rt, cfg)?;
+    let build_id = compute_build_id(&object_ids, strategy);
+    let corpus = S3Corpus::new(src.client.clone(), src.bucket.clone(), &objects);
+    let store = S3BlobStore::new(src.client, src.bucket.clone(), src.prefix.clone());
     build_to_store(&corpus, &store, strategy, &build_id)?;
     eprintln!(
-        "indexed {} docs -> s3://{}/{}/builds/{}",
+        "indexed {} docs -> s3://{}/{}/builds/{build_id}",
         corpus.docs().len(),
-        bucket,
-        build_index_namespace(&prefix),
-        build_id
+        src.bucket,
+        build_index_namespace(&src.prefix)
     );
     Ok(())
 }
@@ -137,10 +194,63 @@ fn search_local(
     index: &Path,
     files_only: bool,
     stats: bool,
+    scope: Option<&Scope>,
 ) -> Result<()> {
     let corpus = LocalCorpus::new(dir)?;
     let reader = MmapIndexReader::open(index)?;
-    emit_results(&reader, &corpus, pattern, files_only, stats)
+    emit_results(&reader, &corpus, pattern, files_only, stats, scope)
+}
+
+fn search_s3(
+    src: S3Source,
+    pattern: &str,
+    files_only: bool,
+    stats: bool,
+    scope: Option<&Scope>,
+) -> Result<()> {
+    let cache_dir = build_cache_dir(&src.bucket, &src.prefix)?;
+    let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
+    let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
+    let corpus = S3Corpus::from_docs(src.client, src.bucket, reader.docs().to_vec());
+    emit_results(&reader, &corpus, pattern, files_only, stats, scope)
+}
+
+/// Prints each doc's results as verification completes (unordered across
+/// docs, like grep over many files). A closed downstream pipe stops the
+/// search instead of erroring.
+struct PrintSink {
+    out: Mutex<std::io::BufWriter<std::io::Stdout>>,
+    files_only: bool,
+}
+
+impl MatchSink for PrintSink {
+    fn wants_matches(&self) -> bool {
+        !self.files_only
+    }
+
+    fn on_doc(&self, key: &str, matches: &[Match]) -> Result<SinkFlow> {
+        let mut out = self
+            .out
+            .lock()
+            .map_err(|_| anyhow::anyhow!("output writer poisoned"))?;
+        let written = if self.files_only {
+            writeln!(out, "{key}")
+        } else {
+            matches.iter().try_for_each(|matched| {
+                writeln!(
+                    out,
+                    "{key}:{}:{}:{}",
+                    matched.line, matched.col, matched.text
+                )
+            })
+        }
+        .and_then(|()| out.flush());
+        match written {
+            Ok(()) => Ok(SinkFlow::Continue),
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(SinkFlow::Stop),
+            Err(err) => Err(err.into()),
+        }
+    }
 }
 
 fn emit_results(
@@ -149,8 +259,25 @@ fn emit_results(
     pattern: &str,
     files_only: bool,
     stats: bool,
+    scope: Option<&Scope>,
 ) -> Result<()> {
-    let (matches, search_stats) = search_matches(reader, corpus, pattern)?;
+    let sink = PrintSink {
+        out: Mutex::new(std::io::BufWriter::new(std::io::stdout())),
+        files_only,
+    };
+    let key_filter = scope.map(|scope| move |key: &str| scope.matches(key));
+    let search_stats = search_streaming(
+        reader,
+        corpus,
+        pattern,
+        key_filter
+            .as_ref()
+            .map(|filter| filter as &dyn Fn(&str) -> bool),
+        &sink,
+    )?;
+    if let Some(scope) = scope {
+        scope.report();
+    }
     if stats {
         let index_stats = reader.stats();
         eprintln!(
@@ -163,25 +290,7 @@ fn emit_results(
             index_stats.postings_bytes
         );
     }
-    if files_only {
-        print_hits(corpus, search_stats.hits)
-    } else {
-        print_matches(corpus, matches)
-    }
-}
-
-fn read_region(region: Option<String>) -> Result<String> {
-    match region {
-        Some(region) => Ok(region),
-        None => region_from_env(),
-    }
-}
-
-fn select_user_objects(objects: Vec<ObjectMeta>, prefix: &str) -> Vec<ObjectMeta> {
-    objects
-        .into_iter()
-        .filter(|object| !is_index_key(prefix, &object.key))
-        .collect()
+    Ok(())
 }
 
 fn build_cache_dir(bucket: &str, prefix: &str) -> Result<PathBuf> {
@@ -206,96 +315,35 @@ fn read_cache_home(
     }
 }
 
-fn search_s3(
-    pattern: &str,
-    bucket: String,
-    prefix: String,
-    region: Option<String>,
-    files_only: bool,
-    stats: bool,
-    concurrency: usize,
-) -> Result<()> {
-    let prefix = normalize_prefix(&prefix);
-    let cfg = build_fetch_config(concurrency);
-    let region = read_region(region)?;
-    let client = s3_client_from_env(&region, None)?;
-    let rt = tokio::runtime::Handle::current();
-    let store = S3BlobStore::new(
-        client.clone(),
-        bucket.clone(),
-        prefix.clone(),
-        rt.clone(),
-        cfg.clone(),
-    )?;
-    let cache_dir = build_cache_dir(&bucket, &prefix)?;
-    let reader = StoreIndexReader::open(Box::new(store), &cache_dir)?;
-    let corpus = S3Corpus::from_docs(client, bucket, reader.docs().to_vec(), rt, cfg)?;
-    emit_results(&reader, &corpus, pattern, files_only, stats)
-}
-
-fn print_hits(
-    corpus: &dyn Corpus,
-    hits: std::collections::BTreeSet<holys3_core::DocId>,
-) -> Result<()> {
-    for id in hits {
-        println!("{}", corpus.docs()[id as usize].1);
-    }
-    Ok(())
-}
-
-fn print_matches(corpus: &dyn Corpus, matches: Vec<Match>) -> Result<()> {
-    for matched in matches {
-        let key = &corpus.docs()[matched.doc as usize].1;
-        println!("{key}:{}:{}:{}", matched.line, matched.col, matched.text);
-    }
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Index {
-            local_dir: Some(dir),
+            source,
             out,
             strategy,
-            ..
-        } => build_local(&dir, &out, strategy.into()),
-        Cmd::Index {
-            bucket: Some(bucket),
-            prefix,
-            region,
-            strategy,
-            concurrency,
-            ..
-        } => build_s3(bucket, prefix, region, strategy.into(), concurrency).await,
-        Cmd::Index { .. } => anyhow::bail!("provide --local-dir or --bucket"),
+        } => match source.open()? {
+            Source::Local(dir) => build_local(&dir, &out, strategy.into()),
+            Source::S3(src) => build_s3(src, strategy.into()),
+        },
         Cmd::Search {
             pattern,
-            local_dir: Some(dir),
+            source,
             index,
+            key_prefix,
+            key_regex,
+            since,
+            until,
             files_only,
             stats,
-            ..
-        } => search_local(&pattern, &dir, &index, files_only, stats),
-        Cmd::Search {
-            pattern,
-            bucket: Some(bucket),
-            prefix,
-            region,
-            files_only,
-            stats,
-            concurrency,
-            ..
-        } => search_s3(
-            &pattern,
-            bucket,
-            prefix,
-            region,
-            files_only,
-            stats,
-            concurrency,
-        ),
-        Cmd::Search { .. } => anyhow::bail!("provide --local-dir or --bucket"),
+        } => {
+            let scope = Scope::from_args(key_prefix, key_regex, since, until)?;
+            match source.open()? {
+                Source::Local(dir) => {
+                    search_local(&pattern, &dir, &index, files_only, stats, scope.as_ref())
+                }
+                Source::S3(src) => search_s3(src, &pattern, files_only, stats, scope.as_ref()),
+            }
+        }
         Cmd::Stats { index } => {
             let reader = MmapIndexReader::open(&index)?;
             let s = reader.stats();
@@ -311,6 +359,12 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::env::VarError;
+
+    #[test]
+    fn cli_args_are_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     #[test]
     fn read_cache_home_uses_xdg_cache_home() {

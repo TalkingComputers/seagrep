@@ -1,10 +1,12 @@
 use holys3_core::{Corpus, DocId, Strategy};
-use holys3_index::{build_to_store, compute_build_id, search, IndexReader, StoreIndexReader};
+use holys3_index::{
+    build_to_store, compute_build_id, search_collect, IndexReader, StoreIndexReader,
+};
 use holys3_s3::{is_index_key, FetchConfig, S3BlobStore, S3Client, S3Corpus};
 use holys3_sigv4::resolve;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
+#[test]
+fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
     let bucket = match std::env::var("HOLYS3_TEST_BUCKET") {
         Ok(bucket) => bucket,
         Err(_) => {
@@ -13,11 +15,10 @@ async fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         }
     };
     let region = std::env::var("AWS_REGION")?;
-    let creds = resolve("default")?;
-    let client = S3Client::new(region, creds, None, false)?;
+    let creds = resolve()?;
+    let client = S3Client::new(region, creds, None, FetchConfig::default())?;
     let objects = client
-        .list(&bucket, "")
-        .await?
+        .list(&bucket, "")?
         .into_iter()
         .filter(|object| !is_index_key("", &object.key))
         .collect::<Vec<_>>();
@@ -25,27 +26,13 @@ async fn live_s3_index_search_roundtrip() -> anyhow::Result<()> {
         .iter()
         .map(|object| (object.key.clone(), object.etag.clone()))
         .collect::<Vec<_>>();
-    let build_id = compute_build_id(&object_ids);
-    let rt = tokio::runtime::Handle::current();
-    let cfg = FetchConfig::default();
-    let corpus = S3Corpus::new(
-        client.clone(),
-        bucket.clone(),
-        objects,
-        rt.clone(),
-        cfg.clone(),
-    )?;
-    let store = S3BlobStore::new(
-        client.clone(),
-        bucket.clone(),
-        String::new(),
-        rt.clone(),
-        cfg.clone(),
-    )?;
+    let build_id = compute_build_id(&object_ids, Strategy::Trigram);
+    let corpus = S3Corpus::new(client.clone(), bucket.clone(), &objects);
+    let store = S3BlobStore::new(client.clone(), bucket.clone(), String::new());
     build_to_store(&corpus, &store, Strategy::Trigram, &build_id)?;
     let cache_dir = tempfile::tempdir()?;
     let reader = StoreIndexReader::open(
-        Box::new(S3BlobStore::new(client, bucket, String::new(), rt, cfg)?),
+        Box::new(S3BlobStore::new(client, bucket, String::new())),
         cache_dir.path(),
     )?;
     assert_hit(&reader, &corpus, "world", "b.txt")?;
@@ -60,7 +47,7 @@ fn assert_hit(
     pattern: &str,
     expected_key: &str,
 ) -> anyhow::Result<()> {
-    let hits = search(reader, corpus, pattern)?;
+    let hits = search_collect(reader, corpus, pattern)?.1.hits;
     let keys = hits
         .iter()
         .map(|id| key_for_doc(reader, *id))
