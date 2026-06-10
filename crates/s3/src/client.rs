@@ -15,12 +15,18 @@ static FORMAT: LazyLock<Vec<time::format_description::BorrowedFormatItem<'static
             .expect("invalid amz date format")
     });
 
+/// Hedge window for small ranged reads (index blocks): ~2x a slow S3
+/// first-byte latency.
+const SMALL_READ_HEDGE: Duration = Duration::from_millis(300);
+
 fn build_http(pool_max_idle: usize) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .pool_max_idle_per_host(pool_max_idle)
         .pool_idle_timeout(Duration::from_secs(60))
         .tcp_keepalive(Duration::from_secs(30))
-        .http2_adaptive_window(true)
+        // S3 never negotiates HTTP/2; forcing h1 also keeps a custom
+        // endpoint's proxy from multiplexing 750 streams onto one socket.
+        .http1_only()
         .connect_timeout(Duration::from_secs(3))
         .read_timeout(Duration::from_secs(20))
         .build()
@@ -364,13 +370,22 @@ impl S3Client {
     }
 
     /// Object GET with hedging: when the first attempt has held a permit for
-    /// `hedge_after` without completing, race a budgeted duplicate request.
+    /// the hedge window without completing, race a budgeted duplicate
+    /// request. Small index reads (posting blocks, metadata) hedge much
+    /// earlier than whole-object fetches: their expected latency is one
+    /// round trip, so 2x-median is a few hundred ms, not seconds.
     async fn fetch_hedged(
         &self,
         bucket: &str,
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<Option<Vec<u8>>> {
+        let hedge_after = match range {
+            Some((start, end)) if end.saturating_sub(start) < 4 * 1024 * 1024 => {
+                SMALL_READ_HEDGE.min(self.0.cfg.hedge_after)
+            }
+            _ => self.0.cfg.hedge_after,
+        };
         let req = S3Request {
             method: "GET",
             bucket,
@@ -385,7 +400,7 @@ impl S3Client {
         let result = tokio::select! {
             biased;
             result = &mut primary => result,
-            () = async { started.notified().await; tokio::time::sleep(self.0.cfg.hedge_after).await } => {
+            () = async { started.notified().await; tokio::time::sleep(hedge_after).await } => {
                 match self.0.hedges.try_take() {
                     None => primary.await,
                     Some(token) => {

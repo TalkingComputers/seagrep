@@ -365,7 +365,7 @@ pub fn matches_in(bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Match> {
     for m in re.find_iter(bytes) {
         let start = m.start();
         let gap = &bytes[counted_to..start];
-        line += memchr::memchr_iter(b'\n', gap).count();
+        line += bytecount::count(gap, b'\n');
         if let Some(p) = memchr::memrchr(b'\n', gap) {
             line_start = counted_to + p + 1;
         }

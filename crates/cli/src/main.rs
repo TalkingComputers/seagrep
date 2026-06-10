@@ -1,5 +1,8 @@
 mod scope;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use holys3_core::{Corpus, DocFetcher, Match, Strategy};
