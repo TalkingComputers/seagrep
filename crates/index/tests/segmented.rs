@@ -5,7 +5,7 @@
 use anyhow::Result;
 use holys3_core::{
     decode_body, scan_matching_docs, testutil::MemCorpus, Corpus, DocFetcher, LocalBlobStore,
-    Strategy,
+    MatchOptions, Strategy,
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, IndexReader, KeyScope, NullSink,
@@ -264,7 +264,14 @@ fn compaction_bounds_segment_count_and_preserves_results() -> Result<()> {
     // Segment count must stay bounded: target 8 plus at most the one new
     // segment a run can add beyond a single merge.
     let fetcher = BucketFetcher(&bucket);
-    let stats = search_streaming(&reader, &fetcher, "needle", KeyScope::default(), &NullSink)?;
+    let stats = search_streaming(
+        &reader,
+        &fetcher,
+        "needle",
+        KeyScope::default(),
+        MatchOptions::default(),
+        &NullSink,
+    )?;
     assert_eq!(stats.hits.len(), 20);
     Ok(())
 }
@@ -306,7 +313,14 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
         prefix: Some("logs/"),
         matches: None,
     };
-    let stats = search_streaming(&reader, &fetcher, "needle", scope, &NullSink)?;
+    let stats = search_streaming(
+        &reader,
+        &fetcher,
+        "needle",
+        scope,
+        MatchOptions::default(),
+        &NullSink,
+    )?;
     assert_eq!(stats.hits, vec!["logs/2026/06/08/x.gz"]);
     Ok(())
 }

@@ -3,7 +3,7 @@
 
 use crate::{IndexReader, SearchStats};
 use anyhow::Result;
-use holys3_core::{decode_body, matches_in, DocFetcher, Match};
+use holys3_core::{decode_body, grep_doc, DocFetcher, LineEvent, MatchOptions};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -38,17 +38,28 @@ pub enum SinkFlow {
     Stop,
 }
 
+/// Everything a sink learns about one matching doc.
+#[derive(Debug)]
+pub struct DocResult<'a> {
+    /// Empty when the sink declined match positions.
+    pub events: &'a [LineEvent],
+    /// Decoded doc length.
+    pub bytes_searched: u64,
+    /// Decode + verify wall time for this doc.
+    pub elapsed: std::time::Duration,
+}
+
 /// Receives verified results per doc, possibly from several threads at once.
 pub trait MatchSink: Sync {
     /// Whether this sink uses match positions. Returning false lets the
     /// engine stop at the first match per doc (files-only behavior); `on_doc`
-    /// is then called with empty `matches`.
+    /// then sees empty `events`.
     fn wants_matches(&self) -> bool {
         true
     }
 
     /// Called once per doc with at least one verified match.
-    fn on_doc(&self, key: &str, matches: &[Match]) -> Result<SinkFlow>;
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow>;
 }
 
 /// Sentinel threaded through `fetch_each` to unwind an early stop.
@@ -82,6 +93,7 @@ pub fn search_streaming(
     fetcher: &dyn DocFetcher,
     pattern: &str,
     scope: KeyScope<'_>,
+    options: MatchOptions,
     sink: &dyn MatchSink,
 ) -> Result<SearchStats> {
     let q = holys3_query::plan(pattern, reader.strategy())?;
@@ -122,6 +134,7 @@ pub fn search_streaming(
     // contends under exactly this all-threads-search workload.
     let verify = |re: &regex::bytes::Regex, idx: usize, bytes: Vec<u8>| -> Result<()> {
         let key = &keys_ref[idx];
+        let started = std::time::Instant::now();
         let text = match decode_body(key, bytes) {
             Ok(text) => text,
             Err(err) => {
@@ -129,20 +142,26 @@ pub fn search_streaming(
                 return Ok(());
             }
         };
-        let matches = if wants_matches {
-            let matches = matches_in(&text, re);
-            if matches.is_empty() {
+        let events = if wants_matches {
+            let events = grep_doc(&text, re, options);
+            if events.is_empty() {
                 return Ok(());
             }
-            matches
+            events
         } else {
-            if !re.is_match(&text) {
+            // line semantics, same as grep_doc: no lines in an empty doc
+            if !holys3_core::has_line_match(&text, re) {
                 return Ok(());
             }
             Vec::new()
         };
         lock(&hits)?.push(key.clone());
-        if sink.on_doc(key, &matches)? == SinkFlow::Stop {
+        let doc = DocResult {
+            events: &events,
+            bytes_searched: text.len() as u64,
+            elapsed: started.elapsed(),
+        };
+        if sink.on_doc(key, &doc)? == SinkFlow::Stop {
             stopped.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -220,23 +239,23 @@ impl MatchSink for NullSink {
         false
     }
 
-    fn on_doc(&self, _key: &str, _matches: &[Match]) -> Result<SinkFlow> {
+    fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
         Ok(SinkFlow::Continue)
     }
 }
 
 #[derive(Default)]
 struct CollectSink {
-    matches: Mutex<Vec<(String, Match)>>,
+    matches: Mutex<Vec<(String, LineEvent)>>,
 }
 
 impl MatchSink for CollectSink {
-    fn on_doc(&self, key: &str, matches: &[Match]) -> Result<SinkFlow> {
+    fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
         let mut collected = lock(&self.matches)?;
         collected.extend(
-            matches
+            doc.events
                 .iter()
-                .map(|matched| (key.to_owned(), matched.clone())),
+                .map(|event| (key.to_owned(), event.clone())),
         );
         Ok(SinkFlow::Continue)
     }
@@ -248,15 +267,26 @@ pub fn search_collect(
     reader: &dyn IndexReader,
     fetcher: &dyn DocFetcher,
     pattern: &str,
-) -> Result<(Vec<(String, Match)>, SearchStats)> {
+) -> Result<(Vec<(String, LineEvent)>, SearchStats)> {
     let sink = CollectSink::default();
-    let stats = search_streaming(reader, fetcher, pattern, KeyScope::default(), &sink)?;
+    let stats = search_streaming(
+        reader,
+        fetcher,
+        pattern,
+        KeyScope::default(),
+        MatchOptions::default(),
+        &sink,
+    )?;
     let mut matches = sink
         .matches
         .into_inner()
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))?;
     matches.sort_by(|(a_key, a), (b_key, b)| {
-        (a_key, a.line, a.col, a.text.as_str()).cmp(&(b_key, b.line, b.col, b.text.as_str()))
+        (a_key, a.line, a.submatches.first().map(|s| s.start)).cmp(&(
+            b_key,
+            b.line,
+            b.submatches.first().map(|s| s.start),
+        ))
     });
     Ok((matches, stats))
 }

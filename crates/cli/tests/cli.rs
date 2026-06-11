@@ -1,0 +1,260 @@
+//! End-to-end CLI tests over a local corpus: rg-style invocation, output
+//! formats, exit codes. Everything runs piped, so defaults are
+//! no-heading / no-line-numbers / no color.
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+struct Corpus {
+    dir: tempfile::TempDir,
+    index: tempfile::TempDir,
+}
+
+fn corpus() -> Corpus {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("alpha.log"),
+        "one ERROR here\nclean line\nanother ERROR line\ntail\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("beta.log"),
+        "all quiet\nnothing to see\na.b literal\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("gamma.txt"), "ERROR ERROR double\n").unwrap();
+    let index = tempfile::tempdir().unwrap();
+    holys3()
+        .args(["index"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(index.path())
+        .assert()
+        .success();
+    Corpus { dir, index }
+}
+
+fn holys3() -> Command {
+    Command::cargo_bin("holys3").unwrap()
+}
+
+fn search(c: &Corpus) -> Command {
+    let mut cmd = holys3();
+    cmd.arg("ERROR")
+        .arg(c.dir.path())
+        .arg("--index")
+        .arg(c.index.path());
+    cmd
+}
+
+fn search_pattern(c: &Corpus, pattern: &str) -> Command {
+    let mut cmd = holys3();
+    cmd.arg(pattern)
+        .arg(c.dir.path())
+        .arg("--index")
+        .arg(c.index.path());
+    cmd
+}
+
+fn key(c: &Corpus, name: &str) -> String {
+    c.dir.path().join(name).display().to_string()
+}
+
+fn sorted_lines(output: &[u8]) -> Vec<String> {
+    let mut lines: Vec<String> = String::from_utf8_lossy(output)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[test]
+fn exit_codes() {
+    let c = corpus();
+    search(&c).assert().success();
+    search_pattern(&c, "NO_SUCH_TOKEN").assert().code(1);
+    search_pattern(&c, "(").assert().code(2);
+    holys3().args(["x", "s3://"]).assert().code(2);
+    holys3().assert().code(2); // missing args (clap usage error)
+}
+
+#[test]
+fn piped_default_format_and_flags() {
+    let c = corpus();
+    let out = search(&c).output().unwrap();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        vec![
+            format!("{}:another ERROR line", key(&c, "alpha.log")),
+            format!("{}:one ERROR here", key(&c, "alpha.log")),
+            format!("{}:ERROR ERROR double", key(&c, "gamma.txt")),
+        ]
+    );
+    let out = search(&c).arg("-n").output().unwrap();
+    assert!(
+        sorted_lines(&out.stdout).contains(&format!("{}:1:one ERROR here", key(&c, "alpha.log")))
+    );
+    let out = search(&c).args(["--column"]).output().unwrap();
+    assert!(
+        sorted_lines(&out.stdout).contains(&format!("{}:1:5:one ERROR here", key(&c, "alpha.log")))
+    );
+    // heading mode groups under a key header
+    let out = search_pattern(&c, "one ERROR")
+        .arg("--heading")
+        .arg("-N")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\none ERROR here\n", key(&c, "alpha.log"))
+    );
+}
+
+#[test]
+fn context_rendering() {
+    let c = corpus();
+    // alpha.log lines: 1 ERROR, 2 clean, 3 ERROR, 4 tail -> -C1 merges all
+    let out = search_pattern(&c, "ERROR")
+        .args(["-C", "1", "-g", "alpha.log", "-n"])
+        .output()
+        .unwrap();
+    let k = key(&c, "alpha.log");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{k}:1:one ERROR here\n{k}-2-clean line\n{k}:3:another ERROR line\n{k}-4-tail\n")
+    );
+    let out = search_pattern(&c, "another")
+        .args(["-B", "1", "-g", "alpha.log", "-n"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{k}-2-clean line\n{k}:3:another ERROR line\n")
+    );
+}
+
+#[test]
+fn pattern_semantics() {
+    let c = corpus();
+    // -F: a.b is literal, must not match "all" via the dot
+    let out = search_pattern(&c, "a.b")
+        .arg("-F")
+        .arg("-l")
+        .output()
+        .unwrap();
+    assert_eq!(sorted_lines(&out.stdout), vec![key(&c, "beta.log")]);
+    // -i
+    search_pattern(&c, "error").assert().code(1);
+    search_pattern(&c, "error").arg("-i").assert().success();
+    // -S: lowercase pattern is insensitive, capitalized is not
+    search_pattern(&c, "error").arg("-S").assert().success();
+    search_pattern(&c, "Error").arg("-S").assert().code(1);
+    // -w
+    search_pattern(&c, "ERRO").assert().success();
+    search_pattern(&c, "ERRO").arg("-w").assert().code(1);
+    // multiple -e OR
+    let mut cmd = holys3();
+    cmd.args(["-e", "quiet", "-e", "tail"])
+        .arg(c.dir.path())
+        .arg("--index")
+        .arg(c.index.path())
+        .arg("-l");
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        vec![key(&c, "alpha.log"), key(&c, "beta.log")]
+    );
+    // -m 1 caps matching lines per doc
+    let out = search(&c)
+        .args(["-m", "1", "-g", "alpha.log"])
+        .output()
+        .unwrap();
+    assert_eq!(sorted_lines(&out.stdout).len(), 1);
+}
+
+#[test]
+fn modes() {
+    let c = corpus();
+    let out = search(&c).arg("-l").output().unwrap();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        vec![key(&c, "alpha.log"), key(&c, "gamma.txt")]
+    );
+    // -c counts lines; --count-matches counts occurrences
+    let out = search(&c).arg("-c").output().unwrap();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        vec![
+            format!("{}:2", key(&c, "alpha.log")),
+            format!("{}:1", key(&c, "gamma.txt"))
+        ]
+    );
+    let out = search(&c).arg("--count-matches").output().unwrap();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        vec![
+            format!("{}:2", key(&c, "alpha.log")),
+            format!("{}:2", key(&c, "gamma.txt"))
+        ]
+    );
+    // -q: silent, exit by match presence
+    let out = search(&c).arg("-q").output().unwrap();
+    assert!(out.stdout.is_empty());
+    assert!(out.status.success());
+    search_pattern(&c, "NO_SUCH_TOKEN")
+        .arg("-q")
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn glob_filters() {
+    let c = corpus();
+    let out = search(&c).args(["-l", "-g", "*.txt"]).output().unwrap();
+    assert_eq!(sorted_lines(&out.stdout), vec![key(&c, "gamma.txt")]);
+    let out = search(&c).args(["-l", "-g", "!*.txt"]).output().unwrap();
+    assert_eq!(sorted_lines(&out.stdout), vec![key(&c, "alpha.log")]);
+}
+
+#[test]
+fn json_wire_format() {
+    let c = corpus();
+    let out = search(&c).arg("--json").output().unwrap();
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.last().unwrap()["type"], "summary");
+    let types: Vec<&str> = lines.iter().map(|v| v["type"].as_str().unwrap()).collect();
+    assert!(types.contains(&"begin") && types.contains(&"match") && types.contains(&"end"));
+    let m = lines.iter().find(|v| v["type"] == "match").unwrap();
+    let data = &m["data"];
+    assert!(data["line_number"].as_u64().is_some());
+    let text = data["lines"]["text"].as_str().unwrap();
+    let sub = &data["submatches"][0];
+    let (s, e) = (
+        sub["start"].as_u64().unwrap() as usize,
+        sub["end"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(&text[s..e], sub["match"]["text"].as_str().unwrap());
+    let summary = &lines.last().unwrap()["data"]["stats"];
+    assert_eq!(summary["matched_lines"].as_u64().unwrap(), 3);
+    assert_eq!(summary["matches"].as_u64().unwrap(), 4);
+}
+
+#[test]
+fn color_control() {
+    let c = corpus();
+    let out = search(&c).args(["--color", "always"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\x1b["));
+    let out = search(&c).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("\x1b["));
+}
+
+#[test]
+fn broken_pipe_is_not_an_error() {
+    let c = corpus();
+    let assert = search(&c).assert();
+    assert.success().stdout(predicate::str::contains("ERROR"));
+}

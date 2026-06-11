@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result as AnyhowResult};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 pub type DocId = u32;
@@ -332,41 +333,132 @@ impl BlobStore for LocalBlobStore {
     }
 }
 
-/// One verified match: 1-based line, 1-based column (byte), the line text.
-/// The owning object's key travels alongside, not inside.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Match {
-    pub line: usize,
-    pub col: usize,
-    pub text: String,
+/// One occurrence within a line: byte offsets into `LineEvent.text`,
+/// half-open, clamped to the line's content (pre-`\n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubMatch {
+    pub start: usize,
+    pub end: usize,
 }
 
-/// Run `re` over `bytes`, returning one Match per matching occurrence.
-/// Single pass: line numbers are tracked incrementally across matches.
-pub fn matches_in(bytes: &[u8], re: &regex::bytes::Regex) -> Vec<Match> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    Match,
+    Context,
+}
+
+/// One output line of a search: a matching line or a context line around
+/// one. The owning object's key travels alongside, not inside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineEvent {
+    /// 1-based line number.
+    pub line: u64,
+    pub kind: LineKind,
+    /// Byte offset of the line start in the decoded doc.
+    pub offset: u64,
+    /// Exact line bytes INCLUDING the trailing `\n` when present.
+    pub text: Vec<u8>,
+    /// Ordered by start; non-empty for Match. A Context line past a
+    /// `max_count` cap can also carry submatches (rg behavior).
+    pub submatches: Vec<SubMatch>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatchOptions {
+    pub before_context: usize,
+    pub after_context: usize,
+    /// Cap on MATCHING lines per doc (`rg -m`). After-context still drains.
+    pub max_count: Option<u64>,
+}
+
+/// Run `re` over one decoded doc, producing the rg-ordered, overlap-merged
+/// line event stream: events sorted by line, each line present at most once,
+/// matches preferred over context. Empty result == zero matching lines.
+pub fn grep_doc(bytes: &[u8], re: &regex::bytes::Regex, options: MatchOptions) -> Vec<LineEvent> {
+    if options.max_count == Some(0) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    let mut counted_to = 0usize;
-    for m in re.find_iter(bytes) {
-        let start = m.start();
-        let gap = &bytes[counted_to..start];
-        line += bytecount::count(gap, b'\n');
-        if let Some(p) = memchr::memrchr(b'\n', gap) {
-            line_start = counted_to + p + 1;
+    let mut finder = re.find_iter(bytes).peekable();
+    let mut ring: VecDeque<(u64, usize, usize)> = VecDeque::new();
+    let mut line_no: u64 = 0;
+    let mut pos = 0usize;
+    let mut last_emitted: u64 = 0;
+    let mut after_remaining = 0usize;
+    let mut matched_lines: u64 = 0;
+    let mut done = false;
+    while pos < bytes.len() {
+        line_no += 1;
+        let (content_end, span_end) = match memchr::memchr(b'\n', &bytes[pos..]) {
+            Some(off) => (pos + off, pos + off + 1),
+            None => (bytes.len(), bytes.len()),
+        };
+        let mut subs = Vec::new();
+        while finder.peek().is_some_and(|m| m.start() < span_end) {
+            let m = finder.next().expect("peeked");
+            subs.push(SubMatch {
+                start: m.start() - pos,
+                end: m.end().min(content_end).max(m.start()) - pos,
+            });
         }
-        counted_to = start;
-        let line_end = memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len(), |p| start + p);
-        out.push(Match {
-            line,
-            col: start - line_start + 1,
-            text: String::from_utf8_lossy(&bytes[line_start..line_end]).into_owned(),
-        });
+        if !subs.is_empty() && !done {
+            while let Some((l, s, e)) = ring.pop_front() {
+                if l <= last_emitted {
+                    continue;
+                }
+                out.push(LineEvent {
+                    line: l,
+                    kind: LineKind::Context,
+                    offset: s as u64,
+                    text: bytes[s..e].to_vec(),
+                    submatches: Vec::new(),
+                });
+            }
+            out.push(LineEvent {
+                line: line_no,
+                kind: LineKind::Match,
+                offset: pos as u64,
+                text: bytes[pos..span_end].to_vec(),
+                submatches: subs,
+            });
+            last_emitted = line_no;
+            matched_lines += 1;
+            after_remaining = options.after_context;
+            if options.max_count == Some(matched_lines) {
+                done = true;
+            }
+        } else if after_remaining > 0 {
+            out.push(LineEvent {
+                line: line_no,
+                kind: LineKind::Context,
+                offset: pos as u64,
+                text: bytes[pos..span_end].to_vec(),
+                submatches: subs,
+            });
+            last_emitted = line_no;
+            after_remaining -= 1;
+        } else if options.before_context > 0 {
+            if ring.len() == options.before_context {
+                ring.pop_front();
+            }
+            ring.push_back((line_no, pos, span_end));
+        }
+        if (done || finder.peek().is_none()) && after_remaining == 0 {
+            break;
+        }
+        pos = span_end;
     }
     out
 }
 
-/// Oracle: keys of docs containing at least one match, sorted. The
+/// Line-semantics match test (rg behavior): a doc matches iff some match
+/// STARTS before EOF — an empty doc has no lines and never matches, and an
+/// empty match at EOF belongs to no line.
+pub fn has_line_match(bytes: &[u8], re: &regex::bytes::Regex) -> bool {
+    re.find(bytes).is_some_and(|m| m.start() < bytes.len())
+}
+
+/// Oracle: keys of docs containing at least one matching line, sorted. The
 /// differential ground truth.
 pub fn scan_matching_docs(
     corpus: &dyn Corpus,
@@ -375,7 +467,7 @@ pub fn scan_matching_docs(
     let mut hits = Vec::new();
     for (id, key) in corpus.docs() {
         let bytes = corpus.fetch(*id)?;
-        if re.is_match(&bytes) {
+        if has_line_match(&bytes, re) {
             hits.push(key.clone());
         }
     }
@@ -555,35 +647,157 @@ mod corpus_tests {
         assert_eq!(scan_matching_docs(&c, &re).unwrap(), vec!["a".to_owned()]);
     }
 
+    fn re(p: &str) -> regex::bytes::Regex {
+        regex::bytes::Regex::new(p).unwrap()
+    }
+
+    type EventShape = (u64, LineKind, Vec<(usize, usize)>);
+
+    fn shape(events: &[LineEvent]) -> Vec<EventShape> {
+        events
+            .iter()
+            .map(|e| {
+                (
+                    e.line,
+                    e.kind,
+                    e.submatches.iter().map(|s| (s.start, s.end)).collect(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn match_line_col() {
-        let m = matches_in(b"foo\nbar baz", &regex::bytes::Regex::new("baz").unwrap());
+        let events = grep_doc(b"foo\nbar baz", &re("baz"), MatchOptions::default());
         assert_eq!(
-            m,
-            vec![Match {
+            events,
+            vec![LineEvent {
                 line: 2,
-                col: 5,
-                text: "bar baz".into()
+                kind: LineKind::Match,
+                offset: 4,
+                text: b"bar baz".to_vec(),
+                submatches: vec![SubMatch { start: 4, end: 7 }],
             }]
         );
     }
 
     #[test]
-    fn matches_in_tracks_lines_across_matches() {
+    fn grep_doc_merges_per_line_and_tracks_lines() {
+        // x appears twice on line 3: ONE event with two submatches
         let bytes = b"alpha x\nbeta\nx gamma x\nx";
-        let re = regex::bytes::Regex::new("x").unwrap();
-        let m = matches_in(bytes, &re);
-        let positions: Vec<(usize, usize, &str)> =
-            m.iter().map(|m| (m.line, m.col, m.text.as_str())).collect();
+        let events = grep_doc(bytes, &re("x"), MatchOptions::default());
         assert_eq!(
-            positions,
+            shape(&events),
             vec![
-                (1, 7, "alpha x"),
-                (3, 1, "x gamma x"),
-                (3, 9, "x gamma x"),
-                (4, 1, "x"),
+                (1, LineKind::Match, vec![(6, 7)]),
+                (3, LineKind::Match, vec![(0, 1), (8, 9)]),
+                (4, LineKind::Match, vec![(0, 1)]),
             ]
         );
+        assert_eq!(events[1].text, b"x gamma x\n".to_vec());
+        assert_eq!(events[2].text, b"x".to_vec());
+    }
+
+    #[test]
+    fn grep_doc_context_merges_overlaps() {
+        // matches on lines 3 and 5 with C=2: lines 1-7 once each, 3+5 Match
+        let bytes = b"l1\nl2\nhit\nl4\nhit\nl6\nl7\nl8\n";
+        let opts = MatchOptions {
+            before_context: 2,
+            after_context: 2,
+            max_count: None,
+        };
+        let events = grep_doc(bytes, &re("hit"), opts);
+        let lines: Vec<(u64, LineKind)> = events.iter().map(|e| (e.line, e.kind)).collect();
+        assert_eq!(
+            lines,
+            vec![
+                (1, LineKind::Context),
+                (2, LineKind::Context),
+                (3, LineKind::Match),
+                (4, LineKind::Context),
+                (5, LineKind::Match),
+                (6, LineKind::Context),
+                (7, LineKind::Context),
+            ]
+        );
+    }
+
+    #[test]
+    fn grep_doc_independent_before_after() {
+        let bytes = b"a\nb\nhit\nc\nd\n";
+        let only_after = MatchOptions {
+            after_context: 1,
+            ..Default::default()
+        };
+        let events = grep_doc(bytes, &re("hit"), only_after);
+        assert_eq!(
+            events.iter().map(|e| e.line).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let only_before = MatchOptions {
+            before_context: 1,
+            ..Default::default()
+        };
+        let events = grep_doc(bytes, &re("hit"), only_before);
+        assert_eq!(
+            events.iter().map(|e| e.line).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn grep_doc_max_count_caps_but_drains_after_context() {
+        let bytes = b"hit\nmid\nhit\ntail\n";
+        let opts = MatchOptions {
+            after_context: 1,
+            max_count: Some(1),
+            ..Default::default()
+        };
+        let events = grep_doc(bytes, &re("hit"), opts);
+        // one Match, then line 2 as after-context; the capped line-3 match
+        // never surfaces because after-context ran out before it
+        assert_eq!(
+            shape(&events),
+            vec![
+                (1, LineKind::Match, vec![(0, 3)]),
+                (2, LineKind::Context, vec![]),
+            ]
+        );
+        assert!(grep_doc(
+            bytes,
+            &re("hit"),
+            MatchOptions {
+                max_count: Some(0),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn grep_doc_post_cap_match_in_context_carries_submatches() {
+        let bytes = b"hit\nhit\nrest\n";
+        let opts = MatchOptions {
+            after_context: 1,
+            max_count: Some(1),
+            ..Default::default()
+        };
+        let events = grep_doc(bytes, &re("hit"), opts);
+        assert_eq!(
+            shape(&events),
+            vec![
+                (1, LineKind::Match, vec![(0, 3)]),
+                (2, LineKind::Context, vec![(0, 3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn grep_doc_eof_line_without_newline() {
+        let events = grep_doc(b"no newline tail", &re("tail"), MatchOptions::default());
+        assert_eq!(events[0].text, b"no newline tail".to_vec());
+        assert_eq!(events[0].submatches, vec![SubMatch { start: 11, end: 15 }]);
     }
 
     #[test]

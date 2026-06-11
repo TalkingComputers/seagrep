@@ -5,7 +5,9 @@ mod eval;
 mod search;
 mod segment;
 
-pub use search::{search_collect, search_streaming, KeyScope, MatchSink, NullSink, SinkFlow};
+pub use search::{
+    search_collect, search_streaming, DocResult, KeyScope, MatchSink, NullSink, SinkFlow,
+};
 pub use segment::{update_index, CorpusFactory, SegmentedReader, UpdateReport};
 
 use anyhow::{Context, Result};
@@ -379,7 +381,7 @@ impl DocFetcher for LocalFetcher {
 mod tests {
     use super::*;
     use holys3_core::testutil::MemCorpus;
-    use holys3_core::Match;
+    use holys3_core::{LineEvent, LineKind, MatchOptions, SubMatch};
 
     fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, MmapIndexReader) {
         let dir = tempfile::tempdir().unwrap();
@@ -425,10 +427,12 @@ mod tests {
             matches,
             vec![(
                 "x".to_owned(),
-                Match {
+                LineEvent {
                     line: 1,
-                    col: 5,
-                    text: "abc world".into(),
+                    kind: LineKind::Match,
+                    offset: 0,
+                    text: b"abc world".to_vec(),
+                    submatches: vec![SubMatch { start: 4, end: 9 }],
                 }
             )]
         );
@@ -449,7 +453,15 @@ mod tests {
             ],
         );
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let stats = search_streaming(&r, &c, "world", KeyScope::default(), &NullSink).unwrap();
+        let stats = search_streaming(
+            &r,
+            &c,
+            "world",
+            KeyScope::default(),
+            MatchOptions::default(),
+            &NullSink,
+        )
+        .unwrap();
         let (_, full_stats) = search_collect(&r, &c, "world").unwrap();
         assert_eq!(stats.hits, full_stats.hits);
         assert_eq!(stats.hits, vec!["x", "z"]);
@@ -466,7 +478,8 @@ mod tests {
             prefix: Some("logs/"),
             matches: None,
         };
-        let stats = search_streaming(&r, &c, "world", scope, &NullSink).unwrap();
+        let stats =
+            search_streaming(&r, &c, "world", scope, MatchOptions::default(), &NullSink).unwrap();
         assert_eq!(stats.hits, vec!["logs/a"]);
         assert_eq!(stats.candidates, 1);
         assert_eq!(stats.bytes_fetched, b"abc world".len());
@@ -495,7 +508,7 @@ mod tests {
                 "strategy {strategy:?}"
             );
             assert_eq!(matches[0].1.line, 2);
-            assert_eq!(matches[0].1.text, "needle in second member");
+            assert_eq!(matches[0].1.text, b"needle in second member\n".to_vec());
         }
     }
 
@@ -504,7 +517,7 @@ mod tests {
         struct StopAfterFirst;
 
         impl MatchSink for StopAfterFirst {
-            fn on_doc(&self, _key: &str, _matches: &[Match]) -> Result<SinkFlow> {
+            fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
                 Ok(SinkFlow::Stop)
             }
         }
@@ -515,8 +528,15 @@ mod tests {
             .collect();
         let c = MemCorpus::new(docs, bodies);
         let (_d, r) = build_tmp(&c, Strategy::Trigram);
-        let stats =
-            search_streaming(&r, &c, "needle", KeyScope::default(), &StopAfterFirst).unwrap();
+        let stats = search_streaming(
+            &r,
+            &c,
+            "needle",
+            KeyScope::default(),
+            MatchOptions::default(),
+            &StopAfterFirst,
+        )
+        .unwrap();
         // Stop is cooperative: at least one hit was reported, the search
         // ended Ok, and whatever was skipped is simply absent from hits.
         assert!(!stats.hits.is_empty());

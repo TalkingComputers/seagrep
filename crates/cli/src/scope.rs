@@ -9,6 +9,7 @@ use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 pub(crate) struct Scope {
     key_prefix: Option<String>,
     key_regex: Option<regex::Regex>,
+    globs: Option<crate::globs::GlobFilter>,
     since: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
     undated: AtomicUsize,
@@ -20,8 +21,14 @@ impl Scope {
         key_regex: Option<String>,
         since: Option<String>,
         until: Option<String>,
+        globs: Option<crate::globs::GlobFilter>,
     ) -> Result<Option<Scope>> {
-        if key_prefix.is_none() && key_regex.is_none() && since.is_none() && until.is_none() {
+        if key_prefix.is_none()
+            && key_regex.is_none()
+            && since.is_none()
+            && until.is_none()
+            && globs.is_none()
+        {
             return Ok(None);
         }
         let now = OffsetDateTime::now_utc();
@@ -30,6 +37,7 @@ impl Scope {
             key_regex: key_regex
                 .map(|pattern| regex::Regex::new(&pattern).context("invalid --key-regex"))
                 .transpose()?,
+            globs,
             since: since
                 .map(|s| parse_instant(&s, now, Bound::Start).context("invalid --since"))
                 .transpose()?,
@@ -52,6 +60,11 @@ impl Scope {
         }
         if let Some(re) = &self.key_regex {
             if !re.is_match(key) {
+                return false;
+            }
+        }
+        if let Some(globs) = &self.globs {
+            if !globs.admits(key) {
                 return false;
             }
         }
@@ -381,7 +394,7 @@ mod tests {
 
     #[test]
     fn time_window_overlap_includes_day_spanning_objects() {
-        let scope = Scope::from_args(None, None, Some("2026-06-09T14:00".into()), None)
+        let scope = Scope::from_args(None, None, Some("2026-06-09T14:00".into()), None, None)
             .unwrap()
             .unwrap();
         // Day-granular key overlaps a 14:00 cutoff — must be included.
@@ -395,7 +408,7 @@ mod tests {
 
     #[test]
     fn until_excludes_later_objects_but_keeps_delivery_lagged_ones() {
-        let scope = Scope::from_args(None, None, None, Some("2026-06-08".into()))
+        let scope = Scope::from_args(None, None, None, Some("2026-06-08".into()), None)
             .unwrap()
             .unwrap();
         // The next day's key may hold delivery-lagged events from June 8.
@@ -407,14 +420,20 @@ mod tests {
 
     #[test]
     fn year_9999_until_errors_instead_of_panicking() {
-        assert!(Scope::from_args(None, None, None, Some("9999-12-31".into())).is_err());
+        assert!(Scope::from_args(None, None, None, Some("9999-12-31".into()), None).is_err());
     }
 
     #[test]
     fn prefix_and_regex_filters_compose() {
-        let scope = Scope::from_args(Some("prod/".into()), Some(r"\.gz$".into()), None, None)
-            .unwrap()
-            .unwrap();
+        let scope = Scope::from_args(
+            Some("prod/".into()),
+            Some(r"\.gz$".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(scope.matches("prod/a.gz"));
         assert!(!scope.matches("dev/a.gz"));
         assert!(!scope.matches("prod/a.txt"));
