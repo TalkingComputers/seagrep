@@ -310,13 +310,20 @@ fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
 }
 
 fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
-    let listing = list_user_objects(&src)?
-        .into_iter()
-        .map(|object| (object.key, object.etag))
+    let objects = list_user_objects(&src)?;
+    // Real sizes let the build bound its fetch chunks by bytes, not just
+    // doc count — a bucket of huge objects must not OOM the indexer.
+    let size_of: std::collections::HashMap<&str, u64> = objects
+        .iter()
+        .map(|object| (object.key.as_str(), object.size))
+        .collect();
+    let listing = objects
+        .iter()
+        .map(|object| (object.key.clone(), object.etag.clone()))
         .collect::<Vec<_>>();
     let cache_dir = build_cache_dir(src.endpoint.as_deref(), &src.bucket, &src.prefix)?;
     let store = S3BlobStore::new(src.client.clone(), src.bucket.clone(), src.prefix.clone());
-    let client = src.client;
+    let client = src.client.clone();
     let bucket = src.bucket.clone();
     let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|keys| {
         let objects = keys
@@ -324,7 +331,7 @@ fn build_s3(src: S3Source, strategy: Strategy, rebuild: bool) -> Result<()> {
             .map(|key| ObjectMeta {
                 key: key.clone(),
                 etag: String::new(),
-                size: 0,
+                size: size_of.get(key.as_str()).copied().unwrap_or(0),
             })
             .collect::<Vec<_>>();
         Ok(Box::new(S3Corpus::new(
@@ -402,10 +409,13 @@ fn execute_search(
 /// Returns whether anything matched (drives the exit code).
 fn run_search(args: SearchArgs) -> Result<bool> {
     let (patterns, target_raw) = split_pattern_target(args.args, args.regexp)?;
-    patterns::reject_line_terminators(&patterns)?;
     let insensitive = patterns::is_insensitive(args.ignore_case, args.smart_case, &patterns);
-    let pattern =
-        patterns::compose_pattern(&patterns, args.fixed_strings, args.word_regexp, insensitive);
+    let pattern = patterns::sanitize_line_terminators(&patterns::compose_pattern(
+        &patterns,
+        args.fixed_strings,
+        args.word_regexp,
+        insensitive,
+    ))?;
     let globs = globs::build_glob_filter(&args.glob)?;
     let scope = Scope::from_args(
         args.key_prefix,

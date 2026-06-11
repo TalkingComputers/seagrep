@@ -19,7 +19,9 @@ pub(crate) fn compose_pattern(
                 p.clone()
             };
             if word_regexp {
-                format!(r"\b(?:{p})\b")
+                // rg uses HALF word boundaries: full \b mis-anchors when the
+                // pattern's first/last char is a non-word char (`foo(`, `->`)
+                format!(r"\b{{start-half}}(?:{p})\b{{end-half}}")
             } else {
                 p
             }
@@ -43,17 +45,65 @@ pub(crate) fn compose_pattern(
     }
 }
 
-/// rg rejects literal line terminators in patterns: a match can never span
-/// the line-oriented engine's unit of output, so the result would silently
-/// truncate at the first line.
-pub(crate) fn reject_line_terminators(patterns: &[String]) -> anyhow::Result<()> {
-    for pattern in patterns {
-        anyhow::ensure!(
-            !pattern.contains('\n'),
-            "the literal '\\n' is not allowed in a regex"
-        );
+/// rg's line-terminator discipline, applied to the COMPOSED pattern: strip
+/// \n out of every character class that matches it (this is what makes
+/// `[^x]` and `(?s).` line-oriented — a class spanning \n would swallow
+/// following lines into one phantom match), then reject any literal \n
+/// left (a match can never span the line-oriented unit of output).
+pub(crate) fn sanitize_line_terminators(pattern: &str) -> anyhow::Result<String> {
+    use regex_syntax::hir::{Class, Hir, HirKind, Literal};
+    fn strip(hir: &Hir) -> anyhow::Result<Hir> {
+        Ok(match hir.kind() {
+            HirKind::Literal(Literal(bytes)) => {
+                anyhow::ensure!(
+                    !bytes.contains(&b'\n'),
+                    "the literal '\\n' is not allowed in a regex"
+                );
+                hir.clone()
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                let mut class = class.clone();
+                let mut newline =
+                    regex_syntax::hir::ClassBytes::new([regex_syntax::hir::ClassBytesRange::new(
+                        b'\n', b'\n',
+                    )]);
+                newline.negate();
+                class.intersect(&newline);
+                Hir::class(Class::Bytes(class))
+            }
+            HirKind::Class(Class::Unicode(class)) => {
+                let mut class = class.clone();
+                let mut newline = regex_syntax::hir::ClassUnicode::new([
+                    regex_syntax::hir::ClassUnicodeRange::new('\n', '\n'),
+                ]);
+                newline.negate();
+                class.intersect(&newline);
+                Hir::class(Class::Unicode(class))
+            }
+            HirKind::Repetition(rep) => {
+                let mut rep = rep.clone();
+                rep.sub = Box::new(strip(&rep.sub)?);
+                Hir::repetition(rep)
+            }
+            HirKind::Capture(cap) => {
+                let mut cap = cap.clone();
+                cap.sub = Box::new(strip(&cap.sub)?);
+                Hir::capture(cap)
+            }
+            HirKind::Concat(subs) => {
+                Hir::concat(subs.iter().map(strip).collect::<anyhow::Result<_>>()?)
+            }
+            HirKind::Alternation(subs) => {
+                Hir::alternation(subs.iter().map(strip).collect::<anyhow::Result<_>>()?)
+            }
+            HirKind::Empty | HirKind::Look(_) => hir.clone(),
+        })
     }
-    Ok(())
+    let hir = regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .build()
+        .parse(pattern)?;
+    Ok(strip(&hir)?.to_string())
 }
 
 /// Resolve the -i/-S/-s trio (clap guarantees at most one is set).
@@ -112,7 +162,7 @@ mod tests {
         );
         assert_eq!(
             compose_pattern(&one("foo"), false, true, false),
-            r"(?m)\b(?:foo)\b"
+            r"(?m)\b{start-half}(?:foo)\b{end-half}"
         );
         assert_eq!(
             compose_pattern(&["a".into(), "b".into()], false, false, false),
@@ -121,8 +171,28 @@ mod tests {
         assert_eq!(compose_pattern(&one("foo"), false, false, true), "(?mi)foo");
         assert_eq!(
             compose_pattern(&["a.".into(), "b".into()], true, true, true),
-            r"(?mi)(?:\b(?:a\.)\b)|(?:\b(?:b)\b)"
+            r"(?mi)(?:\b{start-half}(?:a\.)\b{end-half})|(?:\b{start-half}(?:b)\b{end-half})"
         );
+    }
+
+    #[test]
+    fn sanitize_strips_newline_from_classes_and_rejects_literals() {
+        let re =
+            |p: &str| regex::bytes::Regex::new(&sanitize_line_terminators(p).unwrap()).unwrap();
+        // [^x] must not swallow the newline
+        assert!(!re("[^x]").is_match(b"\n"));
+        // (?s). is a class containing \n: stripped back to line-oriented
+        assert!(!re("(?s).").is_match(b"\n"));
+        assert!(re("(?s)a.b").is_match(b"axb"));
+        assert!(!re("(?s)a.b").is_match(b"a\nb"));
+        // \D and \W contain \n
+        assert!(!re(r"\D").is_match(b"\n"));
+        // literal newlines are rejected, in every spelling
+        assert!(sanitize_line_terminators("a\nb").is_err());
+        assert!(sanitize_line_terminators(r"a\nb").is_err());
+        assert!(sanitize_line_terminators(r"a\x0Ab").is_err());
+        // plain patterns round-trip
+        assert!(re("(?m)^needle$").is_match(b"x\nneedle\ny"));
     }
 
     #[test]

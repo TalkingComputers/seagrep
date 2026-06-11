@@ -19,9 +19,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Docs are fetched and gram-extracted in chunks of this many, bounding build
-/// memory to one chunk of bodies instead of the whole corpus.
+/// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count
+/// and by total (compressed) bytes, so neither many-small nor few-huge
+/// objects blow build memory.
 const BUILD_FETCH_CHUNK: usize = 1024;
+const BUILD_FETCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Greedy chunk boundaries over `docs()` order respecting both caps; a
+/// single over-budget doc still forms its own chunk.
+fn build_chunks<'a>(ids: &'a [DocId], sizes: &'a [u64]) -> impl Iterator<Item = &'a [DocId]> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        if start >= ids.len() {
+            return None;
+        }
+        let mut end = start;
+        let mut bytes = 0u64;
+        while end < ids.len() && end - start < BUILD_FETCH_CHUNK {
+            let size = sizes[ids[end] as usize];
+            if end > start && bytes + size > BUILD_FETCH_BYTES {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        let chunk = &ids[start..end];
+        start = end;
+        Some(chunk)
+    })
+}
 
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
@@ -251,7 +277,7 @@ fn build_index_bytes(
     let doc_keys = corpus.docs();
     let ids = doc_keys.iter().map(|&(id, _)| id).collect::<Vec<_>>();
     let mut ungrammed: Vec<DocId> = Vec::new();
-    for chunk in ids.chunks(BUILD_FETCH_CHUNK) {
+    for chunk in build_chunks(&ids, corpus.sizes()) {
         let fetched = corpus.fetch_many(chunk)?;
         let mut seen = vec![false; chunk.len()];
         let base = chunk[0];
@@ -385,17 +411,28 @@ pub struct MmapIndexReader {
 
 impl MmapIndexReader {
     pub fn open(dir: &Path) -> Result<MmapIndexReader> {
-        let fst_file = std::fs::File::open(dir.join("terms.fst"))?;
+        let blob = |name: &str| {
+            std::fs::File::open(dir.join(name)).with_context(|| {
+                format!(
+                    "no index at {}: {name} missing (run `holys3 index <TARGET> --out {0}`)",
+                    dir.display()
+                )
+            })
+        };
+        let fst_file = blob("terms.fst")?;
         let map = fst::Map::new(unsafe {
             // Build dirs are immutable while readers are open.
             memmap2::Mmap::map(&fst_file)?
         })?;
-        let post_file = std::fs::File::open(dir.join("postings.bin"))?;
+        let post_file = blob("postings.bin")?;
         let postings = unsafe {
             // Build dirs are immutable while readers are open.
             memmap2::Mmap::map(&post_file)?
         };
-        let manifest = parse_manifest(&std::fs::read(dir.join("manifest.bin"))?)?;
+        let manifest =
+            parse_manifest(&std::fs::read(dir.join("manifest.bin")).with_context(|| {
+                format!("no index at {}: manifest.bin missing", dir.display())
+            })?)?;
         Ok(MmapIndexReader {
             map,
             postings,
@@ -454,6 +491,7 @@ impl IndexReader for MmapIndexReader {
 pub struct LocalCorpus {
     docs: Vec<(DocId, String)>,
     paths: Vec<PathBuf>,
+    sizes: Vec<u64>,
 }
 
 impl LocalCorpus {
@@ -486,11 +524,19 @@ impl LocalCorpus {
             .enumerate()
             .map(|(i, p)| (i as DocId, key_of(p)))
             .collect();
-        Ok(LocalCorpus { docs, paths })
+        let sizes = paths
+            .iter()
+            .map(|p| Ok(std::fs::metadata(p)?.len()))
+            .collect::<Result<Vec<u64>>>()?;
+        Ok(LocalCorpus { docs, paths, sizes })
     }
 }
 
 impl Corpus for LocalCorpus {
+    fn sizes(&self) -> &[u64] {
+        &self.sizes
+    }
+
     fn docs(&self) -> &[(DocId, String)] {
         &self.docs
     }
