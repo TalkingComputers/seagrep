@@ -57,7 +57,13 @@ fn search_pattern(c: &Corpus, pattern: &str) -> Command {
 }
 
 fn key(c: &Corpus, name: &str) -> String {
-    c.dir.path().join(name).display().to_string()
+    // LocalCorpus keys are /-separated on every platform
+    c.dir
+        .path()
+        .join(name)
+        .display()
+        .to_string()
+        .replace('\\', "/")
 }
 
 fn sorted_lines(output: &[u8]) -> Vec<String> {

@@ -342,10 +342,17 @@ impl LocalCorpus {
             }
         }
         paths.sort();
+        // Keys are S3-style `/`-separated on every platform so globs,
+        // prefixes, and key-time scoping behave identically; Windows file
+        // APIs accept forward slashes, so fetching by key still works.
+        #[cfg(windows)]
+        let key_of = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        #[cfg(not(windows))]
+        let key_of = |p: &PathBuf| p.to_string_lossy().into_owned();
         let docs = paths
             .iter()
             .enumerate()
-            .map(|(i, p)| (i as DocId, p.to_string_lossy().into_owned()))
+            .map(|(i, p)| (i as DocId, key_of(p)))
             .collect();
         Ok(LocalCorpus { docs, paths })
     }
