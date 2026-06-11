@@ -386,6 +386,10 @@ impl S3Client {
             builder = builder.header("range", range);
         }
         if let Some(body) = req.body {
+            // explicit even when empty: S3 returns 411 Length Required for
+            // an empty PUT without it, and format-4 dense segments legally
+            // produce 0-byte postings.bin blobs (MinIO is lenient, AWS not)
+            builder = builder.header("content-length", body.len());
             builder = builder.body(body.to_vec());
             if body.len() >= UPLOAD_BODY_THRESHOLD {
                 builder = builder.timeout(upload_deadline(body.len()));
