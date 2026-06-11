@@ -119,20 +119,32 @@ fn is_bzip2(bytes: &[u8]) -> bool {
 /// deliveries concatenate members and sometimes pad, so a decode error after
 /// some bytes already decoded keeps the decoded text with a warning — for
 /// grep, partial coverage beats dropping the object.
+/// Chunked, not read_to_end: the `Read` contract discards bytes produced by
+/// a FAILING read call, so a small stream decoded in one call would salvage
+/// nothing. Salvage is best-effort by design — bytes decoded before the
+/// error are kept even when the error proves them unreliable (checksum
+/// mismatch); the warning tells the user the coverage is partial.
 fn read_salvaging(key: &str, label: &str, reader: &mut dyn std::io::Read) -> AnyhowResult<Vec<u8>> {
     let mut out = Vec::new();
-    match reader.read_to_end(&mut out) {
-        Ok(_) => Ok(out),
-        Err(err) if !out.is_empty() => {
-            eprintln!(
-                "warning: {key}: {label} stream ends in garbage ({err}); \
-                 searching the {} bytes that decoded",
-                out.len()
-            );
-            Ok(out)
-        }
-        Err(err) => {
-            Err(anyhow::Error::new(err).context(format!("{label} decode failed for {key}")))
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if !out.is_empty() => {
+                eprintln!(
+                    "warning: {key}: {label} stream ends in garbage ({err}); \
+                     searching the {} bytes that decoded",
+                    out.len()
+                );
+                return Ok(out);
+            }
+            Err(err) => {
+                return Err(
+                    anyhow::Error::new(err).context(format!("{label} decode failed for {key}"))
+                )
+            }
         }
     }
 }
@@ -265,6 +277,76 @@ fn decode_lz4_frames(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
     }
 }
 
+/// Decode concatenated xz streams via the low-level Stream API: the Read
+/// adapters consume the whole (small) input inside one failing call, so
+/// trailing garbage would salvage nothing. Explicit positions let each
+/// stream end cleanly, inter-stream null padding skip, and garbage after at
+/// least one good stream salvage with a warning.
+fn decode_xz_streams(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut chunk = vec![0u8; 256 * 1024];
+    loop {
+        while bytes.get(pos) == Some(&0) {
+            pos += 1; // stream padding
+        }
+        let rest = &bytes[pos..];
+        if rest.is_empty() {
+            return Ok(out);
+        }
+        if !rest.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+            anyhow::ensure!(
+                !out.is_empty(),
+                "xz decode failed for {key}: input is not an xz stream"
+            );
+            eprintln!(
+                "warning: {key}: xz stream ends in garbage; \
+                 searching the {} bytes that decoded",
+                out.len()
+            );
+            return Ok(out);
+        }
+        let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0)
+            .with_context(|| format!("xz decoder init failed for {key}"))?;
+        let mut emitted = 0u64;
+        loop {
+            let input = &rest[usize::try_from(stream.total_in())?..];
+            let result = stream.process(input, &mut chunk, liblzma::stream::Action::Run);
+            let written = usize::try_from(stream.total_out() - emitted)?;
+            out.extend_from_slice(&chunk[..written]);
+            emitted = stream.total_out();
+            match result {
+                Ok(liblzma::stream::Status::StreamEnd) => break,
+                Ok(_) if input.is_empty() && written == 0 => {
+                    // truncated final stream: keep what decoded
+                    anyhow::ensure!(!out.is_empty(), "xz stream of {key} is truncated");
+                    eprintln!(
+                        "warning: {key}: xz stream is truncated; \
+                         searching the {} bytes that decoded",
+                        out.len()
+                    );
+                    return Ok(out);
+                }
+                Ok(_) => {}
+                Err(err) if !out.is_empty() => {
+                    eprintln!(
+                        "warning: {key}: xz stream ends in garbage ({err}); \
+                         searching the {} bytes that decoded",
+                        out.len()
+                    );
+                    return Ok(out);
+                }
+                Err(err) => {
+                    return Err(
+                        anyhow::Error::new(err).context(format!("xz decode failed for {key}"))
+                    )
+                }
+            }
+        }
+        pos += usize::try_from(stream.total_in())?;
+    }
+}
+
 /// Transparently decode an object body into searchable text. Compressed
 /// objects decompress (multi-member/multi-stream concatenations included);
 /// columnar/container formats project to JSON Lines so the same bytes are
@@ -277,8 +359,11 @@ pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
             "gzip",
             &mut flate2::read::MultiGzDecoder::new(bytes.as_slice()),
         ),
-        Codec::Zstd => zstd::stream::decode_all(bytes.as_slice())
-            .with_context(|| format!("zstd decode failed for {key}")),
+        Codec::Zstd => {
+            let mut decoder = zstd::stream::read::Decoder::new(bytes.as_slice())
+                .with_context(|| format!("zstd decode failed for {key}"))?;
+            read_salvaging(key, "zstd", &mut decoder)
+        }
         Codec::Bzip2 => read_salvaging(
             key,
             "bzip2",
@@ -294,11 +379,7 @@ pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
             "{key} is an lz4 LEGACY frame (`lz4 -l` output), which holys3 does \
              not decode; re-compress with the default lz4 frame format"
         ),
-        Codec::Xz => read_salvaging(
-            key,
-            "xz",
-            &mut liblzma::read::XzDecoder::new_multi_decoder(bytes.as_slice()),
-        ),
+        Codec::Xz => decode_xz_streams(key, &bytes),
         Codec::Parquet => parquet_to_json_lines(key, bytes),
         Codec::Avro => avro_to_json_lines(key, &bytes),
     }
@@ -1255,6 +1336,32 @@ mod corpus_tests {
         let mut multi = xz(b"stream a\n");
         multi.extend(xz(b"stream b\n"));
         assert_eq!(decode_body("k.xz", multi).unwrap(), b"stream a\nstream b\n");
+    }
+
+    #[test]
+    fn zstd_multiframe_and_trailing_garbage_salvage() {
+        let zst = |data: &[u8]| zstd::stream::encode_all(data, 0).unwrap();
+        // concatenated frames decode to concatenated text
+        let mut multi = zst(b"frame one\n");
+        multi.extend(zst(b"frame two\n"));
+        assert_eq!(
+            decode_body("k.zst", multi).unwrap(),
+            b"frame one\nframe two\n"
+        );
+        // trailing garbage salvages the decoded frames instead of dropping all
+        let mut garbage = zst(b"good part\n");
+        garbage.extend(b"not a frame at all");
+        assert_eq!(decode_body("k.zst", garbage).unwrap(), b"good part\n");
+    }
+
+    #[test]
+    fn xz_trailing_garbage_salvages() {
+        use std::io::Write;
+        let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(b"good part\n").unwrap();
+        let mut bytes = enc.finish().unwrap();
+        bytes.extend(b"@@@@ trailing junk that is not an xz stream");
+        assert_eq!(decode_body("k.xz", bytes).unwrap(), b"good part\n");
     }
 
     #[test]

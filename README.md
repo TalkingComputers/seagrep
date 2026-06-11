@@ -33,8 +33,12 @@ Do not use holys3 when:
 
 ## Installation
 
+Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon),
+and Windows ship with every [GitHub release](https://github.com/TalkingComputers/holys3/releases):
+
 ```sh
-cargo install holys3
+cargo binstall holys3   # fetches the prebuilt binary for your platform
+cargo install holys3    # or build from source
 ```
 
 ## Quickstart

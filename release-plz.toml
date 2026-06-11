@@ -9,6 +9,12 @@ publish = true
 git_release_enable = true
 git_tag_enable = true
 
+# One v{version} tag for the whole workspace (single shared version): this is
+# the tag shape both the release workflow trigger and cargo-binstall's
+# default pkg-url templates expect.
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
 [changelog]
 # git-cliff-compatible commit parsers. Conventional Commits -> grouped sections.
 protect_breaking_commits = true
