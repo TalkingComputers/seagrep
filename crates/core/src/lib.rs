@@ -119,7 +119,7 @@ fn is_bzip2(bytes: &[u8]) -> bool {
 /// deliveries concatenate members and sometimes pad, so a decode error after
 /// some bytes already decoded keeps the decoded text with a warning — for
 /// grep, partial coverage beats dropping the object.
-/// Chunked, not read_to_end: the `Read` contract discards bytes produced by
+/// Chunked, not `read_to_end`: the `Read` contract discards bytes produced by
 /// a FAILING read call, so a small stream decoded in one call would salvage
 /// nothing. Salvage is best-effort by design — bytes decoded before the
 /// error are kept even when the error proves them unreliable (checksum
