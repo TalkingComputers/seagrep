@@ -158,18 +158,111 @@ fn parquet_to_json_lines(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
     Ok(writer.into_inner())
 }
 
-/// One record per line via the crate's own Value -> JSON conversion.
+/// JSON has no NaN/Infinity; render them as null exactly like the parquet
+/// projection (arrow-json) does, instead of failing the whole object over
+/// one record.
+fn finite_floats(value: apache_avro::types::Value) -> apache_avro::types::Value {
+    use apache_avro::types::Value;
+    match value {
+        Value::Float(f) if !f.is_finite() => Value::Null,
+        Value::Double(d) if !d.is_finite() => Value::Null,
+        Value::Union(branch, inner) => Value::Union(branch, Box::new(finite_floats(*inner))),
+        Value::Array(items) => Value::Array(items.into_iter().map(finite_floats).collect()),
+        Value::Map(entries) => Value::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k, finite_floats(v)))
+                .collect(),
+        ),
+        Value::Record(fields) => Value::Record(
+            fields
+                .into_iter()
+                .map(|(name, v)| (name, finite_floats(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// One record per line via the crate's own Value -> JSON conversion. A
+/// mid-stream read error after some records decoded salvages the decoded
+/// records with a warning, like the compressed-codec paths.
 fn avro_to_json_lines(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
     let context = || format!("avro decode failed for {key}");
     let reader = apache_avro::Reader::new(bytes).with_context(context)?;
     let mut out = Vec::new();
     for value in reader {
-        let json =
-            serde_json::Value::try_from(value.with_context(context)?).with_context(context)?;
+        let value = match value {
+            Ok(value) => value,
+            Err(err) if !out.is_empty() => {
+                eprintln!(
+                    "warning: {key}: avro stream ends in garbage ({err}); \
+                     searching the {} records that decoded",
+                    out.iter().filter(|&&b| b == b'\n').count()
+                );
+                return Ok(out);
+            }
+            Err(err) => return Err(anyhow::Error::new(err)).with_context(context),
+        };
+        let json = serde_json::Value::try_from(finite_floats(value)).with_context(context)?;
         out.extend_from_slice(json.to_string().as_bytes());
         out.push(b'\n');
     }
     Ok(out)
+}
+
+/// Decode a flow of lz4 frames by cursor: one `read_to_end` call decodes one
+/// frame, and the remaining input (via `into_inner`) decides whether to
+/// continue — `Ok(0)` alone CANNOT signal exhaustion, because a legal empty
+/// frame (`lz4 -c` on empty input) also decodes to zero bytes. Skippable
+/// frames may legally sit between data frames; trailing garbage after at
+/// least one decoded frame salvages with a warning.
+fn decode_lz4_frames(key: &str, bytes: &[u8]) -> AnyhowResult<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    let mut decoded_any = false;
+    loop {
+        let skipped = match skip_skippable_frames(rest) {
+            Some(at) => &rest[at..],
+            None => &[][..], // truncated skippable header: treat as garbage
+        };
+        if skipped.is_empty() {
+            return Ok(out);
+        }
+        if !skipped.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            if decoded_any {
+                eprintln!(
+                    "warning: {key}: lz4 stream ends in garbage; \
+                     searching the {} bytes that decoded",
+                    out.len()
+                );
+                return Ok(out);
+            }
+            anyhow::bail!("lz4 decode failed for {key}: input is not an lz4 frame");
+        }
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(skipped);
+        match std::io::Read::read_to_end(&mut decoder, &mut out) {
+            Ok(_) => {}
+            Err(err) if decoded_any || !out.is_empty() => {
+                eprintln!(
+                    "warning: {key}: lz4 stream ends in garbage ({err}); \
+                     searching the {} bytes that decoded",
+                    out.len()
+                );
+                return Ok(out);
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!("lz4 decode failed for {key}")))
+            }
+        }
+        decoded_any = true;
+        let remaining = decoder.into_inner();
+        anyhow::ensure!(
+            remaining.len() < skipped.len(),
+            "lz4 decoder made no progress on {key}"
+        );
+        rest = remaining;
+    }
 }
 
 /// Transparently decode an object body into searchable text. Compressed
@@ -196,32 +289,7 @@ pub fn decode_body(key: &str, bytes: Vec<u8>) -> AnyhowResult<Vec<u8>> {
             "snappy",
             &mut snap::read::FrameDecoder::new(bytes.as_slice()),
         ),
-        Codec::Lz4Frame => {
-            // identity may sit after skippable frames the decoder won't skip
-            let at = skip_skippable_frames(&bytes).expect("validated by detect_codec");
-            let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[at..]);
-            let mut out = Vec::new();
-            loop {
-                // each call decodes one frame; Ok(0) = input exhausted
-                match std::io::Read::read_to_end(&mut decoder, &mut out) {
-                    Ok(0) => return Ok(out),
-                    Ok(_) => {}
-                    Err(err) if !out.is_empty() => {
-                        eprintln!(
-                            "warning: {key}: lz4 stream ends in garbage ({err}); \
-                             searching the {} bytes that decoded",
-                            out.len()
-                        );
-                        return Ok(out);
-                    }
-                    Err(err) => {
-                        return Err(
-                            anyhow::Error::new(err).context(format!("lz4 decode failed for {key}"))
-                        )
-                    }
-                }
-            }
-        }
+        Codec::Lz4Frame => decode_lz4_frames(key, &bytes),
         Codec::Lz4Legacy => anyhow::bail!(
             "{key} is an lz4 LEGACY frame (`lz4 -l` output), which holys3 does \
              not decode; re-compress with the default lz4 frame format"
@@ -305,11 +373,20 @@ pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
         return out;
     }
     let weights: Vec<u32> = data.windows(2).map(|w| pair_weight(w[0], w[1])).collect();
+    // Every emission goes through `is_indexed_gram`: a query-side gram that
+    // the index-side builder would never emit (weight TIES inside
+    // repeated-byte runs create exactly that) would silently return zero
+    // candidates for true matches. covering ⊆ all holds by construction.
+    let push = |out: &mut Vec<Vec<u8>>, a: usize, end: usize| {
+        if is_indexed_gram(&weights, a, end) {
+            out.push(data[a..end].to_vec());
+        }
+    };
     let mut stack: Vec<usize> = Vec::new();
     for i in 0..weights.len() {
         while let Some(&top) = stack.last() {
             if weights[top] <= weights[i] {
-                out.push(data[top..i + 2].to_vec());
+                push(&mut out, top, i + 2);
                 if weights[top] == weights[i] {
                     stack.pop();
                     break;
@@ -324,15 +401,28 @@ pub fn sparse_grams_covering_bytes(data: &[u8]) -> Vec<Vec<u8>> {
     while stack.len() > 1 {
         let top = stack.pop().unwrap();
         if let Some(&prev) = stack.last() {
-            out.push(data[prev..top + 2].to_vec());
+            push(&mut out, prev, top + 2);
         }
     }
     if let Some(&pos) = stack.last() {
-        out.push(data[pos..pos + 2].to_vec());
+        push(&mut out, pos, pos + 2);
     }
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Would `sparse_grams_all_bytes` emit the gram `data[a..end]`? Mirrors its
+/// loop exactly: length-2 grams always; longer grams need every interior
+/// weight below the start weight AND the final pair weight above all
+/// interior weights.
+fn is_indexed_gram(weights: &[u32], a: usize, end: usize) -> bool {
+    let last = end - 2; // index of the gram's final pair
+    if last == a {
+        return true;
+    }
+    let interior_max = weights[a + 1..last].iter().copied().max().unwrap_or(0);
+    interior_max < weights[a] && weights[last] > interior_max
 }
 
 /// Index-time grams for a strategy.
@@ -413,6 +503,8 @@ pub trait BlobStore {
             .map(|&(start, len)| self.get_range(name, start, len))
             .collect()
     }
+    /// Remove a blob; deleting an absent blob is not an error.
+    fn delete(&self, name: &str) -> AnyhowResult<()>;
 }
 
 #[cfg(any(test, feature = "testutil"))]
@@ -545,6 +637,14 @@ impl LocalBlobStore {
 }
 
 impl BlobStore for LocalBlobStore {
+    fn delete(&self, name: &str) -> AnyhowResult<()> {
+        match std::fs::remove_file(self.root.join(name)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()> {
         let path = self.root.join(name);
         if let Some(dir) = path.parent() {
@@ -1203,6 +1303,103 @@ mod corpus_tests {
     fn lz4_legacy_fails_loudly() {
         let err = decode_body("old.lz4", vec![0x02, 0x21, 0x4c, 0x18, 0, 0, 0, 0]).unwrap_err();
         assert!(err.to_string().contains("LEGACY"));
+    }
+
+    #[test]
+    fn parquet_named_timezone_utc_decodes() {
+        // tz="UTC" is what pyarrow/pandas/Spark write; requires chrono-tz
+        use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray};
+        use std::sync::Arc;
+        let ts =
+            TimestampMillisecondArray::from(vec![Some(1_700_000_000_123)]).with_timezone("UTC");
+        let msg = StringArray::from(vec!["NEEDLE_utc here"]);
+        let batch = RecordBatch::try_from_iter(vec![
+            ("ts", Arc::new(ts) as ArrayRef),
+            ("msg", Arc::new(msg) as ArrayRef),
+        ])
+        .unwrap();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        let text = decode_body("k.parquet", writer.into_inner().unwrap()).unwrap();
+        let re = regex::bytes::Regex::new("NEEDLE_utc").unwrap();
+        assert_eq!(grep_doc(&text, &re, MatchOptions::default()).len(), 1);
+        assert!(
+            text.windows(20).any(|w| w == b"2023-11-14T22:13:20."),
+            "RFC3339 rendering"
+        );
+    }
+
+    #[test]
+    fn avro_nan_record_does_not_poison_siblings() {
+        use apache_avro::types::Record;
+        let schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                {"name":"v","type":"double"},{"name":"msg","type":"string"}]}"#,
+        )
+        .unwrap();
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (v, msg) in [
+            (1.0f64, "before"),
+            (f64::NAN, "poison NEEDLE_nan"),
+            (2.0, "after"),
+        ] {
+            let mut record = Record::new(&schema).unwrap();
+            record.put("v", v);
+            record.put("msg", msg);
+            writer.append(record).unwrap();
+        }
+        let text = decode_body("k.avro", writer.into_inner().unwrap()).unwrap();
+        // NaN renders as null (same as the parquet projection); siblings intact
+        assert_eq!(
+            text,
+            b"{\"msg\":\"before\",\"v\":1.0}\n{\"msg\":\"poison NEEDLE_nan\",\"v\":null}\n{\"msg\":\"after\",\"v\":2.0}\n"
+        );
+    }
+
+    #[test]
+    fn lz4_empty_frames_do_not_swallow_followers() {
+        use std::io::Write;
+        let lz = |data: &[u8]| {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut leading = lz(b"");
+        leading.extend(lz(b"tail data\n"));
+        assert_eq!(decode_body("k.lz4", leading).unwrap(), b"tail data\n");
+        let mut middle = lz(b"head\n");
+        middle.extend(lz(b""));
+        middle.extend(lz(b"tail\n"));
+        assert_eq!(decode_body("k.lz4", middle).unwrap(), b"head\ntail\n");
+        // skippable frame BETWEEN data frames (legal per the frame spec)
+        let mut between = lz(b"one\n");
+        between.extend([0x50, 0x2a, 0x4d, 0x18, 2, 0, 0, 0, 0xaa, 0xbb]);
+        between.extend(lz(b"two\n"));
+        assert_eq!(decode_body("k.lz4", between).unwrap(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn sparse_covering_grams_subset_on_repeated_byte_runs() {
+        for input in [
+            b"uniq000".to_vec(),
+            b"aaa".to_vec(),
+            b"xaaay".to_vec(),
+            b"err000timeout".to_vec(),
+            b"aaaaaaaaaa".to_vec(),
+            b"ab".repeat(8),
+        ] {
+            let all: std::collections::HashSet<Vec<u8>> =
+                sparse_grams_all_bytes(&input).into_iter().collect();
+            for gram in sparse_grams_covering_bytes(&input) {
+                assert!(
+                    all.contains(&gram),
+                    "covering gram {:?} of {:?} never indexed",
+                    String::from_utf8_lossy(&gram),
+                    String::from_utf8_lossy(&input)
+                );
+            }
+        }
     }
 
     #[test]

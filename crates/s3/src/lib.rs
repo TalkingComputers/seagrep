@@ -224,6 +224,10 @@ impl BlobStore for S3BlobStore {
             .get_ranges(&self.bucket, &self.build_key(name), ranges)?
             .with_context(|| self.blob_context(name))
     }
+
+    fn delete(&self, name: &str) -> anyhow::Result<()> {
+        self.client.delete(&self.bucket, &self.build_key(name))
+    }
 }
 
 /// Corpus over a fixed S3 object list — the index BUILD side.

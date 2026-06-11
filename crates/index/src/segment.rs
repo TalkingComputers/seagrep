@@ -189,15 +189,21 @@ pub fn update_index(
     make_corpus: &CorpusFactory<'_>,
 ) -> Result<UpdateReport> {
     let mut forced = rebuild;
+    let mut replaced: Vec<SegmentMeta> = Vec::new();
     let existing = if rebuild {
         eprintln!("note: --rebuild requested; re-ingesting everything");
+        // best-effort load purely so the replaced segments can be GC'd
+        if let Ok(RootState::Loaded(list)) = load_segment_list(store) {
+            replaced = list.segments;
+        }
         Vec::new()
     } else {
         match load_segment_list(store)? {
             RootState::Loaded(list) if list.strategy == strategy => list.segments,
-            RootState::Loaded(_) => {
+            RootState::Loaded(list) => {
                 eprintln!("note: index strategy changed; rebuilding from scratch");
                 forced = true;
+                replaced = list.segments;
                 Vec::new()
             }
             RootState::Absent => {
@@ -211,6 +217,7 @@ pub fn update_index(
             }
         }
     };
+    replaced.extend(existing.iter().cloned());
 
     // Newest entry per key wins; dead ids are already gone from `live`.
     let mut tables: Vec<DocsTable> = Vec::with_capacity(existing.len());
@@ -279,7 +286,7 @@ pub fn update_index(
     let removed = newly_dead.len();
 
     // Fold new tombstones into per-segment dead sets, then drop fully-dead
-    // segments (their blobs stay as orphans for racing readers).
+    // segments (collect_garbage deletes their blobs after the root swap).
     let mut metas = existing;
     for group in newly_dead.chunk_by(|a, b| a.0 == b.0) {
         let seg_idx = group[0].0;
@@ -290,6 +297,10 @@ pub fn update_index(
         write_dead(store, &mut metas[seg_idx], &dead)?;
         dead_sets[seg_idx] = dead;
     }
+    // Snapshot AFTER the dead-set rewrites: a segment that just got a fresh
+    // dead blob and then drops out (fully dead, or merged away) must have
+    // that fresh blob GC'd too, not only its pre-run one.
+    replaced.extend(metas.iter().cloned());
     let mut keep: Vec<(SegmentMeta, Vec<u32>)> = metas
         .into_iter()
         .zip(dead_sets)
@@ -315,6 +326,7 @@ pub fn update_index(
         segments,
     };
     store.put("segments.bin", &postcard::to_allocvec(&list)?)?;
+    collect_garbage(store, &replaced, &list.segments);
     Ok(UpdateReport {
         added,
         removed,
@@ -323,6 +335,36 @@ pub fn update_index(
         compacted,
         up_to_date: false,
     })
+}
+
+fn meta_blobs(meta: &SegmentMeta) -> Vec<String> {
+    let mut blobs = vec![
+        segment_blob(&meta.seg_id, "terms.fst"),
+        segment_blob(&meta.seg_id, "postings.bin"),
+        segment_blob(&meta.seg_id, "docs.bin"),
+    ];
+    if !meta.dead_hash.is_empty() {
+        blobs.push(segment_blob(
+            &meta.seg_id,
+            &format!("dead-{}.bin", meta.dead_hash),
+        ));
+    }
+    blobs
+}
+
+/// Delete store blobs the new root no longer references: compaction victims,
+/// rebuilt-over segments, and superseded dead-sets. Best-effort — a failed
+/// delete only leaks storage, never correctness — and immediate: a reader
+/// racing the swap errors loudly on the missing blob and just reruns.
+fn collect_garbage(store: &dyn BlobStore, before: &[SegmentMeta], after: &[SegmentMeta]) {
+    let kept: std::collections::HashSet<String> = after.iter().flat_map(meta_blobs).collect();
+    for meta in before {
+        for blob in meta_blobs(meta) {
+            if !kept.contains(&blob) && store.delete(&blob).is_err() {
+                eprintln!("warning: failed to delete unreferenced index blob {blob}");
+            }
+        }
+    }
 }
 
 fn live_doc_count(live: &HashMap<&str, (usize, u32, &str)>) -> usize {
@@ -515,11 +557,11 @@ fn merge_segments(
         while let Some((gram, packed)) = fst::Streamer::next(&mut stream) {
             let (offset, count) = crate::eval::unpack_posting(packed);
             let start = usize::try_from(offset)?;
-            let end = start + usize::try_from(count)? * 4;
+            let end = start + usize::try_from(crate::posting_block_len(count, meta.doc_count))?;
             let block = postings_bytes
                 .get(start..end)
                 .context("truncated postings.bin during merge")?;
-            let ids = crate::decode_ids(block, count)?;
+            let ids = crate::decode_posting_block(block, count, meta.doc_count)?;
             let remap = &remaps[seg_idx];
             postings
                 .entry(gram.to_vec())
@@ -527,7 +569,7 @@ fn merge_segments(
                 .extend(ids.into_iter().filter_map(|id| remap[id as usize]));
         }
     }
-    let (fst_bytes, postings_buf) = crate::serialize_postings(postings)?;
+    let (fst_bytes, postings_buf) = crate::serialize_postings(postings, table.len() as u32)?;
     let (meta, _) = put_segment_blobs(store, &fst_bytes, &postings_buf, &table)?;
     Ok(meta)
 }
@@ -669,9 +711,10 @@ impl crate::IndexReader for SegmentedReader {
             }
             let postings_name = segment_blob(&segment.meta.seg_id, "postings.bin");
             let ids = candidates_with(&segment.map, segment.meta.doc_count, q, |needed| {
+                let doc_count = segment.meta.doc_count;
                 let ranges = needed
                     .iter()
-                    .map(|(&offset, &count)| (offset, u64::from(count) * 4))
+                    .map(|(&offset, &count)| (offset, crate::posting_block_len(count, doc_count)))
                     .collect::<Vec<_>>();
                 let blocks = self.store.get_ranges(&postings_name, &ranges)?;
                 anyhow::ensure!(
@@ -684,7 +727,10 @@ impl crate::IndexReader for SegmentedReader {
                     .iter()
                     .zip(blocks)
                     .map(|((&offset, &count), bytes)| {
-                        Ok((offset, crate::decode_ids(&bytes, count)?))
+                        Ok((
+                            offset,
+                            crate::decode_posting_block(&bytes, count, doc_count)?,
+                        ))
                     })
                     .collect()
             })?;

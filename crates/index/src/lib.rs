@@ -26,7 +26,7 @@ const BUILD_FETCH_CHUNK: usize = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 3;
+const INDEX_FORMAT: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -83,17 +83,141 @@ fn ids_to_keys(docs: &[(DocId, String)], ids: Vec<DocId>, key_prefix: Option<&st
         .collect()
 }
 
-pub(crate) fn decode_ids(bytes: &[u8], count: u32) -> Result<Vec<DocId>> {
-    let expected = usize::try_from(count)? * 4;
+/// Bit width of one stored doc id: just wide enough for the largest id in
+/// `0..doc_count`. A pure function of `doc_count`, so block byte lengths
+/// stay derivable BEFORE any fetch.
+fn posting_id_bits(doc_count: u32) -> u32 {
+    (32 - doc_count.saturating_sub(1).leading_zeros()).max(1)
+}
+
+/// How many ids a block physically stores: the COMPLEMENT (absent ids) when
+/// the gram is in more than half the docs, the present ids otherwise, and
+/// nothing at all when the gram is in every doc. The representation class is
+/// a pure function of `(count, doc_count)` — no flags, no sniffing.
+fn stored_id_count(count: u32, doc_count: u32) -> u64 {
+    if count == doc_count {
+        0
+    } else if u64::from(count) * 2 > u64::from(doc_count) {
+        // saturating: a corrupt count > doc_count yields 0 here and is then
+        // rejected loudly by decode_posting_block's count <= doc_count check
+        u64::from(doc_count.saturating_sub(count))
+    } else {
+        u64::from(count)
+    }
+}
+
+/// On-disk byte length of a posting block: `stored_id_count` ids bit-packed
+/// at `posting_id_bits` each, rounded up to whole bytes.
+pub(crate) fn posting_block_len(count: u32, doc_count: u32) -> u64 {
+    let bits = stored_id_count(count, doc_count) * u64::from(posting_id_bits(doc_count));
+    bits.div_ceil(8)
+}
+
+fn pack_ids(buf: &mut Vec<u8>, ids: impl Iterator<Item = DocId>, width: u32) {
+    let mut acc: u64 = 0;
+    let mut filled: u32 = 0;
+    for id in ids {
+        acc |= u64::from(id) << filled;
+        filled += width;
+        while filled >= 8 {
+            buf.push(acc as u8);
+            acc >>= 8;
+            filled -= 8;
+        }
+    }
+    if filled > 0 {
+        buf.push(acc as u8);
+    }
+}
+
+fn unpack_ids(bytes: &[u8], n: u64, width: u32) -> Vec<DocId> {
+    let mut out = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+    let mut acc: u64 = 0;
+    let mut filled: u32 = 0;
+    let mut input = bytes.iter();
+    let mask: u64 = (1u64 << width) - 1;
+    for _ in 0..n {
+        while filled < width {
+            acc |= u64::from(*input.next().expect("length validated")) << filled;
+            filled += 8;
+        }
+        out.push((acc & mask) as u32);
+        acc >>= width;
+        filled -= width;
+    }
+    out
+}
+
+fn encode_posting_block(buf: &mut Vec<u8>, ids: &[DocId], doc_count: u32) {
+    let count = ids.len() as u32;
+    if count == doc_count {
+        return;
+    }
+    let width = posting_id_bits(doc_count);
+    if u64::from(count) * 2 > u64::from(doc_count) {
+        let mut present = ids.iter().copied().peekable();
+        let absent = (0..doc_count).filter(|id| {
+            if present.peek() == Some(id) {
+                present.next();
+                false
+            } else {
+                true
+            }
+        });
+        pack_ids(buf, absent, width);
+    } else {
+        pack_ids(buf, ids.iter().copied(), width);
+    }
+}
+
+/// Inverse of `encode_posting_block`. Validates exact length, strict
+/// ascending order, and id bounds — a block that fails any of these is a
+/// corrupt index, reported loudly.
+pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> Result<Vec<DocId>> {
     anyhow::ensure!(
-        bytes.len() == expected,
+        count <= doc_count,
+        "posting count {count} exceeds doc count {doc_count}"
+    );
+    let expected = posting_block_len(count, doc_count);
+    anyhow::ensure!(
+        bytes.len() as u64 == expected,
         "posting block is {} bytes, expected {expected}",
         bytes.len()
     );
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| Ok(u32::from_le_bytes(chunk.try_into()?)))
-        .collect()
+    if count == doc_count {
+        return Ok((0..doc_count).collect());
+    }
+    let stored = unpack_ids(
+        bytes,
+        stored_id_count(count, doc_count),
+        posting_id_bits(doc_count),
+    );
+    for pair in stored.windows(2) {
+        anyhow::ensure!(
+            pair[0] < pair[1],
+            "posting block ids are not strictly ascending"
+        );
+    }
+    if let Some(&last) = stored.last() {
+        anyhow::ensure!(
+            last < doc_count,
+            "posting block references doc {last} >= doc_count {doc_count}"
+        );
+    }
+    if u64::from(count) * 2 > u64::from(doc_count) {
+        let mut absent = stored.into_iter().peekable();
+        let mut present = Vec::with_capacity(count as usize);
+        for id in 0..doc_count {
+            if absent.peek() == Some(&id) {
+                absent.next();
+            } else {
+                present.push(id);
+            }
+        }
+        Ok(present)
+    } else {
+        Ok(stored)
+    }
 }
 
 /// Shared candidates pipeline: resolve grams against the term dict (no IO),
@@ -165,26 +289,33 @@ fn build_index_bytes(
             ungrammed.len()
         );
     }
-    let (fst_bytes, postings_buf) = serialize_postings(postings)?;
+    let (fst_bytes, postings_buf) = serialize_postings(postings, doc_keys.len() as u32)?;
     ungrammed.sort_unstable();
     Ok((fst_bytes, postings_buf, ungrammed))
 }
 
-/// THE postings format: per gram, sorted deduped doc ids as u32 LE runs in
-/// postings.bin; the fst maps gram -> packed (offset, count). Shared by
-/// fresh builds and compaction merges so the format is defined once.
+/// THE postings format: per gram, a density-classed block in postings.bin
+/// (see `posting_block_len`); the fst maps gram -> packed (offset, count).
+/// Shared by fresh builds and compaction merges so the format is defined
+/// once. Dense grams cost zero bytes — the query path never fetches them
+/// (`resolve` short-circuits them to ALL) and decode reconstructs them.
 pub(crate) fn serialize_postings(
     postings: BTreeMap<Vec<u8>, Vec<DocId>>,
+    doc_count: u32,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut postings_buf: Vec<u8> = Vec::new();
     let mut builder = fst::MapBuilder::new(Vec::new())?;
     for (gram, mut ids) in postings {
         ids.sort_unstable();
         ids.dedup();
-        let offset = postings_buf.len() as u64;
-        for id in &ids {
-            postings_buf.extend_from_slice(&id.to_le_bytes());
+        // A gram whose docs all died (compaction) must be ABSENT, not empty:
+        // a zero-length block shares its offset with the next block, and the
+        // offset-keyed fetch map would clobber the neighbor's count.
+        if ids.is_empty() {
+            continue;
         }
+        let offset = postings_buf.len() as u64;
+        encode_posting_block(&mut postings_buf, &ids, doc_count);
         builder.insert(gram, eval::pack_posting(offset, ids.len())?)?;
     }
     Ok((builder.into_inner()?, postings_buf))
@@ -291,19 +422,20 @@ impl IndexReader for MmapIndexReader {
     }
 
     fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
-        let ids = candidates_with(&self.map, self.docs.len() as u32, q, |needed| {
+        let doc_count = self.docs.len() as u32;
+        let ids = candidates_with(&self.map, doc_count, q, |needed| {
             needed
                 .iter()
                 .map(|(&offset, &count)| {
                     let start = usize::try_from(offset)?;
                     let end = start
-                        .checked_add(usize::try_from(count)? * 4)
+                        .checked_add(usize::try_from(posting_block_len(count, doc_count))?)
                         .context("posting block end overflow")?;
                     let bytes = self
                         .postings
                         .get(start..end)
                         .context("truncated postings.bin")?;
-                    Ok((offset, decode_ids(bytes, count)?))
+                    Ok((offset, decode_posting_block(bytes, count, doc_count)?))
                 })
                 .collect()
         })?;
@@ -395,6 +527,57 @@ mod tests {
         build_to_dir(c, dir.path(), strategy).unwrap();
         let r = MmapIndexReader::open(dir.path()).unwrap();
         (dir, r)
+    }
+
+    #[test]
+    fn posting_blocks_round_trip_every_density_class() {
+        let cases: Vec<(Vec<u32>, u32)> = vec![
+            (vec![], 10),             // empty list
+            (vec![3], 10),            // single
+            (vec![0, 1, 2], 7),       // sparse (below half)
+            ((0..5).collect(), 10),   // exactly half: stored as ids
+            ((0..6).collect(), 10),   // just over half: complement
+            ((0..9).collect(), 10),   // doc_count - 1: complement of one
+            ((0..10).collect(), 10),  // fully dense: zero bytes
+            (vec![0], 1),             // doc_count = 1, dense
+            (vec![1, 3, 5, 7], 8),    // exactly half at even doc_count
+            (vec![0, 2, 4, 6, 7], 8), // over half
+        ];
+        for (ids, doc_count) in cases {
+            let mut buf = Vec::new();
+            encode_posting_block(&mut buf, &ids, doc_count);
+            assert_eq!(
+                buf.len() as u64,
+                posting_block_len(ids.len() as u32, doc_count),
+                "len mismatch for {ids:?}/{doc_count}"
+            );
+            let decoded = decode_posting_block(&buf, ids.len() as u32, doc_count).unwrap();
+            assert_eq!(decoded, ids, "round trip failed for doc_count {doc_count}");
+        }
+        // dense stores nothing
+        let mut buf = Vec::new();
+        encode_posting_block(&mut buf, &(0..10).collect::<Vec<_>>(), 10);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn posting_block_decode_rejects_corruption() {
+        // wrong length
+        assert!(decode_posting_block(&[0, 0, 0, 0], 2, 10).is_err());
+        // count above doc_count
+        assert!(decode_posting_block(&[], 11, 10).is_err());
+        // out-of-bounds id (sparse class: 1 of 10 -> 4 bytes)
+        assert!(decode_posting_block(&10u32.to_le_bytes(), 1, 10).is_err());
+        // unsorted ids (2 of 10 -> stored as ids)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        assert!(decode_posting_block(&buf, 2, 10).is_err());
+        // duplicate ids are not strictly ascending
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        assert!(decode_posting_block(&buf, 2, 10).is_err());
     }
 
     #[test]

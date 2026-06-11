@@ -446,6 +446,107 @@ fn rebuild_flag_reingests_from_scratch() -> Result<()> {
 }
 
 #[test]
+fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
+    fn segment_dirs(store_dir: &Path) -> Vec<String> {
+        let segments = store_dir.join("segments");
+        if !segments.exists() {
+            return Vec::new();
+        }
+        let mut dirs: Vec<String> = std::fs::read_dir(&segments)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        dirs.sort();
+        dirs
+    }
+    fn blob_files(store_dir: &Path) -> usize {
+        walkdir(&store_dir.join("segments"))
+    }
+    fn walkdir(p: &Path) -> usize {
+        if !p.exists() {
+            return 0;
+        }
+        std::fs::read_dir(p)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    walkdir(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("a", b"needle one");
+    bucket.put("b", b"needle two");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    let first_gen = segment_dirs(store_dir.path());
+    assert_eq!(first_gen.len(), 1);
+
+    // a --rebuild must REPLACE the old segment's blobs, not orphan them
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = bucket.listing();
+    update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        true,
+        &|keys| Ok(Box::new(bucket.corpus_over(keys))),
+    )?;
+    // dirs may linger empty on local fs; what matters is blob count: exactly
+    // one live segment's worth of files (terms + postings + docs)
+    assert_eq!(
+        blob_files(store_dir.path()),
+        3,
+        "rebuild must not leak old segment blobs"
+    );
+
+    // a delete creates a dead-set; the NEXT dead-set supersedes it and the
+    // old one must be GC'd (never two dead files for one segment)
+    bucket.delete("a");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    assert_eq!(blob_files(store_dir.path()), 4, "segment + one dead-set");
+    bucket.put("c", b"needle three");
+    bucket.delete("b");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    // first segment fully dead -> dropped + GC'd; only the c-segment remains
+    assert_eq!(
+        blob_files(store_dir.path()),
+        3,
+        "fully-dead segment blobs must be GC'd"
+    );
+    assert_matches_oracle(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["needle", "three"],
+        "post-gc",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
     use holys3_core::BlobStore;
 
@@ -468,6 +569,10 @@ fn transient_store_error_fails_loudly_instead_of_rebuilding() -> Result<()> {
 
         fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
             self.inner.get_range(name, start, len)
+        }
+
+        fn delete(&self, name: &str) -> Result<()> {
+            self.inner.delete(name)
         }
     }
 

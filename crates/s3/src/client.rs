@@ -824,6 +824,21 @@ impl S3Client {
         }
     }
 
+    /// Delete one object. Deleting an absent object is not an error (S3
+    /// DELETE returns 204 either way; a 404 here means the bucket).
+    pub fn delete(&self, bucket: &str, key: &str) -> Result<()> {
+        let req = S3Request {
+            method: "DELETE",
+            bucket,
+            key: Some(key),
+            canonical_query: "",
+            range: None,
+            body: None,
+        };
+        self.0.rt.block_on(self.send_resilient(&req, None))?;
+        Ok(())
+    }
+
     /// Upload many objects concurrently; first failure aborts the rest.
     pub fn put_many(&self, bucket: &str, objects: Vec<(String, Vec<u8>)>) -> Result<()> {
         self.0.rt.block_on(async {
