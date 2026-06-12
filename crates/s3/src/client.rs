@@ -309,7 +309,6 @@ impl S3Client {
         self.0.creds.refresher.get_or_init(|| Arc::new(refresh));
     }
 
-
     fn host(&self, bucket: &str) -> String {
         match &self.0.endpoint_host {
             Some(host) => host.clone(),

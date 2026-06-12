@@ -15,8 +15,8 @@ use holys3_index::{
     MatchSink, MmapIndexReader, SearchStats, SegmentedReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, is_index_key, list_prefix, normalize_prefix, region_from_env,
-    s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
+    build_fetch_config, build_index_namespace, is_index_key, list_prefix, normalize_prefix,
+    region_from_env, s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scope::Scope;
 use std::io::IsTerminal;
