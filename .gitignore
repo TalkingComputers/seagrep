@@ -8,3 +8,6 @@ ruvector.db
 # transient xbench artifacts (keep runs/*.json reports)
 crates/xbench/runs/corpus/
 crates/xbench/runs/*-cache*/
+
+# local planning scratch, never tracked
+/docs/
