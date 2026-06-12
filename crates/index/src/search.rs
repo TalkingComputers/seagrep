@@ -4,7 +4,8 @@
 use crate::{IndexReader, SearchStats};
 use anyhow::Result;
 use holys3_core::{decode_body, grep_doc, DocFetcher, LineEvent, MatchOptions};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Key-level search scope. `prefix` is authoritative for both segment
@@ -62,7 +63,7 @@ pub trait MatchSink: Sync {
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow>;
 }
 
-/// Sentinel threaded through `fetch_each` to unwind an early stop.
+/// Sentinel error that short-circuits verification on `SinkFlow::Stop`.
 #[derive(Debug)]
 struct StopEarly;
 
@@ -122,25 +123,12 @@ pub fn search_streaming(
     let workers = std::thread::available_parallelism()?.get().min(keys.len());
 
     let bytes_fetched = AtomicUsize::new(0);
-    let stopped = AtomicBool::new(false);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let worker_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(workers * 2);
-    let rx = Mutex::new(rx);
 
-    // Workers never exit while the channel is open: on error they record it,
-    // flip `stopped`, and keep draining, so the feeder's blocking send always
-    // has a consumer (otherwise an all-workers-failed state would deadlock
-    // the feeder).
-    let record_error = |err: anyhow::Error| {
-        if let Ok(mut slot) = worker_error.lock() {
-            slot.get_or_insert(err);
-        }
-        stopped.store(true, Ordering::Relaxed);
-    };
     let wants_matches = sink.wants_matches();
     let keys_ref = &keys;
-    // `re` is cloned per worker: the meta engine's shared scratch Cache
+    // `re` is cloned per rayon split: the meta engine's shared scratch Cache
     // contends under exactly this all-threads-search workload.
     let verify = |re: &regex::bytes::Regex, idx: usize, bytes: Vec<u8>| -> Result<()> {
         let key = &keys_ref[idx];
@@ -172,60 +160,46 @@ pub fn search_streaming(
             elapsed: started.elapsed(),
         };
         if sink.on_doc(key, &doc)? == SinkFlow::Stop {
-            stopped.store(true, Ordering::Relaxed);
+            return Err(anyhow::Error::new(StopEarly));
         }
         Ok(())
     };
 
-    let feed_result = std::thread::scope(|scope| -> Result<()> {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                let re = re.clone();
-                loop {
-                    let received = match lock(&rx) {
-                        Ok(guard) => guard.recv(),
-                        Err(err) => {
-                            record_error(err);
-                            return;
-                        }
-                    };
-                    let Ok((idx, bytes)) = received else {
-                        return;
-                    };
-                    if stopped.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    // catch_unwind keeps a panicking verify (or sink) from
-                    // breaking the drain invariant — and from poisoning the rx
-                    // mutex, since the panic never crosses the recv lock.
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        verify(&re, idx, bytes)
-                    })) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => record_error(err),
-                        Err(_) => record_error(anyhow::anyhow!("a search worker panicked")),
-                    }
-                }
-            });
-        }
+    // One consumer thread drives the rayon pool over the channel. When any
+    // doc errors (Stop, sink error, panic), try_for_each short-circuits,
+    // the bridge drops `rx`, and the feeder's next blocking send fails —
+    // so the feeder can never deadlock against dead consumers.
+    let (feed_result, verify_result) = std::thread::scope(|scope| {
+        let consumer = scope.spawn(|| {
+            rx.into_iter().par_bridge().try_for_each_init(
+                || re.clone(),
+                |re, (idx, bytes)| {
+                    // map panics to errors so rayon short-circuits: queued
+                    // docs are discarded, not handed to a broken sink
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        verify(re, idx, bytes)
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
+                },
+            )
+        });
         let feed = fetcher.fetch_each(keys_ref, &mut |idx, bytes| {
-            if stopped.load(Ordering::Relaxed) {
-                return Err(anyhow::Error::new(StopEarly));
-            }
             bytes_fetched.fetch_add(bytes.len(), Ordering::Relaxed);
             tx.send((idx, bytes))
                 .map_err(|_| anyhow::anyhow!("search workers exited early"))
         });
         drop(tx);
-        feed
+        let verified = consumer
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")));
+        (feed, verified)
     });
 
-    if let Some(err) = lock(&worker_error)?.take() {
-        return Err(err);
-    }
-    match feed_result {
+    match verify_result {
+        // the sink declared completion; a racing feed error is moot
         Err(err) if err.is::<StopEarly>() => {}
-        other => other?,
+        Err(err) => return Err(err),
+        Ok(()) => feed_result?,
     }
 
     let mut hits = hits
