@@ -57,64 +57,6 @@ pub fn encode_path(path: &str) -> String {
     uri_encode(path, true)
 }
 
-/// Sign a GET (or HEAD) request with UNSIGNED-PAYLOAD.
-/// `amz_date` is YYYYMMDD'T'HHMMSS'Z' basic format; `date` is "YYYYMMDD".
-/// `canonical_path` and `canonical_query` must already be encoded (see
-/// [`encode_path`] / [`encode_query_component`]); the exact same strings must
-/// be sent on the wire. `extra_signed` are additional (lowercase-name, value)
-/// header pairs to sign (e.g. ("range", "bytes=0-9")); `host` is always signed.
-#[allow(clippy::too_many_arguments)]
-pub fn sign_get(
-    creds: &Credentials,
-    region: &str,
-    host: &str,
-    canonical_path: &str,
-    canonical_query: &str,
-    extra_signed: &[(&str, &str)],
-    amz_date: &str,
-    date: &str,
-) -> SignedHeaders {
-    sign_request(
-        "GET",
-        creds,
-        region,
-        host,
-        canonical_path,
-        canonical_query,
-        extra_signed,
-        amz_date,
-        date,
-        "UNSIGNED-PAYLOAD",
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub fn sign_get_with_payload_hash(
-    creds: &Credentials,
-    region: &str,
-    host: &str,
-    canonical_path: &str,
-    canonical_query: &str,
-    extra_signed: &[(&str, &str)],
-    amz_date: &str,
-    date: &str,
-    payload_hash: &str,
-) -> SignedHeaders {
-    sign_request(
-        "GET",
-        creds,
-        region,
-        host,
-        canonical_path,
-        canonical_query,
-        extra_signed,
-        amz_date,
-        date,
-        payload_hash,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn sign_request(
     method: &str,
@@ -382,7 +324,8 @@ mod tests {
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
             session_token: None,
         };
-        let signed = sign_get(
+        let signed = sign_request(
+            "GET",
             &creds,
             "us-east-1",
             "examplebucket.s3.amazonaws.com",
@@ -391,6 +334,7 @@ mod tests {
             &[("range", "bytes=0-9")],
             "20130524T000000Z",
             "20130524",
+            "UNSIGNED-PAYLOAD",
         );
         assert!(signed.authorization.starts_with(
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request"
@@ -411,7 +355,8 @@ mod tests {
             session_token: None,
         };
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let signed = sign_get_with_payload_hash(
+        let signed = sign_request(
+            "GET",
             &creds,
             "us-east-1",
             "examplebucket.s3.amazonaws.com",

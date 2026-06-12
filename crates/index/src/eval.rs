@@ -61,7 +61,6 @@ pub(crate) fn resolve(
 ) -> Resolved {
     match q {
         Query::All => Resolved::All,
-        Query::None => Resolved::None,
         Query::Gram(gram) => match lookup(gram) {
             Some(value) => {
                 let (offset, count) = unpack_posting(value);

@@ -32,7 +32,7 @@ The main boundary is IO. `holys3-core`, `holys3-query`, `holys3-index`, and `hol
 
 `crates/s3` is the AWS S3 boundary: list, GET, ranged GET, PUT, XML parsing, S3 blob storage, index key layout, and S3 corpus fetching. Architectural Invariant: s3 must be the only crate that performs S3 network IO.
 
-`crates/cli` owns argument parsing, env reads, stdout and stderr output, Tokio runtime entry, and composition of local or S3 pipelines. Architectural Invariant: cli must not contain index format logic or signing logic.
+`crates/cli` owns argument parsing, env reads, rg-style output rendering (stdout sinks, JSON wire format), and composition of local or S3 pipelines (the async runtime lives inside `S3Client`). Architectural Invariant: cli must not contain index format logic or signing logic.
 
 ## Cross-Cutting Concerns
 

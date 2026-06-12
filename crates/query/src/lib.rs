@@ -6,7 +6,6 @@ use holys3_core::{grams_query, Strategy};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     All,
-    None,
     And(Vec<Query>),
     Or(Vec<Query>),
     Gram(Vec<u8>),
@@ -132,7 +131,7 @@ mod tests {
             Query::And(children) | Query::Or(children) => {
                 children.iter().flat_map(grams_of).collect()
             }
-            Query::All | Query::None => Vec::new(),
+            Query::All => Vec::new(),
         }
     }
 

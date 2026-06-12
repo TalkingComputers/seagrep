@@ -59,10 +59,6 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
         concurrency: usize,
     },
-    Report {
-        #[arg(long)]
-        out: PathBuf,
-    },
     Compare {
         base: PathBuf,
         candidate: PathBuf,
@@ -160,7 +156,6 @@ fn main() -> Result<()> {
             warmup,
             concurrency,
         } => run(&scenarios, iterations, warmup, concurrency),
-        Command::Report { out } => report(&out),
         Command::Compare { base, candidate } => compare(&base, &candidate),
         Command::Render { input } => render(&input),
     }
@@ -181,7 +176,7 @@ fn upload_dir(manifest: &SeedManifest) -> Result<()> {
         corpus.docs().len() == manifest.docs.len(),
         "seed manifest mismatch"
     );
-    build_to_dir(&corpus, &local_index_dir(), Strategy::Sparse)?;
+    build_to_dir(&corpus, &local_index_dir(), Strategy::Trigram)?;
     println!("{}", local_index_dir().display());
     Ok(())
 }
@@ -231,7 +226,7 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
     let report = update_index(
         &store,
         &cache_dir,
-        Strategy::Sparse,
+        Strategy::Trigram,
         &listing,
         false,
         &|keys| {
@@ -478,17 +473,6 @@ fn percentile_ms(values: &[Duration], percentile: usize) -> f64 {
         .div_ceil(100)
         .saturating_sub(1);
     values[index.min(len - 1)].as_secs_f64() * 1000.0
-}
-
-fn report(out: &Path) -> Result<()> {
-    let summary = read_summary(&latest_run_path())?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::File::create(out)?;
-    serde_json::to_writer_pretty(file, &summary)?;
-    println!("{}", out.display());
-    Ok(())
 }
 
 fn compare(base: &Path, candidate: &Path) -> Result<()> {

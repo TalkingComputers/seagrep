@@ -19,7 +19,7 @@ bench-s3:
 	$(XBENCH) seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
 	$(XBENCH) upload --target s3
 	$(XBENCH) run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
-	$(XBENCH) report --out crates/xbench/runs/s3.json
+	cp crates/xbench/runs/latest.json crates/xbench/runs/s3.json
 	$(XBENCH) render --input crates/xbench/runs/s3.json
 
 bench-minio:
@@ -27,5 +27,5 @@ bench-minio:
 	$(MINIO_ENV) $(XBENCH) seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)
 	$(MINIO_ENV) $(XBENCH) upload --target s3
 	$(MINIO_ENV) $(XBENCH) run --scenarios $(BENCH_SCENARIOS) --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
-	$(XBENCH) report --out crates/xbench/runs/minio.json
+	cp crates/xbench/runs/latest.json crates/xbench/runs/minio.json
 	$(XBENCH) render --input crates/xbench/runs/minio.json

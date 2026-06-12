@@ -15,7 +15,7 @@ use holys3_index::{
     MatchSink, MmapIndexReader, SearchStats, SegmentedReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, list_prefix, normalize_prefix, region_from_env,
+    build_fetch_config, build_index_namespace, is_index_key, list_prefix, normalize_prefix, region_from_env,
     s3_client_from_env, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scope::Scope;
@@ -300,12 +300,11 @@ fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
 }
 
 fn list_user_objects(src: &S3Source) -> Result<Vec<ObjectMeta>> {
-    let namespace = format!("{}/", build_index_namespace(&src.prefix));
     Ok(src
         .client
         .list(&src.bucket, &list_prefix(&src.prefix))?
         .into_iter()
-        .filter(|object| !object.key.starts_with(&namespace))
+        .filter(|object| !is_index_key(&src.prefix, &object.key))
         .collect())
 }
 
