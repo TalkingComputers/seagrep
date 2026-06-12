@@ -9,10 +9,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use holys3_core::{Corpus, MatchOptions, Strategy};
+use holys3_core::{LocalBlobStore, MatchOptions, Strategy};
 use holys3_index::{
-    build_to_dir, search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher,
-    MatchSink, MmapIndexReader, SearchStats, SegmentedReader,
+    search_streaming, update_index, IndexReader, KeyScope, LocalCorpus, LocalFetcher, MatchSink,
+    SearchStats, SegmentedReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, is_index_key, list_prefix, normalize_prefix,
@@ -292,10 +292,40 @@ fn parse_concurrency(value: &str) -> std::result::Result<usize, String> {
     Ok(concurrency)
 }
 
-fn build_local(dir: &Path, out: &Path, strategy: Strategy) -> Result<()> {
-    let corpus = LocalCorpus::new(dir)?;
-    build_to_dir(&corpus, out, strategy)?;
-    eprintln!("indexed {} docs -> {}", corpus.docs().len(), out.display());
+fn build_local(dir: &Path, out: &Path, strategy: Strategy, rebuild: bool) -> Result<()> {
+    // Canonical target root: `./logs` and `logs` must produce identical
+    // index keys, or invocation spelling would churn the incremental diff.
+    let dir = std::fs::canonicalize(dir)?;
+    std::fs::create_dir_all(out)?;
+    let out_canonical = std::fs::canonicalize(out)?;
+    let corpus = LocalCorpus::new(&dir)?;
+    let mut listing = corpus.listing()?;
+    // The index itself must never be indexed (the local analogue of the S3
+    // path filtering `.holys3/`), or every run would re-ingest the last one.
+    listing.retain(|(key, _)| !Path::new(key).starts_with(&out_canonical));
+    let store = LocalBlobStore::new(out);
+    let cache_dir = local_cache_dir(out)?;
+    let report = update_index(&store, &cache_dir, strategy, &listing, rebuild, &|keys| {
+        Ok(Box::new(LocalCorpus::from_keys(keys)?))
+    })?;
+    if report.up_to_date {
+        eprintln!(
+            "index up to date: {} docs in {} segments at {}",
+            report.total_docs,
+            report.segments,
+            out.display()
+        );
+    } else {
+        eprintln!(
+            "indexed +{} -{} -> {} docs in {} segments{} at {}",
+            report.added,
+            report.removed,
+            report.total_docs,
+            report.segments,
+            if report.compacted { " (compacted)" } else { "" },
+            out.display()
+        );
+    }
     Ok(())
 }
 
@@ -379,7 +409,7 @@ fn execute_search(
     };
     let search_stats = match source {
         Source::Local(_) => {
-            let reader = MmapIndexReader::open(index)?;
+            let reader = open_local_reader(index)?;
             search_streaming(&reader, &LocalFetcher, pattern, key_scope, options, sink)?
         }
         Source::S3(src) => {
@@ -529,7 +559,7 @@ fn run() -> Result<bool> {
             connect,
         }) => {
             match open_source(parse_target(&target)?, &connect)? {
-                Source::Local(dir) => build_local(&dir, &out, strategy.into())?,
+                Source::Local(dir) => build_local(&dir, &out, strategy.into(), rebuild)?,
                 Source::S3(src) => {
                     anyhow::ensure!(
                         out == Path::new("holys3.idxdir"),
@@ -541,7 +571,7 @@ fn run() -> Result<bool> {
             Ok(true)
         }
         Some(Cmd::Stats { index }) => {
-            let reader = MmapIndexReader::open(&index)?;
+            let reader = open_local_reader(&index)?;
             let s = reader.stats();
             println!("distinct_grams={}", s.distinct_grams);
             println!("terms_fst_bytes={}", s.terms_fst_bytes);
@@ -575,6 +605,31 @@ fn build_cache_dir(endpoint: Option<&str>, bucket: &str, prefix: &str) -> Result
         holys3_core::hash_ngram(scope.as_bytes())
     ));
     Ok(path)
+}
+
+/// Cache dir for a local index, keyed on its canonicalized path. A REAL
+/// cache directory, never `<out>/segments` itself: `SegmentedReader`'s
+/// self-heal and stale-segment eviction delete cache entries, which must
+/// never be the store's own blobs.
+fn local_cache_dir(index_dir: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(index_dir).with_context(|| {
+        format!(
+            "no index at {} (run `holys3 index <TARGET> --out {0}`)",
+            index_dir.display()
+        )
+    })?;
+    let mut path = read_cache_home(std::env::var("XDG_CACHE_HOME"), std::env::var("HOME"))?;
+    path.push("holys3");
+    path.push(format!(
+        "local-{:016x}",
+        holys3_core::hash_ngram(canonical.to_string_lossy().as_bytes())
+    ));
+    Ok(path)
+}
+
+fn open_local_reader(index_dir: &Path) -> Result<SegmentedReader> {
+    let cache_dir = local_cache_dir(index_dir)?;
+    SegmentedReader::open(Box::new(LocalBlobStore::new(index_dir)), &cache_dir)
 }
 
 fn read_cache_home(

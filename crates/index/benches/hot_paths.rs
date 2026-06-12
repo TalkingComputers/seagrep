@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use holys3_core::{
     grams_index, grams_query, testutil::MemCorpus, Corpus, LocalBlobStore, Strategy,
 };
-use holys3_index::{build_to_dir, update_index, IndexReader, MmapIndexReader, SegmentedReader};
+use holys3_index::{update_index, IndexReader, SegmentedReader};
 use holys3_query::plan;
 use std::hint::black_box;
 
@@ -53,18 +53,6 @@ fn bench_plan(c: &mut Criterion) {
 
 fn bench_index_reader(c: &mut Criterion) {
     let corpus = mem_corpus();
-    let dir = tempfile::tempdir().expect("benchmark setup failed");
-    build_to_dir(&corpus, dir.path(), Strategy::Sparse).expect("benchmark setup failed");
-    let mmap_reader = MmapIndexReader::open(dir.path()).expect("benchmark setup failed");
-    let q = plan("ERROR42", mmap_reader.strategy()).expect("benchmark setup failed");
-    c.bench_function("mmap_index_reader_candidates", |b| {
-        b.iter(|| {
-            mmap_reader
-                .candidate_keys(black_box(&q), None)
-                .expect("benchmark setup failed");
-        });
-    });
-
     let store_dir = tempfile::tempdir().expect("benchmark setup failed");
     let store = LocalBlobStore::new(store_dir.path());
     let cache_dir = tempfile::tempdir().expect("benchmark setup failed");

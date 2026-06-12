@@ -57,9 +57,12 @@ fn search_pattern(c: &Corpus, pattern: &str) -> Command {
 }
 
 fn key(c: &Corpus, name: &str) -> String {
-    // LocalCorpus keys are /-separated on every platform
+    // Index keys are canonicalized at build time and /-separated on every
+    // platform
     c.dir
         .path()
+        .canonicalize()
+        .unwrap()
         .join(name)
         .display()
         .to_string()

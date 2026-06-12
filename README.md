@@ -164,6 +164,10 @@ pointer swap is a **compare-and-swap** (S3 conditional writes), so a racing
 concurrent index run fails loudly instead of corrupting anything. Large index
 blobs upload as concurrent multipart parts.
 
+Local directories use the same segmented format, written to `--out` (default
+`holys3.idxdir`) with `{size}-{mtime}` freshness etags — local runs are
+incremental too, and `--rebuild` re-ingests everything.
+
 ## Performance
 
 **Real-world S3** — 1,000 synthetic 4 KiB objects, indexed search
@@ -171,15 +175,15 @@ blobs upload as concurrent multipart parts.
 us-east-2 over the public internet (per-object RTT dominates; in-region is
 far lower). Reproduce with `make bench-s3`.
 
-| scenario | pattern | hits | candidates/total | p50 ms | seq p50 ms | speedup |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| no_match | `UNMATCHABLE_TOKEN` | 0 | 0/1000 | 0 | 0 | index fetches nothing |
-| QAll | `.*` | 1000 | 1000/1000 | 1288 | 66828 | 51.9x |
-| short_literal | `needle` | 500 | 500/1000 | 702 | 34825 | 49.6x |
-| alternation | `alpha\|beta` | 314 | 314/1000 | 467 | 22267 | 47.6x |
-| long_literal | `longliteralbenchmarktoken` | 334 | 334/1000 | 547 | 23593 | 43.1x |
-| anchored | `^ANCHOR_START` | 91 | 91/1000 | 214 | 5832 | 27.2x |
-| dot_star_gap | `(?s)needle.*alpha` | 100 | 100/1000 | 299 | 7699 | 25.7x |
+| scenario      | pattern                     | hits | candidates/total | p50 ms | seq p50 ms |               speedup |
+| ------------- | --------------------------- | ---: | ---------------: | -----: | ---------: | --------------------: |
+| no_match      | `UNMATCHABLE_TOKEN`         |    0 |           0/1000 |      0 |          0 | index fetches nothing |
+| QAll          | `.*`                        | 1000 |        1000/1000 |   1288 |      66828 |                 51.9x |
+| short_literal | `needle`                    |  500 |         500/1000 |    702 |      34825 |                 49.6x |
+| alternation   | `alpha\|beta`               |  314 |         314/1000 |    467 |      22267 |                 47.6x |
+| long_literal  | `longliteralbenchmarktoken` |  334 |         334/1000 |    547 |      23593 |                 43.1x |
+| anchored      | `^ANCHOR_START`             |   91 |          91/1000 |    214 |       5832 |                 27.2x |
+| dot_star_gap  | `(?s)needle.*alpha`         |  100 |         100/1000 |    299 |       7699 |                 25.7x |
 
 At 100K objects the same needle queries hold at ~1.5 s with exact candidate
 counts (the planted-needle suite returns precisely 1/5/100 matching objects
@@ -229,7 +233,7 @@ never sends data anywhere else.
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing index, query, S3, or
 SigV4 behavior. The differential test suites are the correctness contract:
 indexed search must exactly equal a decoded full scan, for every format, both
-gram strategies, and both readers.
+gram strategies, and every index lifecycle state.
 
 ## License
 

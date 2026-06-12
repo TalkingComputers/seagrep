@@ -12,10 +12,9 @@ pub use segment::{update_index, CorpusFactory, SegmentedReader, UpdateReport};
 
 use anyhow::{Context, Result};
 use eval::Selection;
-use holys3_core::{decode_body, grams_index, hash_ngram, Corpus, DocFetcher, DocId, Strategy};
+use holys3_core::{decode_body, grams_index, Corpus, DocFetcher, DocId, Strategy};
 use holys3_query::Query;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -54,27 +53,6 @@ fn build_chunks<'a>(ids: &'a [DocId], sizes: &'a [u64]) -> impl Iterator<Item = 
 /// return wrong results.
 const INDEX_FORMAT: u32 = 4;
 
-#[derive(Serialize, Deserialize)]
-struct Manifest {
-    format: u32,
-    build_id: String,
-    strategy: Strategy,
-    terms_fst_len: u64,
-    postings_len: u64,
-    docs: Vec<(DocId, String)>,
-}
-
-fn parse_manifest(bytes: &[u8]) -> Result<Manifest> {
-    let manifest: Manifest = postcard::from_bytes(bytes)
-        .context("index manifest unreadable; run `holys3 index` to rebuild")?;
-    anyhow::ensure!(
-        manifest.format == INDEX_FORMAT,
-        "index format {} is not the current {INDEX_FORMAT}; run `holys3 index` to rebuild",
-        manifest.format
-    );
-    Ok(manifest)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
     pub distinct_grams: u64,
@@ -99,14 +77,6 @@ pub trait IndexReader {
     /// any fetch; the engine re-applies it per key regardless.
     fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>>;
     fn stats(&self) -> IndexStats;
-}
-
-/// Map candidate local ids to keys, applying the prefix filter.
-fn ids_to_keys(docs: &[(DocId, String)], ids: Vec<DocId>, key_prefix: Option<&str>) -> Vec<String> {
-    ids.into_iter()
-        .map(|id| docs[id as usize].1.clone())
-        .filter(|key| key_prefix.is_none_or(|prefix| key.starts_with(prefix)))
-        .collect()
 }
 
 /// Bit width of one stored doc id: just wide enough for the largest id in
@@ -347,147 +317,6 @@ pub(crate) fn serialize_postings(
     Ok((builder.into_inner()?, postings_buf))
 }
 
-fn make_manifest(
-    corpus: &dyn Corpus,
-    strategy: Strategy,
-    build_id: &str,
-    fst_bytes: &[u8],
-    postings_buf: &[u8],
-) -> Result<Manifest> {
-    Ok(Manifest {
-        format: INDEX_FORMAT,
-        build_id: build_id.to_owned(),
-        strategy,
-        terms_fst_len: u64::try_from(fst_bytes.len())?,
-        postings_len: u64::try_from(postings_buf.len())?,
-        docs: corpus.docs().to_vec(),
-    })
-}
-
-/// Write terms.fst + postings.bin + manifest.bin into `dir`.
-pub fn build_to_dir(corpus: &dyn Corpus, dir: &Path, strategy: Strategy) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let (fst_bytes, postings_buf, _) = build_index_bytes(corpus, strategy)?;
-    let ids = corpus
-        .docs()
-        .iter()
-        .map(|(_, key)| (key.clone(), String::new()))
-        .collect::<Vec<_>>();
-    let manifest = make_manifest(
-        corpus,
-        strategy,
-        &compute_build_id(&ids, strategy),
-        &fst_bytes,
-        &postings_buf,
-    )?;
-    std::fs::write(dir.join("terms.fst"), &fst_bytes)?;
-    std::fs::write(dir.join("postings.bin"), &postings_buf)?;
-    std::fs::write(dir.join("manifest.bin"), postcard::to_allocvec(&manifest)?)?;
-    Ok(())
-}
-
-/// Content-addressed build id. Includes the strategy and index format so a
-/// rebuild of the same corpus with different settings can never collide with
-/// (and silently mix into) a cached build under `builds/<id>`.
-fn compute_build_id(objects: &[(String, String)], strategy: Strategy) -> String {
-    let mut objects = objects.iter().collect::<Vec<_>>();
-    objects.sort_unstable();
-    let mut bytes = format!("format={INDEX_FORMAT};strategy={strategy:?}\n").into_bytes();
-    for (key, etag) in objects {
-        bytes.extend_from_slice(key.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(etag.as_bytes());
-        bytes.push(b'\n');
-    }
-    format!("{:016x}", hash_ngram(&bytes))
-}
-
-pub struct MmapIndexReader {
-    map: fst::Map<memmap2::Mmap>,
-    postings: memmap2::Mmap,
-    docs: Vec<(DocId, String)>,
-    strategy: Strategy,
-}
-
-impl MmapIndexReader {
-    pub fn open(dir: &Path) -> Result<MmapIndexReader> {
-        let blob = |name: &str| {
-            std::fs::File::open(dir.join(name)).with_context(|| {
-                format!(
-                    "no index at {}: {name} missing (run `holys3 index <TARGET> --out {0}`)",
-                    dir.display()
-                )
-            })
-        };
-        let fst_file = blob("terms.fst")?;
-        let map = fst::Map::new(unsafe {
-            // Build dirs are immutable while readers are open.
-            memmap2::Mmap::map(&fst_file)?
-        })?;
-        let post_file = blob("postings.bin")?;
-        let postings = unsafe {
-            // Build dirs are immutable while readers are open.
-            memmap2::Mmap::map(&post_file)?
-        };
-        let manifest =
-            parse_manifest(&std::fs::read(dir.join("manifest.bin")).with_context(|| {
-                format!("no index at {}: manifest.bin missing", dir.display())
-            })?)?;
-        Ok(MmapIndexReader {
-            map,
-            postings,
-            docs: manifest.docs,
-            strategy: manifest.strategy,
-        })
-    }
-}
-
-impl MmapIndexReader {
-    /// All doc keys in this index (id order). Local-mode helper.
-    pub fn doc_keys(&self) -> impl Iterator<Item = &str> {
-        self.docs.iter().map(|(_, key)| key.as_str())
-    }
-}
-
-impl IndexReader for MmapIndexReader {
-    fn strategy(&self) -> Strategy {
-        self.strategy
-    }
-
-    fn total_docs(&self) -> usize {
-        self.docs.len()
-    }
-
-    fn candidate_keys(&self, q: &Query, key_prefix: Option<&str>) -> Result<Vec<String>> {
-        let doc_count = self.docs.len() as u32;
-        let ids = candidates_with(&self.map, doc_count, q, |needed| {
-            needed
-                .iter()
-                .map(|(&offset, &count)| {
-                    let start = usize::try_from(offset)?;
-                    let end = start
-                        .checked_add(usize::try_from(posting_block_len(count, doc_count))?)
-                        .context("posting block end overflow")?;
-                    let bytes = self
-                        .postings
-                        .get(start..end)
-                        .context("truncated postings.bin")?;
-                    Ok((offset, decode_posting_block(bytes, count, doc_count)?))
-                })
-                .collect()
-        })?;
-        Ok(ids_to_keys(&self.docs, ids, key_prefix))
-    }
-
-    fn stats(&self) -> IndexStats {
-        IndexStats {
-            distinct_grams: self.map.len() as u64,
-            terms_fst_bytes: self.map.as_fst().as_bytes().len() as u64,
-            postings_bytes: self.postings.len() as u64,
-        }
-    }
-}
-
 pub struct LocalCorpus {
     docs: Vec<(DocId, String)>,
     paths: Vec<PathBuf>,
@@ -530,6 +359,40 @@ impl LocalCorpus {
             .collect::<Result<Vec<u64>>>()?;
         Ok(LocalCorpus { docs, paths, sizes })
     }
+
+    /// Corpus over exactly `keys` (full file paths; ids = positions): the
+    /// changed subset an incremental index run fetches.
+    pub fn from_keys(keys: &[String]) -> Result<LocalCorpus> {
+        let paths: Vec<PathBuf> = keys.iter().map(PathBuf::from).collect();
+        let docs = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (i as DocId, key.clone()))
+            .collect();
+        let sizes = paths
+            .iter()
+            .map(|p| Ok(std::fs::metadata(p)?.len()))
+            .collect::<Result<Vec<u64>>>()?;
+        Ok(LocalCorpus { docs, paths, sizes })
+    }
+
+    /// (key, etag) listing of the walked files. Etags are synthesized as
+    /// `{size}-{mtime_ns}` — the standard freshness heuristic for local
+    /// files, and never NUL-prefixed, so they can't collide with tombstones.
+    pub fn listing(&self) -> Result<Vec<(String, String)>> {
+        self.docs
+            .iter()
+            .zip(&self.paths)
+            .map(|((_, key), path)| {
+                let meta = std::fs::metadata(path)?;
+                let mtime = meta
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .context("file mtime before the unix epoch")?;
+                Ok((key.clone(), format!("{}-{}", meta.len(), mtime.as_nanos())))
+            })
+            .collect()
+    }
 }
 
 impl Corpus for LocalCorpus {
@@ -566,13 +429,52 @@ impl DocFetcher for LocalFetcher {
 mod tests {
     use super::*;
     use holys3_core::testutil::MemCorpus;
-    use holys3_core::{LineEvent, LineKind, MatchOptions, SubMatch};
+    use holys3_core::{LineEvent, LineKind, LocalBlobStore, MatchOptions, SubMatch};
 
-    fn build_tmp(c: &MemCorpus, strategy: Strategy) -> (tempfile::TempDir, MmapIndexReader) {
-        let dir = tempfile::tempdir().unwrap();
-        build_to_dir(c, dir.path(), strategy).unwrap();
-        let r = MmapIndexReader::open(dir.path()).unwrap();
-        (dir, r)
+    fn build_tmp(
+        c: &MemCorpus,
+        strategy: Strategy,
+    ) -> (tempfile::TempDir, tempfile::TempDir, SegmentedReader) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let listing: Vec<(String, String)> = c
+            .docs()
+            .iter()
+            .map(|(_, key)| (key.clone(), format!("etag-{key}")))
+            .collect();
+        update_index(
+            &LocalBlobStore::new(store_dir.path()),
+            cache_dir.path(),
+            strategy,
+            &listing,
+            false,
+            &|keys| {
+                let docs = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| (i as DocId, key.clone()))
+                    .collect();
+                let bodies = keys
+                    .iter()
+                    .map(|key| {
+                        let (id, _) = c
+                            .docs()
+                            .iter()
+                            .find(|(_, k)| k == key)
+                            .expect("listed key exists");
+                        c.fetch(*id)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Box::new(MemCorpus::new(docs, bodies)))
+            },
+        )
+        .unwrap();
+        let r = SegmentedReader::open(
+            Box::new(LocalBlobStore::new(store_dir.path())),
+            cache_dir.path(),
+        )
+        .unwrap();
+        (store_dir, cache_dir, r)
     }
 
     #[test]
@@ -633,7 +535,7 @@ mod tests {
             vec![b"world".to_vec(), b"word".to_vec()],
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
-            let (_d, r) = build_tmp(&c, strategy);
+            let (_s, _c, r) = build_tmp(&c, strategy);
             let cands = r
                 .candidate_keys(&holys3_query::plan("world", r.strategy()).unwrap(), None)
                 .unwrap();
@@ -646,7 +548,7 @@ mod tests {
     fn all_returns_every_doc() {
         let c = MemCorpus::new(vec![(0, "x".into())], vec![b"abcdef".to_vec()]);
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
-            let (_d, r) = build_tmp(&c, strategy);
+            let (_s, _c, r) = build_tmp(&c, strategy);
             assert_eq!(r.candidate_keys(&Query::All, None).unwrap(), vec!["x"]);
         }
     }
@@ -657,7 +559,7 @@ mod tests {
             vec![(0, "x".into()), (1, "y".into())],
             vec![b"abc world".to_vec(), b"nomatch".to_vec()],
         );
-        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let (matches, stats) = search_collect(&r, &c, "world").unwrap();
         assert_eq!(
             matches,
@@ -688,7 +590,7 @@ mod tests {
                 b"world world".to_vec(),
             ],
         );
-        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let stats = search_streaming(
             &r,
             &c,
@@ -709,7 +611,7 @@ mod tests {
             vec![(0, "logs/a".into()), (1, "other/b".into())],
             vec![b"abc world".to_vec(), b"abc world".to_vec()],
         );
-        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let scope = KeyScope {
             prefix: Some("logs/"),
             matches: None,
@@ -736,7 +638,7 @@ mod tests {
             vec![multi, b"plain needle\n".to_vec()],
         );
         for strategy in [Strategy::Trigram, Strategy::Sparse] {
-            let (_d, r) = build_tmp(&c, strategy);
+            let (_s, _c, r) = build_tmp(&c, strategy);
             let (matches, stats) = search_collect(&r, &c, "needle").unwrap();
             assert_eq!(
                 stats.hits,
@@ -763,7 +665,7 @@ mod tests {
             .map(|i| format!("needle {i}").into_bytes())
             .collect();
         let c = MemCorpus::new(docs, bodies);
-        let (_d, r) = build_tmp(&c, Strategy::Trigram);
+        let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
         let stats = search_streaming(
             &r,
             &c,

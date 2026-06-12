@@ -10,10 +10,9 @@ use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
     reports_dir, write_seed, SeedManifest,
 };
-use holys3_core::{Corpus, DocFetcher, Strategy};
+use holys3_core::{Corpus, DocFetcher, LocalBlobStore, Strategy};
 use holys3_index::{
-    build_to_dir, search_collect, update_index, IndexReader, LocalCorpus, LocalFetcher,
-    MmapIndexReader, SegmentedReader,
+    search_collect, update_index, IndexReader, LocalCorpus, LocalFetcher, SegmentedReader,
 };
 use holys3_s3::{
     build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
@@ -171,14 +170,28 @@ fn upload(target: UploadTarget) -> Result<()> {
 
 fn upload_dir(manifest: &SeedManifest) -> Result<()> {
     remove_dir(&local_index_dir())?;
+    std::fs::create_dir_all(local_index_dir())?;
     let corpus = LocalCorpus::new(&objects_dir())?;
     anyhow::ensure!(
         corpus.docs().len() == manifest.docs.len(),
         "seed manifest mismatch"
     );
-    build_to_dir(&corpus, &local_index_dir(), Strategy::Trigram)?;
+    let listing = corpus.listing()?;
+    let store = LocalBlobStore::new(local_index_dir());
+    update_index(
+        &store,
+        &dir_cache_dir(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|keys| Ok(Box::new(LocalCorpus::from_keys(keys)?)),
+    )?;
     println!("{}", local_index_dir().display());
     Ok(())
+}
+
+fn dir_cache_dir() -> PathBuf {
+    reports_dir().join("dir-cache")
 }
 
 fn upload_s3(manifest: &SeedManifest) -> Result<()> {
@@ -281,7 +294,10 @@ fn run_dir(
     warmup: usize,
     concurrency: usize,
 ) -> Result<RunSummary> {
-    let reader = MmapIndexReader::open(&local_index_dir())?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(local_index_dir())),
+        &dir_cache_dir(),
+    )?;
     let results = run_all(
         &reader,
         &LocalFetcher,

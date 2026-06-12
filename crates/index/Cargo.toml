@@ -20,7 +20,6 @@ serde.workspace = true
 postcard.workspace = true
 regex.workspace = true
 fst = "0.4.7"
-memmap2 = "0.9.10"
 rayon = "1.12.0"
 sha2.workspace = true
 
