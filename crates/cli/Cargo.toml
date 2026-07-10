@@ -36,7 +36,6 @@ time = { version = "0.3", features = ["formatting"] }
 [dev-dependencies]
 assert_cmd = "2.2.2"
 holys3-core = { path = "../core", version = "0.4.0", features = ["testutil"] }
-holys3-sigv4 = { path = "../sigv4", version = "0.4.0" }
 predicates = "3.1.4"
 tempfile = "3.27.0"
 

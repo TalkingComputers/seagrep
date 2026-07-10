@@ -211,12 +211,13 @@ laptop; in-region EC2 is far lower) — the prune ratios and hits are the
 stable part.
 
 **Continuous (CI)** — measured on every push against a pinned local MinIO
-image (`make bench-minio`). CI runs release binaries, rejects missing or >30%
-slower microbenchmarks, validates exact end-to-end hit counts, indexes 25,000
-objects, and enforces a 300 MiB peak-RSS ceiling for high-cardinality and
-256 MiB decoded workloads under both index strategies. Segment construction
-also enforces its cap on logical documents, including archive members, rather
-than only on physical source objects.
+image (`make bench-minio`). CI runs release binaries, rejects missing or
+unbaselined microbenchmarks and hybrid sort paths more than 15% slower than
+their same-run controls, validates exact end-to-end hit counts, indexes 25,000
+objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
+high-cardinality and 256 MiB decoded workloads under both index strategies.
+Segment construction also enforces its cap on logical documents, including
+archive members, rather than only on physical source objects.
 
 <!-- BENCH:START -->
 | scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |

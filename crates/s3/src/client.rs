@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn source_byte_budget_reaches_through_consumer() {
+    fn oversized_source_holds_byte_budget_through_consumer() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -1482,10 +1482,10 @@ mod tests {
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    1024 * 1024
+                    2 * 1024 * 1024
                 )
                 .unwrap();
-                stream.write_all(&vec![b'x'; 1024 * 1024]).unwrap();
+                stream.write_all(&vec![b'x'; 2 * 1024 * 1024]).unwrap();
             }
         });
         let config = FetchConfig {
@@ -1507,14 +1507,17 @@ mod tests {
         client
             .get_each(
                 "bucket",
-                vec![(0, "a".into(), 1024 * 1024), (1, "b".into(), 1024 * 1024)],
+                vec![
+                    (0, "a".into(), 2 * 1024 * 1024),
+                    (1, "b".into(), 2 * 1024 * 1024),
+                ],
                 &mut |_, bytes| {
                     consumed += 1;
                     if consumed == 1 {
                         std::thread::sleep(Duration::from_millis(50));
                         assert_eq!(accepted.load(Ordering::SeqCst), 1);
                     }
-                    assert_eq!(bytes.unwrap().len(), 1024 * 1024);
+                    assert_eq!(bytes.unwrap().len(), 2 * 1024 * 1024);
                     Ok(())
                 },
             )

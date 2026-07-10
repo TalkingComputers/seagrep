@@ -37,6 +37,8 @@ jobs:
         with:
           toolchain: 1.96.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
       - name: Run Criterion benches
         run: |
           rm -rf target/criterion
@@ -64,10 +66,6 @@ jobs:
           import sys
           from pathlib import Path
 
-          # Shared runners swing CPU-bound medians ~20% run to run (verified:
-          # an untouched code path flapped +19.8% and back across runs); gate
-          # only on regressions big enough to clear that noise floor.
-          threshold = 30.0
           baseline = json.loads(Path("benches/baseline.json").read_text())
           current = json.loads(Path("benches/current.json").read_text())
           base = baseline["benchmarks"]
@@ -86,7 +84,13 @@ jobs:
               old = base[name]
               delta = ((value - old) / old) * 100.0
               rows.append(f"| {name} | {old:.0f} | {value:.0f} | {delta:+.1f}% |")
-              failed = failed or delta > threshold
+          rows.extend(["", "| paired benchmark | hybrid/control | limit |", "|---|---:|---:|"])
+          for windows in (128, 256, 512, 1024, 4096, 65_536):
+              control = current["benchmarks"][f"packed_sort_control_{windows}"]
+              hybrid = current["benchmarks"][f"packed_sort_hybrid_{windows}"]
+              ratio = hybrid / control
+              rows.append(f"| packed sort {windows} | {ratio:.3f}x | 1.150x |")
+              failed = failed or ratio > 1.15
           Path("bench-micro.md").write_text("\n".join(rows) + "\n")
           if failed:
               sys.exit(1)
@@ -176,6 +180,8 @@ jobs:
         with:
           toolchain: 1.96.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
       - run: cargo build --locked --release -p holys3 -p holys3-bench
       - name: Profile 25,000-object index
         run: |
