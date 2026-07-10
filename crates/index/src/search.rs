@@ -164,8 +164,10 @@ fn search_batch(
         });
         let feed = fetcher.fetch_each(documents_ref, &mut |idx, bytes| {
             bytes_fetched.fetch_add(bytes.len(), Ordering::Relaxed);
+            // The channel only closes when the consumer short-circuited, so
+            // a failed send is the same sentinel: not a real fetch failure.
             tx.send((idx, bytes))
-                .map_err(|_| anyhow::anyhow!("search workers exited early"))
+                .map_err(|_| anyhow::Error::new(StopEarly))
         });
         drop(tx);
         let verified = consumer
@@ -175,7 +177,17 @@ fn search_batch(
     });
 
     let stopped = match verify_result {
-        Err(err) if err.is::<StopEarly>() => true,
+        Err(err) if err.is::<StopEarly>() => {
+            // A concurrent fetch or decode failure must still fail the
+            // search; only the send-into-closed-channel sentinel is the
+            // expected side effect of stopping early.
+            if let Err(err) = feed_result {
+                if !err.is::<StopEarly>() {
+                    return Err(err);
+                }
+            }
+            true
+        }
         Err(err) => return Err(err),
         Ok(()) => {
             feed_result?;
