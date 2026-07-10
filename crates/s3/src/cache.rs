@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const MAGIC: &[u8; 8] = b"HS3CACHE";
+const MAGIC: &[u8; 8] = b"HS3CACH2";
 const STATE_MAGIC: &[u8; 8] = b"HS3SIZE1";
-const HEADER_LEN: usize = 48;
+// magic (8) + body length (8) + blake3 checksum (32) + insertion stamp (8)
+const HEADER_LEN: usize = 56;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectCacheConfig {
@@ -113,6 +114,7 @@ impl ObjectCache {
         temp.write_all(MAGIC)?;
         temp.write_all(&u64::try_from(body.len())?.to_le_bytes())?;
         temp.write_all(blake3::hash(body).as_bytes())?;
+        temp.write_all(&insertion_stamp().to_le_bytes())?;
         temp.write_all(body)?;
         set_file_mode(temp.as_file())?;
         match std::fs::remove_file(&path) {
@@ -282,8 +284,10 @@ impl ObjectCache {
                 std::fs::remove_file(entry.path())?;
                 continue;
             }
+            // FIFO order comes from the insertion stamp recorded in the
+            // entry header; filesystem mtimes are too coarse to break ties.
             entries.push((
-                metadata.modified()?,
+                read_stamp(&entry.path())?,
                 entry.file_name(),
                 entry.path(),
                 metadata.len(),
@@ -341,6 +345,21 @@ fn read_entry(bytes: &[u8]) -> Result<()> {
         "cache entry checksum is invalid"
     );
     Ok(())
+}
+
+fn insertion_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
+fn read_stamp(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let mut header = [0u8; HEADER_LEN];
+    File::open(path)?.read_exact(&mut header)?;
+    Ok(u64::from_le_bytes(header[48..56].try_into()?))
 }
 
 #[cfg(unix)]
