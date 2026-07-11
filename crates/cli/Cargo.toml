@@ -24,7 +24,7 @@ holys3-s3 = { path = "../s3", version = "0.4.0" }
 anyhow.workspace = true
 base64 = "0.22.1"
 globset = "0.4.18"
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", features = ["no_thp"] }
 clap.workspace = true
 regex.workspace = true
 regex-syntax.workspace = true

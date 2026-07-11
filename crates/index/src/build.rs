@@ -299,6 +299,26 @@ fn build_source(
     }
 }
 
+fn build_raw_source(
+    source: &SourceObject,
+    body: Option<&DocumentBody>,
+    strategy: Strategy,
+    document_limit: Option<usize>,
+) -> Result<Option<SourceBuild>> {
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    if !is_raw_body(&source.key, body)? {
+        return Ok(None);
+    }
+    Ok(Some(build_source(
+        source,
+        body.try_clone()?,
+        strategy,
+        document_limit,
+    )?))
+}
+
 pub(crate) fn build_index_files(
     corpus: &dyn Corpus,
     strategy: Strategy,
@@ -329,25 +349,27 @@ pub(crate) fn build_index_files(
             );
             bodies[position] = Some(bytes);
         }
-        let mut raw = bodies
-            .par_iter()
-            .enumerate()
-            .map(|(offset, body)| -> Result<Option<SourceBuild>> {
-                let source = &sources[chunk_start + offset];
-                let Some(body) = body else {
-                    return Ok(None);
-                };
-                if !is_raw_body(&source.key, body)? {
-                    return Ok(None);
-                }
-                Ok(Some(build_source(
-                    source,
-                    body.try_clone()?,
-                    strategy,
-                    document_cap,
-                )?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let build_raw = |(offset, body): (usize, &Option<DocumentBody>)| {
+            build_raw_source(
+                &sources[chunk_start + offset],
+                body.as_ref(),
+                strategy,
+                document_cap,
+            )
+        };
+        let mut raw = if bodies.len() == 1 {
+            bodies
+                .iter()
+                .enumerate()
+                .map(build_raw)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            bodies
+                .par_iter()
+                .enumerate()
+                .map(build_raw)
+                .collect::<Result<Vec<_>>>()?
+        };
         let mut grammed = Vec::new();
         for offset in 0..bodies.len() {
             let source = &sources[chunk_start + offset];

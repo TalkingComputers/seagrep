@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use holys3_core::{DocId, DocumentBody, DocumentSpool};
 use reqwest::StatusCode;
+use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -164,8 +165,26 @@ impl S3Client {
             let Some(part) = part else {
                 return Ok(None);
             };
-            let bytes = part.into_bytes()?;
-            body.write_at(start, &bytes)?;
+            let part_len = part.len();
+            let mut reader = part.into_reader();
+            let mut copied = 0u64;
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                body.write_at(
+                    start
+                        .checked_add(copied)
+                        .context("source range write offset overflows u64")?,
+                    &chunk[..read],
+                )?;
+                copied = copied
+                    .checked_add(u64::try_from(read)?)
+                    .context("source range length overflows u64")?;
+            }
+            anyhow::ensure!(copied == part_len, "source range body length changed");
         }
         Ok(Some(body.finish()?))
     }

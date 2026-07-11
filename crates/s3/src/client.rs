@@ -370,6 +370,7 @@ impl S3Client {
             None => (None, None),
         };
         let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()?;
         Ok(S3Client(Arc::new(ClientInner {
