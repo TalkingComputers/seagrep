@@ -63,4 +63,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify security jobs passed
-        run: jq --exit-status 'all(.result == "success" or .result == "skipped")' <<< '${{ toJson(needs) }}'
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: jq --exit-status 'all(.result == "success" or .result == "skipped")' <<< "$NEEDS_JSON"

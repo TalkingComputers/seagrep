@@ -86,8 +86,15 @@ jobs:
               rows.append(f"| {name} | {old:.0f} | {value:.0f} | {delta:+.1f}% |")
           rows.extend(["", "| paired benchmark | hybrid/control | limit |", "|---|---:|---:|"])
           for windows in (128, 256, 512, 1024, 4096, 65_536):
-              control = current["benchmarks"][f"packed_sort_control_{windows}"]
-              hybrid = current["benchmarks"][f"packed_sort_hybrid_{windows}"]
+              control_name = f"packed_sort_control_{windows}"
+              hybrid_name = f"packed_sort_hybrid_{windows}"
+              missing = [name for name in (control_name, hybrid_name) if name not in current["benchmarks"]]
+              if missing:
+                  rows.append(f"| packed sort {windows} | missing: {', '.join(missing)} | 1.150x |")
+                  failed = True
+                  continue
+              control = current["benchmarks"][control_name]
+              hybrid = current["benchmarks"][hybrid_name]
               ratio = hybrid / control
               rows.append(f"| packed sort {windows} | {ratio:.3f}x | 1.150x |")
               failed = failed or ratio > 1.15
@@ -151,12 +158,52 @@ jobs:
           AWS_SECRET_ACCESS_KEY: minioadmin
           MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
         run: |
-          truncate -s 67108864 bench-large.log
-          printf RANGE_NEEDLE | dd of=bench-large.log bs=1 seek=33554432 conv=notrunc status=none
+          truncate -s 536870912 bench-large.log
+          printf RANGE_NEEDLE | dd of=bench-large.log bs=1 seek=268435456 conv=notrunc status=none
           docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-large.log:/bench-large.log:ro" "$MC_IMAGE" cp /bench-large.log local/holys3-bench/range/large.log
-          target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64
-          hits=$(target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 | wc -l)
-          test "$hits" -eq 1
+          /usr/bin/time -v -o bench-s3-trigram-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64
+          /usr/bin/time -v -o bench-s3-trigram-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-trigram-hits.txt
+          test "$(wc -l < bench-s3-trigram-hits.txt)" -eq 1
+          /usr/bin/time -v -o bench-s3-sparse-index.txt target/release/holys3 index s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --strategy sparse --rebuild
+          /usr/bin/time -v -o bench-s3-sparse-search.txt target/release/holys3 -l RANGE_NEEDLE s3://holys3-bench/range --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-s3-sparse-hits.txt
+          test "$(wc -l < bench-s3-sparse-hits.txt)" -eq 1
+          python3 <<'PY'
+          from pathlib import Path
+
+          limit_kib = 96 * 1024
+          for path in Path(".").glob("bench-s3-*.txt"):
+              if path.name.endswith("-hits.txt"):
+                  continue
+              lines = path.read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > limit_kib:
+                  raise SystemExit(f"{path}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+          PY
+      - name: Test high-entropy compressed source
+        env:
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          MC_HOST_local: http://minioadmin:minioadmin@127.0.0.1:9000
+        run: |
+          dd if=/dev/urandom of=bench-entropy.log bs=1048576 count=64 status=none
+          printf ENTROPY_NEEDLE | dd of=bench-entropy.log bs=1 seek=33554432 conv=notrunc status=none
+          gzip -1 -c bench-entropy.log > bench-entropy.log.gz
+          docker run --rm --network host -e MC_HOST_local -v "$PWD/bench-entropy.log.gz:/bench-entropy.log.gz:ro" "$MC_IMAGE" cp /bench-entropy.log.gz local/holys3-bench/entropy/large.log.gz
+          /usr/bin/time -v -o bench-entropy-index.txt target/release/holys3 index s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 --rebuild
+          /usr/bin/time -v -o bench-entropy-search.txt target/release/holys3 -l ENTROPY_NEEDLE s3://holys3-bench/entropy --region us-east-1 --endpoint http://127.0.0.1:9000 --concurrency 64 > bench-entropy-hits.txt
+          test "$(wc -l < bench-entropy-hits.txt)" -eq 1
+          python3 <<'PY'
+          from pathlib import Path
+
+          limit_kib = 96 * 1024
+          for name in ("bench-entropy-index.txt", "bench-entropy-search.txt"):
+              lines = Path(name).read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > limit_kib:
+                  raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+          PY
       - name: Stop MinIO
         if: always()
         run: docker rm --force holys3-minio
@@ -166,6 +213,8 @@ jobs:
           name: bench-e2e
           path: |
             bench-e2e.md
+            bench-entropy-*.txt
+            bench-s3-*.txt
             crates/xbench/runs/latest.json
           if-no-files-found: ignore
 
@@ -202,6 +251,18 @@ jobs:
           /usr/bin/time -v -o bench-scale-sparse.txt target/release/holys3 index /tmp/holys3-large-data --out /tmp/holys3-large-sparse-index --strategy sparse
           hits=$(target/release/holys3 -l needle /tmp/holys3-large-data --index /tmp/holys3-large-sparse-index | wc -l)
           test "$hits" -eq 2
+      - name: Profile 512 MiB compression expansion
+        run: |
+          mkdir -p /tmp/holys3-expansion-data
+          truncate -s 536870912 /tmp/holys3-expansion-data/expanded.log
+          printf EXPANSION_NEEDLE | dd of=/tmp/holys3-expansion-data/expanded.log bs=1 seek=268435456 conv=notrunc status=none
+          gzip /tmp/holys3-expansion-data/expanded.log
+          /usr/bin/time -v -o bench-expansion-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-index
+          /usr/bin/time -v -o bench-expansion-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-index > bench-expansion-hits.txt
+          test "$(wc -l < bench-expansion-hits.txt)" -eq 1
+          /usr/bin/time -v -o bench-expansion-sparse-index.txt target/release/holys3 index /tmp/holys3-expansion-data --out /tmp/holys3-expansion-sparse-index --strategy sparse
+          /usr/bin/time -v -o bench-expansion-sparse-search.txt target/release/holys3 -l EXPANSION_NEEDLE /tmp/holys3-expansion-data --index /tmp/holys3-expansion-sparse-index > bench-expansion-sparse-hits.txt
+          test "$(wc -l < bench-expansion-sparse-hits.txt)" -eq 1
       - name: Enforce peak memory ceilings
         run: |
           python3 <<'PY'
@@ -215,6 +276,19 @@ jobs:
               peak_kib = int(field.rsplit(":", 1)[1])
               if peak_kib > limit_kib:
                   raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {limit_kib} KiB")
+
+          expansion_limit_kib = 96 * 1024
+          for name in (
+              "bench-expansion-index.txt",
+              "bench-expansion-search.txt",
+              "bench-expansion-sparse-index.txt",
+              "bench-expansion-sparse-search.txt",
+          ):
+              lines = Path(name).read_text().splitlines()
+              field = next(line for line in lines if "Maximum resident set size" in line)
+              peak_kib = int(field.rsplit(":", 1)[1])
+              if peak_kib > expansion_limit_kib:
+                  raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {expansion_limit_kib} KiB")
 
           output = Path("bench-scale-build.txt").read_text()
           match = re.search(r"listing_ms=([0-9.]+) build_ms=([0-9.]+)", output)
@@ -236,6 +310,12 @@ jobs:
             bench-scale-large.txt
             bench-scale-sparse.txt
             bench-scale.json
+            bench-expansion-index.txt
+            bench-expansion-search.txt
+            bench-expansion-hits.txt
+            bench-expansion-sparse-index.txt
+            bench-expansion-sparse-search.txt
+            bench-expansion-sparse-hits.txt
           if-no-files-found: error
 
   benchmarks-success:
@@ -245,7 +325,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify benchmark jobs passed
-        run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: jq --exit-status 'all(.result == "success")' <<< "$NEEDS_JSON"
 
   pr-comment:
     if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository

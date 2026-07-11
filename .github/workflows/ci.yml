@@ -53,6 +53,11 @@ jobs:
       # so the full workspace test run is safe without cloud credentials.
       - name: Run tests
         run: cargo nextest run --locked --workspace --all-features --profile ci
+      - name: Test bounded file descriptor usage
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == '1.96.1'
+        run: |
+          ulimit -n 96
+          cargo test --locked -p holys3-index tests::posting_run_merge_bounds_open_files -- --exact
       - name: Run doc tests
         run: cargo test --locked --workspace --all-features --doc
 
@@ -177,7 +182,8 @@ jobs:
         with:
           toolchain: 1.96.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo package --locked --workspace
+      - name: Package workspace from a clean registry
+        run: CARGO_TARGET_DIR="$(mktemp -d)" cargo package --locked --workspace
 
   semver:
     name: semver
@@ -201,13 +207,14 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2
         with:
-          tool: typos-cli
+          tool: typos-cli,zizmor
           fallback: none
       - name: Run actionlint
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
       - run: typos
+      - run: zizmor --offline .
 
   coverage:
     name: coverage
@@ -227,7 +234,7 @@ jobs:
           tool: cargo-llvm-cov
           fallback: none
       - name: Generate code coverage
-        run: cargo llvm-cov --locked --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 80
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
@@ -243,4 +250,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Verify all jobs passed
-        run: jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: jq --exit-status 'all(.result == "success")' <<< "$NEEDS_JSON"
