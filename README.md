@@ -238,9 +238,10 @@ under the same 96 MiB ceiling. Workspace line coverage is gated at 80%.
 | dot_star_gap | 100 | 100/1000 | 0.100 | 409600 | 5.413 | 12.604 | 12.604 | 22.036 |
 <!-- BENCH:END -->
 
-Microbenchmarks: `make bench-micro` (CI-gated against
-[`benches/baseline.json`](benches/baseline.json)). Refresh the baseline only
-from CI's `bench-micro` artifact so measurements stay on the same runner class.
+Microbenchmarks: `make bench-micro`. PR CI compares the base and head revisions
+on one runner and gates statistically confident regressions above 20%; the
+committed [`benches/baseline.json`](benches/baseline.json) remains the reporting
+reference. Refresh it only from CI's `bench-micro` artifact.
 
 ## Limitations
 

@@ -30,8 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          persist-credentials: false
+      - name: Checkout benchmark base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: benchmark-base
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
@@ -39,9 +46,23 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
+      - name: Clear Criterion results
+        run: rm -rf target/criterion
+      - name: Run base Criterion benches
+        if: github.event_name == 'pull_request'
+        working-directory: benchmark-base
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pull-request-base
+      - name: Keep only the named base results
+        if: github.event_name == 'pull_request'
+        run: rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
+      - name: Run Criterion benches against PR base
+        if: github.event_name == 'pull_request'
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --baseline-lenient pull-request-base
       - name: Run Criterion benches
+        if: github.event_name != 'pull_request'
         run: |
-          rm -rf target/criterion
           cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
@@ -63,9 +84,12 @@ jobs:
         run: |
           python3 <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
+          regression_limit = 0.20
+          root = Path("target/criterion")
           baseline = json.loads(Path("benches/baseline.json").read_text())
           current = json.loads(Path("benches/current.json").read_text())
           base = baseline["benchmarks"]
@@ -98,6 +122,19 @@ jobs:
               ratio = hybrid / control
               rows.append(f"| packed sort {windows} | {ratio:.3f}x | 1.150x |")
               failed = failed or ratio > 1.15
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+              changes = []
+              for path in root.rglob("change/estimates.json"):
+                  name = path.parent.parent.relative_to(root).as_posix()
+                  estimate = json.loads(path.read_text())["median"]
+                  interval = estimate["confidence_interval"]
+                  changes.append((name, interval["lower_bound"], estimate["point_estimate"], interval["upper_bound"]))
+              if not changes:
+                  raise SystemExit("Criterion produced no PR-base comparisons")
+              rows.extend(["", "| benchmark vs PR base | median delta | 95% CI | limit |", "|---|---:|---:|---:|"])
+              for name, lower, point, upper in sorted(changes):
+                  rows.append(f"| {name} | {point:+.1%} | {lower:+.1%} to {upper:+.1%} | +{regression_limit:.0%} |")
+                  failed = failed or lower > regression_limit
           Path("bench-micro.md").write_text("\n".join(rows) + "\n")
           if failed:
               sys.exit(1)
@@ -114,7 +151,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
@@ -222,7 +259,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master

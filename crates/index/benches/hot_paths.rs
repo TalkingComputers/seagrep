@@ -162,7 +162,7 @@ fn bench_index_reader(c: &mut Criterion) {
     )
     .expect("benchmark setup failed");
     let q = plan("ERROR42", store_reader.strategy()).expect("benchmark setup failed");
-    c.bench_function("local_blob_store_index_reader_candidates", |b| {
+    c.bench_function("local_blob_store_segmented_reader_candidate_docs", |b| {
         b.iter(|| {
             store_reader
                 .candidate_docs(black_box(&q), None)
