@@ -484,6 +484,20 @@ struct SearchExecution<'a> {
     stats_line: bool,
 }
 
+fn pick_candidate_prefix<'a>(
+    target_prefix: &'a str,
+    key_prefix: Option<&'a str>,
+) -> Option<&'a str> {
+    let key_prefix = key_prefix.filter(|prefix| !prefix.is_empty());
+    match key_prefix {
+        Some(prefix) if target_prefix.is_empty() || !target_prefix.starts_with(prefix) => {
+            Some(prefix)
+        }
+        _ if target_prefix.is_empty() => None,
+        _ => Some(target_prefix),
+    }
+}
+
 fn execute_search(
     source: &S3Source,
     index: &IndexStorage,
@@ -503,11 +517,8 @@ fn execute_search(
         .as_ref()
         .map(|filter| filter as &(dyn Fn(&str) -> bool + Sync));
     let target_prefix = list_prefix(&source.prefix);
-    let candidate_prefix = if target_prefix.is_empty() {
-        execution.scope.and_then(Scope::key_prefix)
-    } else {
-        Some(target_prefix.as_str())
-    };
+    let candidate_prefix =
+        pick_candidate_prefix(&target_prefix, execution.scope.and_then(Scope::key_prefix));
     let search_stats = search_with_reopen(
         || SegmentedReader::open(index.store(), index.cache(), &source_identity),
         execution.pattern,
@@ -752,6 +763,26 @@ mod tests {
 
         let path = read_cache_home(Ok("/cache".to_owned()), Err(VarError::NotPresent)).unwrap();
         assert_eq!(path, PathBuf::from("/cache"));
+    }
+
+    #[test]
+    fn picks_most_selective_candidate_prefix() {
+        assert_eq!(pick_candidate_prefix("", None), None);
+        assert_eq!(pick_candidate_prefix("", Some("")), None);
+        assert_eq!(pick_candidate_prefix("", Some("logs/")), Some("logs/"));
+        assert_eq!(pick_candidate_prefix("logs/", None), Some("logs/"));
+        assert_eq!(
+            pick_candidate_prefix("logs/", Some("logs/2026/")),
+            Some("logs/2026/")
+        );
+        assert_eq!(
+            pick_candidate_prefix("logs/app/", Some("logs/")),
+            Some("logs/app/")
+        );
+        assert_eq!(
+            pick_candidate_prefix("logs/", Some("metrics/")),
+            Some("metrics/")
+        );
     }
 
     #[test]
