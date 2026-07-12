@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Fixed
+
+- Watch mode now starts from shell background jobs that inherit ignored signal dispositions.
+
 ## [0.5.0] - 2026-07-12
 
 ### Added

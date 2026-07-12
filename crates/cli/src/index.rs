@@ -171,7 +171,7 @@ fn run_cycles(
 
 fn install_stop_channel() -> Result<Receiver<()>> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    ctrlc::try_set_handler(move || {
+    ctrlc::set_handler(move || {
         let _ = sender.try_send(());
     })
     .context("installing termination signal handler")?;
