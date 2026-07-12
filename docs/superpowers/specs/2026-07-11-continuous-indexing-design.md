@@ -110,7 +110,7 @@ holys3-bench churn --cycles CYCLES --changes CHANGES
 
 Both values are required positive integers. The command consumes the existing generated corpus and local index. For each cycle it removes exactly `CHANGES` oldest sources and writes exactly `CHANGES` deterministic JSONL log sources under date-partitioned paths, keeping source cardinality constant.
 
-Each generated record contains timestamp, level, service, request ID, and message fields. Bodies have the seed manifest's exact object size. New source names and contents derive only from the seed and sequence number.
+Each generated body is one valid JSONL record containing timestamp, level, service, request ID, and message fields. The message is deterministically padded so the record plus newline has the seed manifest's exact object size. New source names and contents derive only from the seed and sequence number.
 
 The benchmark times listing and incremental update separately, validates `added == CHANGES`, `removed == CHANGES`, constant `total_docs`, and final indexed search equivalence for a planted churn token. It writes this schema to `crates/xbench/runs/churn.json`:
 
