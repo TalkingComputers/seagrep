@@ -6,6 +6,7 @@ agentdb.rvf
 agentdb.rvf.lock
 ruvector.db
 .cursor/
+.worktrees/
 
 # transient xbench artifacts (keep runs/*.json reports)
 crates/xbench/runs/corpus/
