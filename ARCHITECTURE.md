@@ -4,7 +4,7 @@
 
 holys3 is a grep-style CLI for local files and private S3 buckets. It builds a compact gram index, uses that index only to reduce the candidate set, and runs the final regex over source bytes. The correctness model is deliberately simple: indexed search must return the same document set as scanning every document.
 
-The main boundary is IO. `holys3-core`, `holys3-query`, `holys3-index`, and `holys3-sigv4` are mostly pure format and planning code. `holys3-s3` owns AWS network calls. `holys3` wires those pieces into a user-facing CLI.
+The main boundary is IO. `holys3-core`, `holys3-query`, and `holys3-index` are mostly pure format and planning code. `holys3-s3` owns AWS network calls. `holys3` wires those pieces into a user-facing CLI.
 
 ## Entry Points
 
@@ -34,11 +34,9 @@ Index construction emits bounded sorted posting runs to temporary files and k-wa
 
 Immutable term dictionaries download into the content-addressed cache through bounded ranged reads, receive a streaming SHA-256 check, and remain memory-mapped for lookup. Owner-only verification markers bind the validated hash to file length and modification time, so warm opens avoid rehashing the dictionary while externally modified entries are revalidated and repaired. Search validates only posting ranges selected by the query, so opening an index is independent of total dictionary size.
 
-`crates/sigv4` implements AWS SigV4 canonicalization, signing, and credential loading from env or credentials files. The signer is pure and vector-tested. Architectural Invariant: sigv4 must not perform HTTP requests.
+`crates/s3` is the AWS S3 boundary: official SDK configuration and credential providers, list, conditional/full/ranged GET, PUT and multipart upload, S3 blob storage, index key layout, grouped source fetching, adaptive request limits, and the private opt-in object cache. Large ranged responses and cache entries use sealed file-backed bodies. The cache validates BLAKE3-framed entries on every read, uses lock-free healthy reads, serializes mutations across processes, recovers interrupted accounting at open, and performs bounded concurrent probes. Architectural Invariant: s3 must be the only crate that performs S3 network IO.
 
-`crates/s3` is the AWS S3 boundary: list, conditional/full/ranged GET, PUT and multipart upload, XML parsing, S3 blob storage, index key layout, grouped source fetching, adaptive request limits, and the private opt-in object cache. Large ranged responses and cache entries use sealed file-backed bodies. The cache validates BLAKE3-framed entries on every read, uses lock-free healthy reads, serializes mutations across processes, recovers interrupted accounting at open, and performs bounded concurrent probes. Architectural Invariant: s3 must be the only crate that performs S3 network IO.
-
-`crates/cli` owns argument parsing, env reads, rg-style output rendering (stdout sinks, JSON wire format), and composition of local or S3 pipelines (the async runtime lives inside `S3Client`). Architectural Invariant: cli must not contain index format logic or signing logic.
+`crates/cli` owns argument parsing, env reads, rg-style output rendering (stdout sinks, JSON wire format), and composition of local or S3 pipelines (the async runtime lives inside `S3Client`). Architectural Invariant: cli must not contain index format or AWS transport logic.
 
 ## Cross-Cutting Concerns
 
@@ -46,9 +44,9 @@ Immutable term dictionaries download into the content-addressed cache through bo
 
 The contract is `index == scan`: indexed search must return the same logical documents as recursively decoding and scanning every physical source. `differential_store` covers the format matrix and both gram strategies; `segmented` covers source/member lifecycle, 10,000-member archives, compaction, stale readers, and garbage collection.
 
-### SigV4 vector conformance
+### AWS transport
 
-SigV4 changes are gated by deterministic AWS signature-vector tests. Signing should stay concrete because it is one pure algorithm with no second implementation.
+The official AWS SDK owns credential discovery, refresh, endpoint rules, and request signing. holys3 owns operation scheduling, adaptive concurrency, retry jitter, hedging, range coalescing, and bounded body storage above that transport.
 
 ### Error handling
 

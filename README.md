@@ -7,7 +7,7 @@
 [![CI](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/holys3.svg)](https://crates.io/crates/holys3)
 [![docs.rs](https://docs.rs/holys3/badge.svg)](https://docs.rs/holys3)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94.1-blue.svg)](Cargo.toml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 </div>
@@ -38,7 +38,7 @@ Windows ship with every [GitHub release](https://github.com/TalkingComputers/hol
 
 ```sh
 cargo binstall holys3   # fetches the prebuilt binary for your platform
-cargo install holys3    # or build from source (Rust 1.88+)
+cargo install holys3    # or build from source (Rust 1.94.1+)
 ```
 
 Release archives include SHA-256 checksums and GitHub build-provenance
@@ -142,12 +142,10 @@ match the line terminator, and a literal `\n` in a pattern is an error.
 
 ### Credentials
 
-Resolved in order: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional
-`AWS_SESSION_TOKEN`) from the environment → the `AWS_PROFILE` config profile,
-including **AWS IAM Identity Center (SSO)** profiles whose cached
-`aws sso login` tokens are exchanged for role credentials and auto-refreshed
-before expiry → static profile keys. Requests are signed by holys3's own
-SigV4 implementation, tested against AWS signature vectors.
+Credentials and regions use the official AWS SDK provider chains, including
+environment variables, shared profiles, IAM Identity Center (SSO),
+`credential_process`, web identity, ECS task roles, and EC2 instance roles.
+The SDK signs requests and refreshes temporary credentials automatically.
 
 ## How it works
 
@@ -290,13 +288,13 @@ reference. Refresh it only from CI's `bench-micro` artifact.
 ## Security
 
 Use private buckets. The index lives in the same account and bucket namespace
-as the data, under `.holys3/`; holys3 talks only to your S3 endpoint and
-never sends data anywhere else.
+as the data, under `.holys3/`. holys3 contacts the configured S3 endpoint and
+the AWS credential endpoints required by the active SDK provider chain.
 
 ## Contributing
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing index, query, S3, or
-SigV4 behavior. The differential test suites are the correctness contract:
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing index, query, or S3
+behavior. The differential test suites are the correctness contract:
 indexed search must exactly equal a decoded full scan, for every format, both
 gram strategies, and every index lifecycle state.
 

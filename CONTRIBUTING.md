@@ -22,7 +22,6 @@ libraries:
 | `holys3-core`  | `crates/core`  | Shared types (corpus, doc ids, strategy) |
 | `holys3-query` | `crates/query` | Query / regex parsing                    |
 | `holys3-index` | `crates/index` | FST-backed index build + search          |
-| `holys3-sigv4` | `crates/sigv4` | AWS SigV4 request signing                |
 | `holys3-s3`    | `crates/s3`    | S3 client + blob store                   |
 
 ## Development setup
@@ -59,7 +58,7 @@ $ cargo test --workspace
 ```
 
 CI never sets `HOLYS3_TEST_BUCKET`, so these tests are skipped there — run them
-locally if you touch the `s3` or `sigv4` crates.
+locally if you touch the `s3` crate.
 
 ## The PR gauntlet
 

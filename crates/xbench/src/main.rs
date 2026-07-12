@@ -17,8 +17,7 @@ use holys3_index::{
     SegmentedReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, s3_client_from_env, S3BlobStore, S3Client, S3Corpus,
-    S3Fetcher,
+    build_fetch_config, build_index_namespace, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scenarios::{read_scenarios, Scenario};
 use serde::{Deserialize, Serialize};
@@ -572,7 +571,11 @@ fn read_s3_backend(concurrency: usize) -> Result<S3Backend> {
     let bucket = std::env::var("HOLYS3_BENCH_BUCKET")?;
     let region = std::env::var("HOLYS3_BENCH_REGION")?;
     let endpoint = read_optional_env("HOLYS3_BENCH_ENDPOINT")?;
-    let client = s3_client_from_env(&region, endpoint.clone(), build_fetch_config(concurrency))?;
+    let client = S3Client::connect(
+        Some(region.clone()),
+        endpoint.clone(),
+        build_fetch_config(concurrency),
+    )?;
     Ok(S3Backend {
         bucket,
         region,

@@ -16,8 +16,8 @@ use holys3_index::{
     MatchSink, SearchStats, SegmentedReader,
 };
 use holys3_s3::{
-    build_fetch_config, build_index_namespace, is_index_key, list_prefix, region_from_env,
-    s3_client_from_env, ObjectCacheConfig, ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
+    build_fetch_config, build_index_namespace, is_index_key, list_prefix, ObjectCacheConfig,
+    ObjectMeta, S3BlobStore, S3Client, S3Corpus, S3Fetcher,
 };
 use scope::Scope;
 use std::io::IsTerminal;
@@ -85,7 +85,7 @@ enum Cmd {
 #[allow(clippy::doc_markdown)]
 #[derive(clap::Args)]
 struct ConnectArgs {
-    /// AWS region (s3:// targets only). If omitted, AWS_REGION is required.
+    /// AWS region (s3:// targets only). Uses the AWS SDK chain when omitted.
     #[arg(long)]
     region: Option<String>,
     /// Custom S3-compatible endpoint (e.g. http://127.0.0.1:9000 for MinIO).
@@ -267,12 +267,8 @@ fn open_source(target: Target, connect: &ConnectArgs) -> Result<Source> {
             Ok(Source::Local(dir))
         }
         Target::S3 { bucket, prefix } => {
-            let region = match &connect.region {
-                Some(region) => region.clone(),
-                None => region_from_env()?,
-            };
-            let client = s3_client_from_env(
-                &region,
+            let client = S3Client::connect(
+                connect.region.clone(),
                 connect.endpoint.clone(),
                 build_fetch_config(connect.concurrency),
             )?;
