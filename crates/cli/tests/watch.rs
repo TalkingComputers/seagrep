@@ -38,12 +38,16 @@ fn watch_indexes_changes_and_stops_on_sigterm() -> Result<()> {
     let target = tempfile::tempdir()?;
     let index = tempfile::tempdir()?;
     std::fs::write(target.path().join("first.log"), "first\n")?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_holys3"))
-        .arg("index")
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            r#"trap '' INT
+exec "$1" index "$2" --out "$3" --watch --interval 1 --json"#,
+        )
+        .arg("holys3-watch-test")
+        .arg(env!("CARGO_BIN_EXE_holys3"))
         .arg(target.path())
-        .arg("--out")
         .arg(index.path())
-        .args(["--watch", "--interval", "1", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
