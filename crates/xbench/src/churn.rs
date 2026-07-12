@@ -9,7 +9,7 @@ use holys3_index::{
     SegmentedReader,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -88,6 +88,7 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
 
     let mut listing_times = Vec::with_capacity(cycles);
     let mut update_times = Vec::with_capacity(cycles);
+    let mut churn_paths = BTreeSet::new();
     let mut sequence = manifest.objects;
     let mut final_segments = None;
     for cycle in 1..=cycles {
@@ -97,9 +98,11 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
                 .context("live source queue is empty")?;
             std::fs::remove_file(&old_path)
                 .with_context(|| format!("deleting churn source {}", old_path.display()))?;
+            churn_paths.remove(&old_path);
             let new_path = build_churn_path(sequence);
             let body = build_churn_body(manifest.seed, sequence, manifest.size)?;
             write_churn_source(&new_path, &body)?;
+            churn_paths.insert(new_path.clone());
             live_paths.push_back(new_path);
             sequence = sequence.checked_add(1).context("churn sequence overflow")?;
         }
@@ -158,11 +161,29 @@ pub(crate) fn run(cycles: usize, changes: usize) -> Result<ChurnSummary> {
         MatchOptions::default(),
         &NullSink,
     )?;
-    let expected_hits = total_changes.min(manifest.objects);
+    let expected_count = total_changes.min(manifest.objects);
     anyhow::ensure!(
-        stats.hits.len() == expected_hits,
-        "CHURN_NEEDLE matched {} documents, expected {expected_hits}",
-        stats.hits.len()
+        churn_paths.len() == expected_count,
+        "tracked {} churn sources, expected {expected_count}",
+        churn_paths.len()
+    );
+    let mut expected_hits = churn_paths
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path)
+                .with_context(|| format!("canonicalizing churn source {}", path.display()))?;
+            Ok(canonical
+                .to_str()
+                .with_context(|| format!("churn source is not UTF-8: {}", canonical.display()))?
+                .replace('\\', "/"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut actual_hits = stats.hits;
+    expected_hits.sort_unstable();
+    actual_hits.sort_unstable();
+    anyhow::ensure!(
+        actual_hits == expected_hits,
+        "CHURN_NEEDLE indexed hit keys differ from live churn sources"
     );
 
     listing_times.sort_unstable();

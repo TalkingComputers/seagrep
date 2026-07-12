@@ -11,6 +11,7 @@ fn receive_event(
     receiver: &Receiver<String>,
     event_type: &str,
     minimum_cycle: u64,
+    matches: impl Fn(&Value) -> bool,
 ) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -25,6 +26,7 @@ fn receive_event(
             && event["cycle"]
                 .as_u64()
                 .is_some_and(|cycle| cycle >= minimum_cycle)
+            && matches(&event)
         {
             return Ok(event);
         }
@@ -61,18 +63,15 @@ fn watch_indexes_changes_and_stops_on_sigterm() -> Result<()> {
     });
 
     let test_result = (|| -> Result<()> {
-        let initial = receive_event(&receiver, "indexed", 1)?;
+        let initial = receive_event(&receiver, "indexed", 1, |_| true)?;
         anyhow::ensure!(
             initial["total_docs"] == 1,
             "unexpected initial event: {initial}"
         );
         std::fs::write(target.path().join("second.log"), "WATCHNEEDLE\n")?;
-        let changed = loop {
-            let event = receive_event(&receiver, "indexed", 2)?;
-            if event["added"] == 1 && event["total_docs"] == 2 {
-                break event;
-            }
-        };
+        let changed = receive_event(&receiver, "indexed", 2, |event| {
+            event["added"] == 1 && event["total_docs"] == 2
+        })?;
         let status = Command::new("kill")
             .args(["-TERM", &child.id().to_string()])
             .status()
@@ -82,6 +81,7 @@ fn watch_indexes_changes_and_stops_on_sigterm() -> Result<()> {
             &receiver,
             "stopped",
             changed["cycle"].as_u64().context("missing changed cycle")?,
+            |_| true,
         )?;
         anyhow::ensure!(
             stopped["target"].as_str() == target.path().to_str(),

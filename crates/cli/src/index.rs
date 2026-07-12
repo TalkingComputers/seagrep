@@ -59,6 +59,27 @@ pub(crate) fn run_index(
     }
 }
 
+pub(crate) fn write_start_error(
+    target: &str,
+    json: bool,
+    duration: Duration,
+    error: &anyhow::Error,
+) -> Result<()> {
+    if !json {
+        return Ok(());
+    }
+    let mut output = std::io::stdout().lock();
+    write_event(
+        &mut output,
+        &IndexEvent::Error {
+            cycle: 1,
+            target,
+            duration_ms: elapsed_ms(duration)?,
+            error: format!("{error:#}"),
+        },
+    )
+}
+
 fn run_cycles(
     config: IndexConfig<'_>,
     stop: Option<&Receiver<()>>,
@@ -73,6 +94,7 @@ fn run_cycles(
     let mut cycle = 0u64;
     let mut succeeded = false;
     loop {
+        let mut fail_fast_error = None;
         cycle = cycle.checked_add(1).context("index cycle overflow")?;
         let started = Instant::now();
         match build(config.rebuild && cycle == 1) {
@@ -113,18 +135,26 @@ fn run_cycles(
                     )?;
                 }
                 if !succeeded || !watched {
-                    return Err(error);
-                }
-                if !config.json {
+                    fail_fast_error = Some(error);
+                } else if !config.json {
                     eprintln!("cycle {cycle}: index failed: {error:#}");
                 }
             }
         }
         let Some(stop) = stop else {
-            return Ok(());
+            return match fail_fast_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         };
         if stop.try_recv().is_ok() {
+            if let Some(error) = fail_fast_error.as_ref().filter(|_| !config.json) {
+                eprintln!("cycle {cycle}: index failed: {error:#}");
+            }
             return write_stopped(config, cycle, output);
+        }
+        if let Some(error) = fail_fast_error {
+            return Err(error);
         }
         match stop.recv_timeout(config.interval.context("watch interval missing")?) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
@@ -315,6 +345,35 @@ mod tests {
         assert_eq!(events[0]["type"], "error");
         assert_eq!(events[0]["cycle"], 1);
         assert_eq!(events[0]["error"], "offline");
+    }
+
+    #[test]
+    fn first_error_with_pending_stop_emits_error_then_stopped() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut output = Vec::new();
+        let mut build = |_| {
+            sender.try_send(()).unwrap();
+            anyhow::bail!("offline")
+        };
+        run_cycles(
+            IndexConfig {
+                target: "./logs",
+                interval: Some(Duration::from_secs(60)),
+                rebuild: false,
+                json: true,
+            },
+            Some(&receiver),
+            &mut output,
+            &mut build,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_events(&output)
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["error", "stopped"]
+        );
     }
 
     #[test]

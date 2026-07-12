@@ -1002,6 +1002,7 @@ fn interrupted_root_swap_preserves_old_index_and_restart_converges() -> Result<(
         .expect("root exists");
 
     let mut new_bucket = old_bucket.clone();
+    new_bucket.delete("old.log");
     new_bucket.put("new.log", b"NEW_NEEDLE");
     let store = RejectSwapStore {
         inner: LocalBlobStore::new(store_dir.path()),

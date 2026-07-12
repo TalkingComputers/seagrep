@@ -635,15 +635,28 @@ fn run() -> Result<bool> {
                 rebuild,
                 json,
             };
-            match open_source(parse_target(&target)?, &connect)? {
-                Source::Local(dir) => index::run_index(config, |cycle_rebuild| {
-                    build_local(&dir, &out, strategy, cycle_rebuild)
-                })?,
-                Source::S3(src) => {
+            let started = std::time::Instant::now();
+            let source = match (|| -> Result<Source> {
+                let source = open_source(parse_target(&target)?, &connect)?;
+                if matches!(&source, Source::S3(_)) {
                     anyhow::ensure!(
                         out == Path::new("holys3.idxdir"),
                         "--out only applies to local targets"
                     );
+                }
+                Ok(source)
+            })() {
+                Ok(source) => source,
+                Err(error) => {
+                    index::write_start_error(&target, json, started.elapsed(), &error)?;
+                    return Err(error);
+                }
+            };
+            match source {
+                Source::Local(dir) => index::run_index(config, |cycle_rebuild| {
+                    build_local(&dir, &out, strategy, cycle_rebuild)
+                })?,
+                Source::S3(src) => {
                     index::run_index(config, |cycle_rebuild| {
                         build_s3(&src, strategy, cycle_rebuild)
                     })?;

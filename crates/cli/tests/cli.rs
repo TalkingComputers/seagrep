@@ -106,6 +106,32 @@ fn index_json_reports_update() {
     assert_eq!(event["up_to_date"], false);
 }
 
+#[test]
+fn index_json_reports_start_error() {
+    let parent = tempfile::tempdir().unwrap();
+    let target = parent.path().join("missing");
+    let output = holys3()
+        .arg("index")
+        .arg(&target)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let lines = String::from_utf8(output.stdout).unwrap();
+    let events = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let event = events.first().unwrap().as_object().unwrap();
+    assert_eq!(event.len(), 5);
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["cycle"], 1);
+    assert_eq!(event["target"], target.to_str().unwrap());
+    assert!(event["duration_ms"].as_u64().is_some());
+    assert!(event["error"].as_str().unwrap().contains("not a directory"));
+}
+
 fn search(c: &Corpus) -> Command {
     let mut cmd = holys3();
     cmd.arg("ERROR")
