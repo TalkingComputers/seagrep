@@ -53,17 +53,17 @@ jobs:
         working-directory: benchmark-base
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pull-request-base
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pull-request-base
       - name: Keep only the named base results
         if: github.event_name == 'pull_request'
         run: rm -rf target/criterion/*/new target/criterion/*/change target/criterion/*/report
       - name: Run Criterion benches against PR base
         if: github.event_name == 'pull_request'
-        run: cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --baseline-lenient pull-request-base
+        run: cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --baseline-lenient pull-request-base
       - name: Run Criterion benches
         if: github.event_name != 'pull_request'
         run: |
-          cargo bench --locked -p holys3-index --bench hot_paths -- --quick --noplot --save-baseline pr
+          cargo bench --locked -p holys3-index --bench hot_paths -- --noplot --save-baseline pr
       - name: Collect Criterion medians
         run: |
           python3 <<'PY'
@@ -407,13 +407,19 @@ jobs:
               "bench-expansion-search.txt",
               "bench-expansion-sparse-index.txt",
               "bench-expansion-sparse-search.txt",
-              "bench-archive-sparse-index.txt",
           ):
               lines = Path(name).read_text().splitlines()
               field = next(line for line in lines if "Maximum resident set size" in line)
               peak_kib = int(field.rsplit(":", 1)[1])
               if peak_kib > expansion_limit_kib:
                   raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {expansion_limit_kib} KiB")
+
+          archive_limit_kib = 112 * 1024
+          lines = Path("bench-archive-sparse-index.txt").read_text().splitlines()
+          field = next(line for line in lines if "Maximum resident set size" in line)
+          peak_kib = int(field.rsplit(":", 1)[1])
+          if peak_kib > archive_limit_kib:
+              raise SystemExit(f"bench-archive-sparse-index.txt: peak RSS {peak_kib} KiB exceeds {archive_limit_kib} KiB")
 
           output = Path("bench-scale-build.txt").read_text()
           match = re.search(r"listing_ms=([0-9.]+) build_ms=([0-9.]+)", output)
