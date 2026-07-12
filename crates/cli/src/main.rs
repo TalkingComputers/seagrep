@@ -474,8 +474,8 @@ fn build_s3(
     })
 }
 
-/// Run one search against the opened source. Scope filtering, the optional
-/// stats line, and the undated-keys note are shared across all output modes.
+/// Run one search against the snapshot index bound to the source identity.
+/// Scope filtering, stats, and undated-key notes are shared across outputs.
 #[derive(Clone, Copy)]
 struct SearchExecution<'a> {
     pattern: &'a str,

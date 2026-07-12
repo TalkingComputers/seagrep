@@ -1,5 +1,5 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-//! Index construction and local or store-backed index readers.
+//! Index construction and snapshot-backed search readers.
 
 mod build;
 mod eval;
@@ -456,7 +456,8 @@ impl Corpus for LocalCorpus {
     }
 }
 
-/// Search-side fetch for local files: the key IS the path.
+/// Direct local-source candidate fetcher retained for library tests.
+/// The product CLI reads canonical bodies from index snapshot packs instead.
 pub struct LocalFetcher {
     concurrency: usize,
 }

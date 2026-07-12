@@ -235,7 +235,8 @@ impl Corpus for S3Corpus {
     }
 }
 
-/// Fetches objects by key for search verification — no doc table at all.
+/// Direct S3-source candidate fetcher for library callers and tests.
+/// The product CLI reads canonical bodies from index snapshot packs instead.
 pub struct S3Fetcher {
     client: S3Client,
     bucket: String,
@@ -270,8 +271,8 @@ impl S3Fetcher {
 }
 
 impl DocFetcher for S3Fetcher {
-    /// Concurrent streaming fetch. Objects deleted since indexing (404) are
-    /// skipped with a warning — the index entry is stale, not the search.
+    /// Concurrent streaming fetch. Source objects deleted since indexing
+    /// are skipped with a warning.
     fn fetch_each(
         &self,
         documents: &[DocAddress],

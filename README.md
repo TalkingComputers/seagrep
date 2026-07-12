@@ -27,10 +27,10 @@ candidates; the immutable content snapshot decides matches** — results are exa
 for the indexed generation, never index-approximated. Source objects are read
 only by `holys3 index`; search still works when the source is unavailable.
 
-The tracked 25,000-object MinIO benchmark completes matching queries in
-**90-140 ms** p50 and a fully pruned no-match query in **0.005 ms**. Every
-benchmark corpus, planted hit count, candidate count, and byte count is
-deterministic and checked before timing.
+The tracked 25,000-object MinIO benchmark runs selective matching queries in
+**92-130 ms** p50, full-corpus `.*` in **161 ms** p50, and a fully pruned
+no-match query in **0.006 ms** p50. Every benchmark corpus, planted hit count,
+candidate count, and byte count is deterministic and checked before timing.
 
 ## Install
 
@@ -44,7 +44,7 @@ cargo install holys3    # or build from source (Rust 1.94.1+)
 
 Release archives include SHA-256 checksums and GitHub build-provenance
 attestations. Verify an archive with
-`gh attestation verify -R TalkingComputers/holys3 <archive>`.
+`gh attestation verify <archive> -R TalkingComputers/holys3`.
 
 ## Quickstart
 
@@ -147,8 +147,9 @@ match the line terminator, and a literal `\n` in a pattern is an error.
 
 Credentials and regions use the official AWS SDK provider chains, including
 environment variables, shared profiles, IAM Identity Center (SSO),
-`credential_process`, web identity, ECS task roles, and EC2 instance roles.
-The SDK signs requests and refreshes temporary credentials automatically.
+`credential_process`, web identity, ECS/EKS container credentials, and EC2
+instance profiles. The SDK signs requests and refreshes temporary credentials
+automatically.
 
 ## How it works
 
@@ -174,6 +175,8 @@ The SDK signs requests and refreshes temporary credentials automatically.
 `holys3 index s3://bucket/prefix` maintains content-addressed segments under
 `<prefix>/.holys3/` by default. `--index s3://other-bucket/path` moves the
 complete index to that exact namespace, so the source bucket may be read-only.
+`--strategy trigram` is the default; `--strategy sparse` selects sparse grams,
+and switching strategies rebuilds the index automatically.
 Runs are **incremental diffs**: only new or changed objects are
 fetched and indexed, deletions disappear from search immediately, an unchanged
 bucket costs one listing (~seconds), and small segments merge automatically. Posting
@@ -214,12 +217,14 @@ this explicit retention guarantee approaches eager-update cost under churn.
 measured iterations after one warmup. Reproduce with
 `make bench-minio BENCH_OBJECTS=25000 BENCH_ITERATIONS=3`.
 
-**Continuous (CI)** — measured on every push against a pinned local MinIO
-image (`make bench-minio`). CI runs release binaries, rejects missing or
-unbaselined microbenchmarks and hybrid sort paths more than 15% slower than
-their same-run controls, validates exact end-to-end hit counts, indexes 25,000
-objects, and enforces hosted-run time plus a 300 MiB peak-RSS ceiling for
-high-cardinality and 256 MiB decoded workloads under both index strategies.
+**Continuous (CI)** — the benchmark workflow runs for pull requests,
+non-README-only main pushes, a weekly schedule, and manual dispatch. S3 paths
+use pinned MinIO images. CI runs release binaries, rejects missing or unbaselined
+microbenchmarks and hybrid sort paths more than 15% slower than their same-run
+controls, validates exact end-to-end hit counts, indexes 25,000 objects in the
+local engine harness, and enforces hosted-run time plus a 300 MiB peak-RSS
+ceiling for high-cardinality and 256 MiB decoded workloads under both index
+strategies.
 The scale job also replaces 250 of 25,000 objects per cycle for 30 cycles,
 crosses the physical-repack threshold, caps update p50/p95/max at
 0.5/1.5/5 seconds, limits cumulative pack writes to 300 MiB, verifies exact

@@ -49,16 +49,16 @@ impl std::fmt::Display for StaleSource {
 
 impl std::error::Error for StaleSource {}
 
-/// A source of objects for INDEX BUILDS, which need full enumeration.
-/// Implemented by a local dir (tests) and S3 (prod).
+/// A fully enumerable source used to build an index.
+/// Implemented by the local benchmark/test adapter and the S3 product adapter.
 pub trait Corpus {
     /// All sources; a source's id is its position in this slice.
     fn sources(&self) -> &[SourceObject];
     /// Fetch the full bytes of one source by position.
     fn fetch(&self, idx: usize) -> AnyhowResult<Bytes>;
-    /// Fetch a contiguous run of docs concurrently. Result order is NOT
+    /// Fetch a contiguous run of sources concurrently. Result order is NOT
     /// guaranteed; each item carries its position. Implementations may
-    /// return fewer docs than requested when a doc vanished between
+    /// return fewer sources than requested when an object vanished between
     /// indexing and fetching. Default = sequential, fail-fast.
     fn fetch_many(&self, docs: Range<usize>) -> AnyhowResult<Vec<(usize, Bytes)>> {
         docs.map(|idx| Ok((idx, self.fetch(idx)?))).collect()
@@ -71,11 +71,10 @@ pub trait Corpus {
     }
 }
 
-/// Fetches sources by key for SEARCH verification without enumeration.
+/// Fetches canonical bodies for candidate-document verification.
 /// `consume` receives the index into `documents` plus the body, as
 /// fetches complete (order NOT guaranteed). Implementations may fetch
-/// concurrently and may skip vanished docs; the first `consume` error
-/// aborts the remaining fetches.
+/// concurrently; the first `consume` error aborts the remaining fetches.
 pub trait DocFetcher {
     fn fetch_each(
         &self,
