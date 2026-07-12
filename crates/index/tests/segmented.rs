@@ -6,8 +6,8 @@ use anyhow::Result;
 use holys3_core::{
     decode_body, decode_requested, scan_matching_docs,
     testutil::{encode, MemCorpus},
-    Corpus, DocAddress, DocFetcher, DocumentBody, LocalBlobStore, MatchOptions, SourceEncoding,
-    SourceObject, Strategy,
+    BlobStore, Corpus, DocAddress, DocFetcher, DocumentBody, LocalBlobStore, MatchOptions,
+    SourceEncoding, SourceObject, Strategy,
 };
 use holys3_index::{
     search_collect, search_streaming, update_index, IndexChanged, IndexReader, KeyScope, NullSink,
@@ -855,7 +855,6 @@ fn unreferenced_segment_blobs_are_garbage_collected() -> Result<()> {
 
 #[test]
 fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
-    use holys3_core::BlobStore;
     // Simulate writer B winning the root swap between A's load and A's swap:
     // a store wrapper that rewrites segments.bin under A's feet once.
     struct RacingStore {
@@ -939,6 +938,114 @@ fn losing_concurrent_writer_fails_loudly_and_gcs_nothing() -> Result<()> {
     // oracle does not apply here: "b" was never indexed by design)
     let segments = std::fs::read_dir(store_dir.path().join("segments"))?.count();
     assert!(segments >= 1, "winner's segment blobs must survive");
+    Ok(())
+}
+
+struct RejectSwapStore {
+    inner: LocalBlobStore,
+}
+
+impl BlobStore for RejectSwapStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(name, start, len)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        if name == "segments.bin" {
+            return Ok(false);
+        }
+        self.inner.put_if(name, bytes, expected)
+    }
+}
+
+#[test]
+fn interrupted_root_swap_preserves_old_index_and_restart_converges() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut old_bucket = Bucket::default();
+    old_bucket.put("old.log", b"OLD_NEEDLE");
+    reindex(
+        &old_bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    assert_matches_oracle(
+        &old_bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["OLD_NEEDLE", "NEW_NEEDLE"],
+        "old snapshot",
+    )?;
+    let root_before = LocalBlobStore::new(store_dir.path())
+        .get("segments.bin")?
+        .expect("root exists");
+
+    let mut new_bucket = old_bucket.clone();
+    new_bucket.delete("old.log");
+    new_bucket.put("new.log", b"NEW_NEEDLE");
+    let store = RejectSwapStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+    };
+    let listing = new_bucket.listing();
+    let error = update_index(
+        &store,
+        cache_dir.path(),
+        Strategy::Trigram,
+        &listing,
+        false,
+        &|shard| Ok(Box::new(new_bucket.corpus_over(shard))),
+    )
+    .expect_err("rejected root swap must error");
+    assert!(
+        error.to_string().contains("concurrently"),
+        "error must name the race: {error:#}"
+    );
+    let root_after = LocalBlobStore::new(store_dir.path())
+        .get("segments.bin")?
+        .expect("root exists");
+    assert_eq!(root_after, root_before);
+    assert_matches_oracle(
+        &old_bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["OLD_NEEDLE", "NEW_NEEDLE"],
+        "rejected swap",
+    )?;
+
+    reindex(
+        &new_bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Trigram,
+    )?;
+    assert_matches_oracle(
+        &new_bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        &["OLD_NEEDLE", "NEW_NEEDLE"],
+        "restart",
+    )?;
     Ok(())
 }
 
