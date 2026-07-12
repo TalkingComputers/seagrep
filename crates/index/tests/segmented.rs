@@ -3,6 +3,7 @@
 //! search identically to a full scan of that state.
 
 use anyhow::Result;
+use bytes::Bytes;
 use holys3_core::{
     decode_body, scan_matching_docs,
     testutil::{encode, MemCorpus},
@@ -101,7 +102,7 @@ impl BlobStore for RangeCountingStore {
         self.inner.get_range(name, start, len)
     }
 
-    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<Vec<u8>>> {
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> Result<Vec<Bytes>> {
         if name.starts_with("packs/") {
             self.pack_reads.set(self.pack_reads.get() + 1);
         }
@@ -791,16 +792,16 @@ fn object_missing_during_fetch_retries_with_same_etag() -> Result<()> {
             &self.sources
         }
 
-        fn fetch(&self, _idx: usize) -> Result<bytes::Bytes> {
-            Ok(bytes::Bytes::from_static(b"needle"))
+        fn fetch(&self, _idx: usize) -> Result<Bytes> {
+            Ok(Bytes::from_static(b"needle"))
         }
 
-        fn fetch_many(&self, sources: Range<usize>) -> Result<Vec<(usize, bytes::Bytes)>> {
+        fn fetch_many(&self, sources: Range<usize>) -> Result<Vec<(usize, Bytes)>> {
             if self.missing {
                 Ok(Vec::new())
             } else {
                 Ok(sources
-                    .map(|idx| (idx, bytes::Bytes::from_static(b"needle")))
+                    .map(|idx| (idx, Bytes::from_static(b"needle")))
                     .collect())
             }
         }

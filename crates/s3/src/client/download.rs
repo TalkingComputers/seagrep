@@ -392,7 +392,7 @@ impl S3Client {
         bucket: &str,
         key: &str,
         ranges: &[(u64, u64)],
-    ) -> Result<Option<Vec<Vec<u8>>>> {
+    ) -> Result<Option<Vec<Bytes>>> {
         let mut order: Vec<usize> = (0..ranges.len()).collect();
         order.sort_by_key(|&index| ranges[index]);
         let sorted: Vec<(u64, u64)> = order.iter().map(|&index| ranges[index]).collect();
@@ -431,7 +431,7 @@ impl S3Client {
         let Some(blobs) = blobs else {
             return Ok(None);
         };
-        let mut output: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
+        let mut output = vec![Bytes::new(); ranges.len()];
         for (index, &original) in order.iter().enumerate() {
             let (blob_index, start) = coalesced.placements[index];
             let len = usize::try_from(sorted[index].1)?;
@@ -446,7 +446,7 @@ impl S3Client {
                     end
                 )
             })?;
-            output[original] = slice.to_vec();
+            output[original] = blob.slice_ref(slice);
         }
         Ok(Some(output))
     }

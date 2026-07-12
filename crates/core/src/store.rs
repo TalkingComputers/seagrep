@@ -125,10 +125,10 @@ pub trait BlobStore {
     fn get_range(&self, name: &str, start: u64, len: u64) -> AnyhowResult<Vec<u8>>;
     /// Fetch many byte ranges of one blob, preserving order. Implementations
     /// may fetch concurrently. Default = sequential.
-    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> AnyhowResult<Vec<Vec<u8>>> {
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> AnyhowResult<Vec<Bytes>> {
         ranges
             .iter()
-            .map(|&(start, len)| self.get_range(name, start, len))
+            .map(|&(start, len)| self.get_range(name, start, len).map(Bytes::from))
             .collect()
     }
     /// Remove a blob; deleting an absent blob is not an error.
@@ -376,9 +376,10 @@ mod tests {
         );
         assert_eq!(store.get("missing")?, None);
         assert_eq!(store.get_range("builds/a/postings.bin", 2, 3)?, b"cde");
+        let ranges: Vec<Bytes> = store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?;
         assert_eq!(
-            store.get_ranges("builds/a/postings.bin", &[(0, 2), (4, 2)])?,
-            vec![b"ab".to_vec(), b"ef".to_vec()]
+            ranges,
+            [Bytes::from_static(b"ab"), Bytes::from_static(b"ef")]
         );
         std::fs::remove_dir_all(root)?;
         Ok(())

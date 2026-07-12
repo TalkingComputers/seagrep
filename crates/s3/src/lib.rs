@@ -6,6 +6,7 @@ mod client;
 pub mod fetch;
 
 use anyhow::Context;
+use bytes::Bytes;
 use holys3_core::{
     decode_requested_body, BlobStore, Corpus, DocAddress, DocFetcher, DocId, DocumentBody,
     SourceObject,
@@ -131,7 +132,7 @@ impl BlobStore for S3BlobStore {
             .with_context(|| self.blob_context(name))
     }
 
-    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> anyhow::Result<Vec<Vec<u8>>> {
+    fn get_ranges(&self, name: &str, ranges: &[(u64, u64)]) -> anyhow::Result<Vec<Bytes>> {
         self.client
             .get_ranges(&self.bucket, &self.build_key(name), ranges)?
             .with_context(|| self.blob_context(name))
@@ -214,7 +215,7 @@ impl Corpus for S3Corpus {
         &self.sources
     }
 
-    fn fetch(&self, idx: usize) -> anyhow::Result<bytes::Bytes> {
+    fn fetch(&self, idx: usize) -> anyhow::Result<Bytes> {
         let source = &self.sources[idx];
         self.client
             .get_if_match(&self.bucket, &source.key, &source.version)?
@@ -223,7 +224,7 @@ impl Corpus for S3Corpus {
 
     /// Concurrent batch fetch. Objects deleted since listing (404) are
     /// skipped with a warning.
-    fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, bytes::Bytes)>> {
+    fn fetch_many(&self, sources: Range<usize>) -> anyhow::Result<Vec<(usize, Bytes)>> {
         self.fetch_body_batch(sources)?
             .into_iter()
             .map(|(idx, body)| Ok((idx, body.into_bytes()?)))
@@ -445,8 +446,8 @@ mod tests {
         assert_eq!(
             first,
             [
-                (0, bytes::Bytes::from_static(b"alpha")),
-                (1, bytes::Bytes::from_static(b"beta"))
+                (0, Bytes::from_static(b"alpha")),
+                (1, Bytes::from_static(b"beta"))
             ]
         );
         let request = server.join().unwrap().to_ascii_lowercase();
