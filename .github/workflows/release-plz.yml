@@ -96,7 +96,6 @@ jobs:
         if: steps.release.outputs.releases_created == 'true'
         env:
           RELEASES: ${{ steps.release.outputs.releases }}
-        # Empty when the holys3 CLI crate was not part of this release.
         run: |
           tag="$(jq -r 'first(.[] | select(.package_name == "holys3") | .tag) // empty' <<< "$RELEASES")"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
