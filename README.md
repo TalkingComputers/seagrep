@@ -1,41 +1,80 @@
-<div align="center">
-
 # holys3
-
-**grep for S3.** Snapshot-indexed regex search over buckets.
 
 [![CI](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml/badge.svg)](https://github.com/TalkingComputers/holys3/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/holys3.svg)](https://crates.io/crates/holys3)
 [![docs.rs](https://docs.rs/holys3/badge.svg)](https://docs.rs/holys3)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94.1-blue.svg)](Cargo.toml)
-[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-</div>
+holys3 searches S3 buckets with regular expressions. It works like grep, but
+instead of scanning your objects on every query, it builds a trigram index and
+a compressed snapshot of the decoded content once, stores both in S3, and
+answers queries from those alone. A typical search over 25,000 objects returns
+in about 100 ms. The CLI follows ripgrep: same flags, same exit codes, same
+`--json` output.
+
+Dual-licensed under MIT or Apache-2.0.
 
 ```sh
-holys3 index s3://my-logs/prod                     # build the index, in-bucket, once
-holys3 'req-7f3e9a2c1b' s3://my-logs/prod          # then grep it in ~a second
+holys3 index s3://my-logs/prod                # build the index, once
+holys3 'req-7f3e9a2c1b' s3://my-logs/prod     # then grep it
 holys3 -i 'timeout' s3://my-logs -g '*.gz' -C2 --since 6h
 ```
 
-S3 has no native grep. The alternatives scan: download-everything-and-rg pays for
-every object on every query, and Athena bills per byte scanned. holys3 builds a
-compact trigram index plus compressed canonical content snapshot in S3, next to
-the data by default or in a dedicated bucket. Queries read only selective index
-ranges, then verify candidates with real Rust regexes. **The gram index narrows
-candidates; the immutable content snapshot decides matches** — results are exact
-for the indexed generation, never index-approximated. Source objects are read
-only by `holys3 index`; search still works when the source is unavailable.
+[Installation](#installation) •
+[Usage](#usage) •
+[How it works](#how-it-works) •
+[Performance](#performance) •
+[Architecture](ARCHITECTURE.md) •
+[Changelog](CHANGELOG.md)
 
-The tracked 25,000-object MinIO benchmark runs selective matching queries in
-**92-130 ms** p50, full-corpus `.*` in **161 ms** p50, and a fully pruned
-no-match query in **0.006 ms** p50. Every benchmark corpus, planted hit count,
-candidate count, and byte count is deterministic and checked before timing.
+### Why use holys3?
 
-## Install
+S3 has no grep. The usual workarounds scan: downloading everything and running
+rg pays for every object on every query, and Athena bills per byte scanned.
+holys3 pays the scan once, at index time. After that:
+
+- Queries read small index ranges plus only the snapshot bytes of candidate
+  documents. A pattern that can't match anything answers in microseconds,
+  without a single network request.
+- Results are exact. The index only narrows the candidate set; a real Rust
+  regex over snapshot bytes decides every match, so there are no index
+  approximations and no false positives.
+- Compressed objects (gzip, zstd, bzip2, xz, lz4, snappy, brotli, zlib)
+  decompress transparently, including the multi-member concatenations that
+  ALB and CloudTrail actually deliver.
+- Columnar files are greppable. Parquet, Avro, ORC and Arrow rows are
+  projected to canonical JSON lines, and ZIP/TAR members are searched as
+  individual documents.
+- Indexing is incremental. Re-runs fetch only new or changed objects,
+  deletions disappear from results immediately, and an unchanged bucket costs
+  one listing.
+- `--since 6h` scopes a search by the timestamps embedded in object keys. It
+  understands `2026/06/09` paths, hive partitions, `dt=`/`date=` prefixes,
+  and ALB/CloudTrail/CloudFront filename stamps.
+- It speaks to anything S3-compatible: AWS, MinIO, Cloudflare R2.
+- Search keeps working after the source objects are deleted, because it only
+  reads the snapshot.
+
+### Why not use holys3?
+
+- The index contains a compressed copy of your decoded content, not just
+  trigrams. Protect it with the same access controls, retention policy, and
+  encryption requirements as the source data. Use private buckets.
+- The first index build reads every object once. That is the price of never
+  scanning again.
+- No multiline mode: patterns are line-oriented exactly like rg without `-U`.
+- Continuous indexing (`--watch`) polls after each cycle. It doesn't consume
+  bucket notifications, daemonize, or install a system service.
+- The design assumes occasional index writers, not a write-heavy pipeline.
+  Concurrent `holys3 index` runs are safe, but a losing writer errors instead
+  of retrying forever.
+- S3 Express directory buckets aren't supported yet.
+- The CLI is the supported surface. The library crates are not a stable API.
+
+### Installation
 
 Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and
-Windows ship with every [GitHub release](https://github.com/TalkingComputers/holys3/releases):
+Windows ship with every
+[GitHub release](https://github.com/TalkingComputers/holys3/releases):
 
 ```sh
 cargo binstall holys3   # fetches the prebuilt binary for your platform
@@ -43,69 +82,79 @@ cargo install holys3    # or build from source (Rust 1.94.1+)
 ```
 
 Release archives include SHA-256 checksums and GitHub build-provenance
-attestations. Verify an archive with
+attestations. Verify one with
 `gh attestation verify <archive> -R TalkingComputers/holys3`.
 
-## Quickstart
+### Usage
+
+The shape is `holys3 PATTERN TARGET`, where TARGET is `s3://bucket[/prefix]`.
+Credentials come from the standard AWS SDK provider chain, so environment
+variables, shared profiles, IAM Identity Center (SSO) sessions,
+`credential_process`, and container or instance roles all work as usual, and
+temporary credentials refresh automatically.
+
+First build the index. It lives in the bucket, under `<prefix>/.holys3/` by
+default:
 
 ```sh
-# S3, with an `aws sso login` session — holys3 reads SSO profiles directly
 AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2
-AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
-AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --watch --interval 30
-
-# force physical removal of all tombstoned snapshot bytes
-AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --purge-deleted
-
-# Keep the index in a separate bucket (required when the source is read-only)
-AWS_PROFILE=my-sso holys3 index s3://my-log-bucket/prod --region us-east-2 --index s3://my-search-index/holys3/my-log-bucket/prod --index-region us-east-2
-AWS_PROFILE=my-sso holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2 --index s3://my-search-index/holys3/my-log-bucket/prod --index-region us-east-2
-
-# rg-style flags work
-holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
-holys3 -w -F 'foo(' s3://my-code-bucket -l
 ```
 
-The CLI follows ripgrep: `holys3 PATTERN TARGET`, where TARGET is
-`s3://bucket[/prefix]`. To search for a pattern named like a subcommand, use
-`-e`: `holys3 -e index s3://bucket`.
+Then search:
 
-## What's supported
+```sh
+holys3 'level":"ERROR' s3://my-log-bucket/prod --region us-east-2
+```
 
-### Object formats
+Most rg flags do what you expect. `-i`/`-S` for case, `-C` for context, `-w`
+for word boundaries, `-F` for fixed strings, `-l`, `-c`, `-m`, `-q`, and
+`--json` emits rg-compatible JSON Lines:
 
-Format detection is magic-first. Brotli and zlib have no reliable container
-magic, so only `.br`, `.zlib`, and `.zz` select those decoders, and the entire
-stream must validate. Other extensions are never trusted.
+```sh
+holys3 -i 'timeout' s3://my-logs -C2 -g '*.gz' -g '!debug/*'
+holys3 -w -F 'foo(' s3://my-code-bucket -l
+holys3 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
+```
 
-| format                           | detection                      | behavior                                                                                                                                                                                              |
-| -------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| plain text / anything            | no magic matched               | searched as-is (JSONL, CSV, syslog, …)                                                                                                                                                                |
-| gzip                             | `1f 8b 08`                     | transparent decompress, incl. multi-member concatenations (how ALB/CloudTrail/CloudFront deliver)                                                                                                     |
-| zstd                             | `28 b5 2f fd`                  | transparent decompress, incl. multi-frame and skippable frames                                                                                                                                        |
-| bzip2                            | `BZh` + level + block magic    | transparent decompress, incl. multi-stream concatenations                                                                                                                                             |
-| xz                               | `fd 37 7a 58 5a 00`            | transparent decompress, incl. multi-stream + stream padding                                                                                                                                           |
-| snappy (framing format)          | `ff 06 00 00 sNaPpY`           | transparent decompress, incl. concatenated streams                                                                                                                                                    |
-| lz4 (frame format)               | `04 22 4d 18`                  | transparent decompress, incl. concatenated frames and skippable frames                                                                                                                                |
-| Brotli                           | validated `.br` hint           | transparent strict decompression                                                                                                                                                                      |
-| zlib                             | validated `.zlib`/`.zz` hint   | transparent strict decompression                                                                                                                                                                      |
-| ZIP                              | ZIP signatures                 | every regular member is a searchable document at `object.zip!/member/path`; directories and links are skipped, while encrypted members reject the source                                             |
-| TAR                              | validated `ustar` header        | every regular member is a searchable document; nested archives/compression recurse to four layers                                                                                                    |
-| **Parquet**                      | `PAR1` head + validated footer | each row projected to one JSON line and searched as text — RFC3339 timestamps (incl. `tz="UTC"` files from pyarrow/pandas/Spark), unquoted decimals, hex binary, explicit nulls, nested structs/lists |
-| **Avro** (Object Container File) | `Obj` `01`                     | each record projected to one JSON line — null/deflate/snappy/zstd/bzip2/xz codecs, decimals rendered as decimal strings (`"123.45"`), NaN/Infinity as `null`                                          |
-| Arrow IPC file / stream / Feather | validated file or stream framing | each record batch is projected to canonical JSON Lines; continuation-marker and legacy streams are supported                                                                                         |
-| ORC                               | validated postscript + footer    | Arrow-backed rows are projected to canonical JSON Lines                                                                                                                                               |
+Exit codes are rg's: `0` match, `1` no match, `2` error. Patterns are
+line-oriented like rg: `^` and `$` anchor at every line, and a literal `\n` in
+a pattern is an error. To search for a pattern that collides with a subcommand
+name, use `-e`: `holys3 -e index s3://bucket`.
 
-Projection and decompression happen at one canonical decoder boundary, so the
-index and verifier see identical bytes. Columnar line numbers refer to rows.
-Archive member paths are normalized without filesystem extraction; unsafe
-paths fail the source, and duplicate normalized names receive `#2`, `#3`, etc.
+Searches can be scoped by key or by time:
 
-Truncated or corrupt-tailed streams **salvage**: the cleanly decoded prefix is
-searched and a warning names the object. Undecodable objects are excluded
-loudly, never silently searched incorrectly.
+```sh
+holys3 'ERROR' s3://my-logs --since 6h
+holys3 'ERROR' s3://my-logs --since 2026-06-09 --until 2026-06-10 --key-prefix prod/
+```
 
-### Search flags (ripgrep semantics)
+`--key-prefix` prunes whole index segments before any fetch, and `--key-regex`
+filters keys by pattern. `--since`/`--until` take absolute dates or relative
+`30s`/`15m`/`6h`/`2d`/`1w` values. Keys without a recognizable timestamp are
+searched anyway, with a note on stderr, so time scoping never silently hides
+data.
+
+To keep the index fresh, watch mode repeats the listing/diff/swap cycle on an
+interval, finishes the active cycle cleanly on SIGINT/SIGTERM, and with
+`--json` emits tagged `indexed`, `error`, and `stopped` lines on stdout:
+
+```sh
+holys3 index s3://my-log-bucket/prod --watch --interval 30
+```
+
+If the source bucket is read-only (or you just want the index elsewhere), put
+it in its own bucket. Pass the same `--index` location when searching;
+`--index-region` and `--index-endpoint` configure that connection separately:
+
+```sh
+holys3 index s3://my-log-bucket/prod --index s3://my-search-index/prod
+holys3 'ERROR' s3://my-log-bucket/prod --index s3://my-search-index/prod
+```
+
+For MinIO, R2, or any other S3-compatible store, point `--endpoint` at it.
+`--concurrency` (default 750) caps parallel requests.
+
+Flag summary:
 
 ```text
 -e PATTERN        multiple patterns, OR              -n / -N      line numbers on/off
@@ -119,192 +168,133 @@ loudly, never silently searched incorrectly.
 -A/-B/-C NUM      context lines with -/-- separators --stats      candidate stats to stderr
 ```
 
-Exit codes are rg's: `0` match found, `1` no match, `2` error. Patterns are
-line-oriented like rg: `^`/`$` anchor at every line, character classes never
-match the line terminator, and a literal `\n` in a pattern is an error.
+### Object formats
 
-### holys3-specific scoping
+Format detection is magic-first: extensions are not trusted, with one
+exception. Brotli and zlib have no reliable container magic, so only `.br`,
+`.zlib`, and `.zz` select those decoders, and the entire stream must validate.
 
-- `--key-prefix P` — only keys starting with `P` (prunes whole index segments
-  before any fetch)
-- `--key-regex RE` — only keys matching `RE`
-- `--since T` / `--until T` — only objects whose **key-embedded timestamp**
-  overlaps the window. `T` is `2026-06-09`, `2026-06-09T14:30[:00][Z]`, or
-  relative `30s`/`15m`/`6h`/`2d`/`1w` (ago, UTC). Recognized key shapes:
-  `2026/06/09` paths, `year=2026/month=06/day=09[/hour=14]` hive partitions,
-  `dt=`/`date=2026-06-09`, ALB/CloudTrail filename stamps (`20260609T2300Z`),
-  and CloudFront/S3-access-log dashed stamps (`2026-06-09-23[-59-59]`). Keys
-  without a recognizable timestamp are searched anyway, with a note on stderr —
-  time scoping never silently hides data.
-- `--region`, `--endpoint` (MinIO, R2, any S3-compatible store),
-  `--concurrency` (default 750)
-- `--index LOCATION` — `s3://bucket/prefix`; omitted defaults to
-  `<source-prefix>/.holys3` in the source bucket
-- `--index-region`, `--index-endpoint` — connection overrides for an S3 index
-  in a different region or service
+| format                                | how it's searched                                                                                                                                  |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| gzip, zstd, bzip2, xz, snappy, lz4    | decompressed transparently, including multi-member/multi-stream concatenations and skippable frames                                                |
+| brotli, zlib                          | decompressed via validated `.br`/`.zlib`/`.zz` extension hint                                                                                      |
+| ZIP, TAR                              | every regular member is its own document at `object.zip!/member/path`; nested archives recurse to four layers; encrypted members reject the source |
+| Parquet, Avro, Arrow IPC/Feather, ORC | each row becomes one canonical JSON line; line numbers refer to rows                                                                               |
+| everything else                       | searched as plain text (JSONL, CSV, syslog, …)                                                                                                     |
 
-### Credentials
+Projection and decompression happen at one canonical decoder boundary, so the
+index and the verifier see identical bytes. Truncated or corrupt-tailed
+streams salvage: the cleanly decoded prefix is searched and a warning names
+the object. Undecodable objects are excluded loudly, never silently searched
+incorrectly.
 
-Credentials and regions use the official AWS SDK provider chains, including
-environment variables, shared profiles, IAM Identity Center (SSO),
-`credential_process`, web identity, ECS/EKS container credentials, and EC2
-instance profiles. The SDK signs requests and refreshes temporary credentials
-automatically.
+A few deliberate rejections: raw (unframed) snappy has no magic bytes and is
+undetectable by design, so it's unsupported as an object format (it still
+decodes fine inside Avro files, where the container names the codec). lz4
+legacy frames (`lz4 -l` output) are detected and rejected loudly rather than
+decoded. Expansion is capped at 64 GiB per physical source, 100,000 archive
+members, and four nested format layers; oversized decoded output spills to
+private temporary files instead of memory.
 
-## How it works
+### How it works
 
-1. The query planner extracts gram constraints from the regex — prefix,
-   suffix, **and required inner literals** (Cox-style), so `.*ERROR.*` prunes
-   instead of scanning.
-2. The term dictionary (an FST, adaptively prefix-sharded for dense trigram
-   spaces) maps each gram to its postings offset _and_ doc count, so
-   selectivity is known before any fetch: absent grams answer instantly, only
-   the rarest grams per AND-group are fetched, and grams present in every doc
-   cost zero bytes on disk and zero fetches.
-3. Posting blocks are read with coalesced ranged GETs; candidates are pruned
-   by key scope before content is fetched.
-4. Candidate bytes come from immutable content-addressed packs. Canonical
-   decoded documents share independent 128 KiB zstd frames inside bounded
-   packs; adjacent frames merge into bounded range GETs, each frame is
-   SHA-256 verified before decompression, and oversized documents spool to
-   private temporary files. Regex verification runs on a worker pool and
-   prints unordered across objects like rg's parallel mode.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-it-works-dark.svg">
+  <img alt="How holys3 works: the index pipeline decodes objects and writes a trigram index plus content snapshot to S3; the search pipeline plans grams, fetches posting and pack ranges, and verifies with a real regex" src=".github/assets/how-it-works-light.svg">
+</picture>
 
-### The index
+1. The query planner extracts gram constraints from the regex: prefix, suffix,
+   and required inner literals (Cox-style), so `.*ERROR.*` prunes instead of
+   scanning.
+2. The term dictionary (an FST) maps each gram to its postings offset and doc
+   count, so selectivity is known before any fetch. Absent grams answer
+   instantly, and only the rarest grams per AND-group are fetched at all.
+3. Posting blocks are read with coalesced ranged GETs, and candidates are
+   pruned by key scope before any content is fetched.
+4. Candidate bytes come from immutable content-addressed packs: independent
+   128 KiB zstd frames, each SHA-256 verified before decompression. Adjacent
+   frames merge into bounded range GETs, and the final regex runs on a worker
+   pool, printing unordered across objects like rg's parallel mode.
 
-`holys3 index s3://bucket/prefix` maintains content-addressed segments under
-`<prefix>/.holys3/` by default. `--index s3://other-bucket/path` moves the
-complete index to that exact namespace, so the source bucket may be read-only.
-`--strategy trigram` is the default; `--strategy sparse` selects sparse grams,
-and switching strategies rebuilds the index automatically.
-Runs are **incremental diffs**: only new or changed objects are
-fetched and indexed, deletions disappear from search immediately, an unchanged
-bucket costs one listing (~seconds), and small segments merge automatically. Posting
-lists are density-classed and bit-packed, and grams shared by every document
-cost nothing. Index construction uses bounded sorted runs instead of a global
-in-memory postings map. Replaced segments are garbage-collected; the root
-pointer swap is a **compare-and-swap** (S3 conditional writes), so a racing
-concurrent index run fails loudly instead of corrupting anything. Large index
-blobs upload as concurrent multipart parts. Every immutable segment blob has
-its own SHA-256 length/hash contract; readers reject truncation, corruption,
-duplicate segment IDs, and malformed metadata before using it.
+The index itself is a set of immutable, content-addressed segments. Each root
+is a complete snapshot of one generation; the root pointer swap is a
+compare-and-swap via S3 conditional writes, so a racing concurrent index run
+fails loudly instead of corrupting anything. Small segments merge
+automatically, a segment is physically repacked once dead documents or bytes
+reach 25% (or on `--purge-deleted`), and replaced segments are
+garbage-collected. Every blob carries a length and SHA-256 contract, and
+readers reject truncation or corruption before using it.
 
-Each root is a complete snapshot. Segment metadata binds content-pack hashes,
-lengths, block coordinates, per-block hashes, and immutable tombstones. A
-segment is physically repacked when dead documents or decoded bytes reach 25%,
-during compaction, or when `--purge-deleted` is supplied. Fully dead segments
-are removed without rereading their packs. `--rebuild` also removes all stale
-snapshot bytes. Searches never fall back to mutable source objects.
-
-The root records the indexed S3 endpoint, bucket, and prefix. Searches may
+The root also records the indexed endpoint, bucket, and prefix. A search may
 select a narrower subtree of that source, but a broader or different source
-fails instead of returning an incomplete or out-of-scope result. `--rebuild`
-is required to repurpose an index location.
+fails rather than returning an incomplete result. `--rebuild` re-indexes from
+scratch and is required to repurpose an index location. Two gram strategies
+exist (`--strategy trigram`, the default, and `--strategy sparse`); switching
+rebuilds automatically.
 
-`--watch --interval SECONDS` repeats the same listing, diff, and atomic root
-swap without overlapping cycles; the interval starts after each attempt. A
-startup failure exits, while failures after the first successful cycle are
-reported and retried. `--rebuild` applies only to cycle 1. SIGINT, SIGTERM,
-SIGHUP, Ctrl-C, and Ctrl-Break finish any active cycle and stop cleanly.
-`--json` emits tagged `indexed`, `error`, and `stopped` JSON Lines on stdout;
-lower-layer notes and warnings remain on stderr.
-With `--purge-deleted`, every watch cycle physically repacks touched segments;
-this explicit retention guarantee approaches eager-update cost under churn.
+[ARCHITECTURE.md](ARCHITECTURE.md) covers the crate boundaries, segment
+format, and memory bounds in detail.
 
-## Performance
+### Performance
 
-**MinIO snapshot path** — 25,000 synthetic 4 KiB objects, release build, three
-measured iterations after one warmup. Reproduce with
+Numbers from the tracked benchmark: 25,000 synthetic 4 KiB objects on MinIO,
+release build, three measured iterations after one warmup. Every corpus,
+planted hit count, candidate count, and byte count is deterministic and
+checked before timing. Reproduce with
 `make bench-minio BENCH_OBJECTS=25000 BENCH_ITERATIONS=3`.
 
-**Continuous (CI)** — the benchmark workflow runs for pull requests,
-non-README-only main pushes, a weekly schedule, and manual dispatch. S3 paths
-use pinned MinIO images. CI runs release binaries, rejects missing or unbaselined
-microbenchmarks and hybrid sort paths more than 15% slower than their same-run
-controls, validates exact end-to-end hit counts, indexes 25,000 objects in the
-local engine harness, and enforces hosted-run time plus a 300 MiB peak-RSS
-ceiling for high-cardinality and 256 MiB decoded workloads under both index
-strategies.
-The scale job also replaces 250 of 25,000 objects per cycle for 30 cycles,
-crosses the physical-repack threshold, caps update p50/p95/max at
-0.5/1.5/5 seconds, limits cumulative pack writes to 300 MiB, verifies exact
-additions/deletions, and caps churn peak RSS at 300 MiB.
-Segment construction also enforces its cap on logical documents, including
-archive members, rather than only on physical source objects. A separate 512
-MiB compressed-expansion gate caps trigram/sparse index and files-only search
-RSS at 96 MiB. A 512 MiB raw-object MinIO gate applies the same ceiling to S3
-indexing and files-only search with both strategies. A separate 64 MiB
-high-entropy gzip gate exercises ranged source download, streaming decode,
-bitmap-backed trigram construction, cold term-cache population, and mmap lookup
-under the same 96 MiB ceiling. A 20,000-member, 640 MiB TAR gate applies the
-96 MiB ceiling to sparse indexing, removes the source archive, and requires
-exact snapshot search results. Workspace line coverage is gated at 80%.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-latency-dark.svg">
+  <img alt="Query latency, p50 by scenario on the 25,000-object MinIO benchmark" src=".github/assets/bench-latency-light.svg">
+</picture>
 
 <!-- BENCH:START -->
-| scenario | hits | candidates/total | prune ratio | bytes | p50 ms | p95 ms | p99 ms | concurrency=1 p50 ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| short_literal | 12500 | 12500/25000 | 0.500 | 51200000 | 126.481 | 135.274 | 135.274 | 144.098 |
-| long_literal | 8334 | 8334/25000 | 0.333 | 34136064 | 130.168 | 133.678 | 133.678 | 139.821 |
-| alternation | 7857 | 7857/25000 | 0.314 | 32182272 | 121.114 | 133.386 | 133.386 | 127.223 |
-| anchored | 2273 | 2273/25000 | 0.091 | 9310208 | 92.022 | 100.881 | 100.881 | 88.671 |
-| no_match | 0 | 0/25000 | 0.000 | 0 | 0.006 | 0.006 | 0.006 | 0.005 |
-| QAll | 25000 | 25000/25000 | 1.000 | 102400000 | 161.019 | 163.742 | 163.742 | 168.181 |
-| dot_star_gap | 2500 | 2500/25000 | 0.100 | 10240000 | 122.263 | 124.068 | 124.068 | 105.753 |
+
+| scenario      |  hits | candidates/total | prune ratio |     bytes |  p50 ms |  p95 ms |  p99 ms | concurrency=1 p50 ms |
+| ------------- | ----: | ---------------: | ----------: | --------: | ------: | ------: | ------: | -------------------: |
+| short_literal | 12500 |      12500/25000 |       0.500 |  51200000 | 126.481 | 135.274 | 135.274 |              144.098 |
+| long_literal  |  8334 |       8334/25000 |       0.333 |  34136064 | 130.168 | 133.678 | 133.678 |              139.821 |
+| alternation   |  7857 |       7857/25000 |       0.314 |  32182272 | 121.114 | 133.386 | 133.386 |              127.223 |
+| anchored      |  2273 |       2273/25000 |       0.091 |   9310208 |  92.022 | 100.881 | 100.881 |               88.671 |
+| no_match      |     0 |          0/25000 |       0.000 |         0 |   0.006 |   0.006 |   0.006 |                0.005 |
+| QAll          | 25000 |      25000/25000 |       1.000 | 102400000 | 161.019 | 163.742 | 163.742 |              168.181 |
+| dot_star_gap  |  2500 |       2500/25000 |       0.100 |  10240000 | 122.263 | 124.068 | 124.068 |              105.753 |
+
 <!-- BENCH:END -->
 
-Microbenchmarks: `make bench-micro`. PR CI compares the base and head revisions
-on one runner and gates statistically confident regressions above 20%; the
-committed [`benches/baseline.json`](benches/baseline.json) remains the reporting
-reference. Refresh it only from CI's `bench-micro` artifact.
+CI reruns the end-to-end benchmark and a microbenchmark suite
+(`make bench-micro`) for every pull request, gates statistically confident
+regressions, verifies exact hit counts, and enforces peak-RSS ceilings across
+large-object, archive, and churn workloads. The committed
+[`benches/baseline.json`](benches/baseline.json) is the reporting reference;
+refresh it only from CI's `bench-micro` artifact.
 
-## Limitations
+As always with benchmarks: this is one corpus with one object-size
+distribution on local MinIO. Your latencies against real S3 will include
+network round-trips; the shape (pruning ratio drives cost) is the durable
+part, not the exact milliseconds.
 
-- **Raw (unframed) snappy** has no magic bytes and is undetectable by design —
-  unsupported as an object format (it still decodes fine _inside_ Avro files,
-  where the container names the codec). **lz4 legacy frames** (`lz4 -l`
-  output) are detected and rejected loudly rather than decoded.
-- No multiline mode: patterns that would match across line boundaries are
-  line-restricted exactly like rg without `-U`.
-- Decoded output above 8 MiB spills to private temporary files. Trigram indexing
-  and files-only bounded regex verification stream those files; sparse indexing
-  reads them through a bounded 1 MiB window. Expansion is capped at 64 GiB per
-  physical source, 100,000 regular archive members, and four nested format
-  layers.
-- S3 sources of at least 64 MiB remain file-backed during indexing instead of
-  materializing the full body in memory. File-backed
-  gzip, zstd, bzip2, Snappy, Brotli, zlib, TAR, and ZIP sources decode through
-  bounded readers or seekable file handles rather than whole-source mappings.
-- A root race before candidate processing reopens once. If garbage collection
-  invalidates a reader after result batches begin, the command errors and must
-  be rerun; emitted matches remain valid, but output may be partial.
-- Continuous indexing polls after each completed cycle; it does not consume
-  bucket notifications, daemonize itself, or install a system service.
-- Concurrent `holys3 index` runs over one prefix are safe. A losing one-shot
-  writer errors cleanly; watched mode retries only after an earlier successful
-  cycle. The design assumes occasional writers, not a write-heavy pipeline.
-- AWS general-purpose buckets and S3-compatible endpoints are supported. S3
-  Express directory buckets require zonal endpoints and session credentials
-  and are not yet supported.
-- The library crates are not a stable API; the CLI is the supported surface.
+### Security
 
-## Security
+Use private buckets. The default index lives under `<source-prefix>/.holys3/`,
+and `--index` can place it in a separately permissioned bucket. The index
+contains compressed canonical decoded content, not only grams, so protect it
+with the same access controls, retention policy, and encryption requirements
+as the source data. holys3 contacts the configured source and index S3
+endpoints plus the AWS credential endpoints required by the active SDK
+provider chain, and nothing else.
 
-Use private buckets. The default index lives under `<source-prefix>/.holys3/`;
-`--index s3://bucket/prefix` may place it in a separately permissioned bucket.
-The index contains compressed canonical decoded content, not only grams, so
-protect it with the same access controls, retention policy, and encryption
-requirements as the source data.
-holys3 contacts the configured source and index S3 endpoints plus the AWS
-credential endpoints required by the active SDK provider chains.
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-## Contributing
+### Contributing
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing index, query, or S3
-behavior. The differential test suites are the correctness contract:
-indexed search must exactly equal a decoded full scan, for every format, both
-gram strategies, and every index lifecycle state.
+behavior, and [CONTRIBUTING.md](CONTRIBUTING.md) for setup and the CI checks.
+The differential test suites are the correctness contract: indexed search must
+exactly equal a decoded full scan, for every format, both gram strategies, and
+every index lifecycle state.
 
-## License
+### License
 
 Licensed under either of:
 

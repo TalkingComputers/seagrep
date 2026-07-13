@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 488" width="880" height="488" role="img" aria-label="holys3 query latency: p50 milliseconds by scenario on a 25,000-object MinIO corpus">
+<style>
+text{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}
+.title{font-size:16px;font-weight:600;fill:#ffffff}
+.sub{font-size:12px;fill:#c3c2b7}
+.name{font-size:12.5px;fill:#ffffff}
+.cand{font-size:11px;fill:#898781}
+.val{font-size:12px;font-weight:600;fill:#ffffff}
+.tick{font-size:11px;fill:#898781;font-variant-numeric:tabular-nums}
+.bar{fill:#3987e5}
+.grid{stroke:#2c2c2a;stroke-width:1}
+.axis{stroke:#383835;stroke-width:1}
+.card{fill:#1a1a19;stroke:rgba(255,255,255,0.10)}
+</style>
+<rect class="card" x="0.5" y="0.5" width="879" height="487" rx="12"/>
+<text class="title" x="24" y="36">Query latency &#8212; p50</text>
+<text class="sub" x="24" y="58">25,000 &#215; 4 KiB objects on MinIO &#183; 3 iterations after warmup &#183; hit counts verified before timing &#183; reproduce: make bench-minio</text>
+
+<line class="grid" x1="399" y1="76" x2="399" y2="452"/>
+<line class="grid" x1="574" y1="76" x2="574" y2="452"/>
+<line class="grid" x1="749" y1="76" x2="749" y2="452"/>
+<line class="axis" x1="224" y1="76" x2="224" y2="452"/>
+
+<text class="name" x="206" y="104" text-anchor="end">.* (full corpus)</text>
+<text class="cand" x="206" y="120" text-anchor="end">25,000 / 25,000 candidates</text>
+<path class="bar" d="M224 94 h559.6 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-559.6 z"/>
+<text class="val" x="795.6" y="108">161.0 ms</text>
+
+<text class="name" x="206" y="156" text-anchor="end">long literal</text>
+<text class="cand" x="206" y="172" text-anchor="end">8,334 / 25,000 candidates</text>
+<path class="bar" d="M224 146 h451.6 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-451.6 z"/>
+<text class="val" x="687.6" y="160">130.2 ms</text>
+
+<text class="name" x="206" y="208" text-anchor="end">short literal</text>
+<text class="cand" x="206" y="224" text-anchor="end">12,500 / 25,000 candidates</text>
+<path class="bar" d="M224 198 h438.7 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-438.7 z"/>
+<text class="val" x="674.7" y="212">126.5 ms</text>
+
+<text class="name" x="206" y="260" text-anchor="end">literal + .* gap</text>
+<text class="cand" x="206" y="276" text-anchor="end">2,500 / 25,000 candidates</text>
+<path class="bar" d="M224 250 h423.9 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-423.9 z"/>
+<text class="val" x="659.9" y="264">122.3 ms</text>
+
+<text class="name" x="206" y="312" text-anchor="end">alternation</text>
+<text class="cand" x="206" y="328" text-anchor="end">7,857 / 25,000 candidates</text>
+<path class="bar" d="M224 302 h419.9 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-419.9 z"/>
+<text class="val" x="655.9" y="316">121.1 ms</text>
+
+<text class="name" x="206" y="364" text-anchor="end">anchored</text>
+<text class="cand" x="206" y="380" text-anchor="end">2,273 / 25,000 candidates</text>
+<path class="bar" d="M224 354 h318.1 a4 4 0 0 1 4 4 v12 a4 4 0 0 1 -4 4 h-318.1 z"/>
+<text class="val" x="554.1" y="368">92.0 ms</text>
+
+<text class="name" x="206" y="416" text-anchor="end">no match</text>
+<text class="cand" x="206" y="432" text-anchor="end">0 / 25,000 &#183; zero fetches</text>
+<rect class="bar" x="224" y="406" width="2" height="20"/>
+<text class="val" x="234" y="420">0.006 ms</text>
+<text class="cand" x="298" y="420">every required gram absent from the term dictionary &#8212; answered without touching the network</text>
+
+<text class="tick" x="224" y="470" text-anchor="middle">0</text>
+<text class="tick" x="399" y="470" text-anchor="middle">50</text>
+<text class="tick" x="574" y="470" text-anchor="middle">100</text>
+<text class="tick" x="749" y="470" text-anchor="middle">150 ms</text>
+</svg>

@@ -1,17 +1,11 @@
 # Contributing to holys3
 
-Thanks for your interest in improving holys3! Contributions of every size are
-welcome — bug reports, documentation fixes, new features, and questions all
-help. **No contribution is too small.**
-
-## Where to ask questions
-
-- **Bugs / feature requests:** open an
-  [issue](https://github.com/TalkingComputers/holys3/issues).
-- **Design discussion / "is this a good idea?":** open a
-  [discussion](https://github.com/TalkingComputers/holys3/discussions) (or an
-  issue) _before_ a large PR, so we can agree on the approach first. This saves
-  you from reworking a big change.
+Bug reports, documentation fixes, features, and questions are all welcome.
+File bugs and feature requests as
+[issues](https://github.com/TalkingComputers/holys3/issues). For a large
+change, open a
+[discussion](https://github.com/TalkingComputers/holys3/discussions) or an
+issue before writing the code, so we can agree on the approach first.
 
 ## Project layout
 
@@ -68,9 +62,9 @@ $ AWS_PROFILE=my-test-profile HOLYS3_TEST_BUCKET=my-test-bucket AWS_REGION=us-ea
 CI never sets `HOLYS3_TEST_BUCKET`, so these tests are skipped there — run them
 locally if you touch the `s3` crate.
 
-## The PR gauntlet
+## Before opening a PR
 
-Run the local equivalents of the CI checks before opening a PR:
+Run the local equivalents of the CI checks:
 
 ```bash
 make check
@@ -86,12 +80,12 @@ from a clean target directory, and enforces the 32 MiB release-binary limit.
 
 In short, your change must:
 
-- be **formatted** with `rustfmt` (`cargo fmt --all --check` is clean);
-- be **clippy-clean** with warnings treated as errors (`-D warnings`);
-- **build and pass tests** on the workspace;
-- **build docs** with no rustdoc warnings;
-- pass **`cargo deny`** (no new advisories, only allowed licenses);
-- have no unused dependencies according to **`cargo machete`**;
+- be formatted with `rustfmt` (`cargo fmt --all --check` is clean);
+- be clippy-clean with warnings treated as errors (`-D warnings`);
+- build and pass tests on the workspace;
+- build docs with no rustdoc warnings;
+- pass `cargo deny` (no new advisories, only allowed licenses);
+- have no unused dependencies according to `cargo machete`;
 - preserve the public libraries' SemVer compatibility;
 - keep line coverage at or above 80%;
 - pass `actionlint`, `typos`, and `zizmor` workflow checks.
