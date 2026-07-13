@@ -490,9 +490,7 @@ fn pick_candidate_prefix<'a>(
 ) -> Option<&'a str> {
     let key_prefix = key_prefix.filter(|prefix| !prefix.is_empty());
     match key_prefix {
-        Some(prefix) if target_prefix.is_empty() || !target_prefix.starts_with(prefix) => {
-            Some(prefix)
-        }
+        Some(prefix) if prefix.starts_with(target_prefix) => Some(prefix),
         _ if target_prefix.is_empty() => None,
         _ => Some(target_prefix),
     }
@@ -781,7 +779,7 @@ mod tests {
         );
         assert_eq!(
             pick_candidate_prefix("logs/", Some("metrics/")),
-            Some("metrics/")
+            Some("logs/")
         );
     }
 
