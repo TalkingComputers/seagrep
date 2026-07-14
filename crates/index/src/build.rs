@@ -53,7 +53,13 @@ pub(super) fn drive_prefetched<T: Send>(
             if let Some(next) = chunks.get(index + 1) {
                 if prefetchable(next) {
                     let next = next.clone();
-                    pending = Some(scope.spawn(move || fetch(next)));
+                    // catch_unwind keeps a panicking fetch from reaching the
+                    // scope's automatic join, which would clobber an error
+                    // returned by `process` with a scope-level re-panic.
+                    pending = Some(scope.spawn(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(next)))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("prefetch thread panicked")))
+                    }));
                 }
             }
             process(chunk.clone(), fetched)?;
@@ -641,6 +647,33 @@ pub(crate) fn build_index_files(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn drive_prefetched_returns_process_error_even_when_prefetch_panics() {
+        let chunks = vec![0..1usize, 1..2];
+        let (process_failed, prefetch_gate) = std::sync::mpsc::channel();
+        let prefetch_gate = std::sync::Mutex::new(prefetch_gate);
+        let fetch = move |chunk: Range<usize>| {
+            if chunk.start == 1 {
+                let () = prefetch_gate
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("process error signal");
+                panic!("prefetch blew up");
+            }
+            Ok(chunk.start)
+        };
+        let error = drive_prefetched(&chunks, &|_| true, &fetch, &mut |_, _| {
+            process_failed.send(()).unwrap();
+            anyhow::bail!("process failed first")
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("process failed first"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn drive_prefetched_starts_next_fetch_during_processing() {
         let chunks = vec![0..2usize, 2..4, 4..6];
