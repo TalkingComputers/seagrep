@@ -1006,14 +1006,14 @@ impl SegmentedReader {
             }
             let postings_name = segment_blob(&segment.meta.seg_id, "postings.bin");
             let remote_values = match &segment.map {
-                TermMap::SparseRemote { index } => {
-                    Some(crate::remote_terms::fetch_query_gram_values(
+                TermMap::SparseRemote { index } => Some(self.classify_index_result(
+                    crate::remote_terms::fetch_query_gram_values(
                         self.store.as_ref(),
                         &segment_blob(&segment.meta.seg_id, "terms.fst"),
                         index,
                         q,
-                    )?)
-                }
+                    ),
+                )?),
                 _ => None,
             };
             let lookup = |gram: &[u8]| match &remote_values {
