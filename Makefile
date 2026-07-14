@@ -8,7 +8,7 @@ BENCH_CONCURRENCY=64
 MINIO_ENV=env -u AWS_PROFILE AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin HOLYS3_BENCH_BUCKET=holys3-bench HOLYS3_BENCH_REGION=us-east-1 HOLYS3_BENCH_ENDPOINT=http://127.0.0.1:9000
 XBENCH=cargo run --locked --release -p holys3-bench --
 
-.PHONY: check package bench bench-micro bench-s3 bench-minio
+.PHONY: check package bench bench-micro bench-s3 bench-minio bench-prose
 
 check:
 	cargo fmt --all --check
@@ -32,6 +32,17 @@ bench: bench-micro
 
 bench-micro:
 	cargo bench --locked -p holys3-index
+
+bench-prose:
+	$(XBENCH) seed --seed $(BENCH_SEED) --objects 1000 --size 65536 --corpus prose
+	$(XBENCH) upload --target dir
+	$(XBENCH) run --scenarios crates/xbench/scenarios/prose.toml --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
+	cp crates/xbench/runs/latest.json crates/xbench/runs/prose-trigram.json
+	$(XBENCH) upload --target dir --strategy sparse
+	$(XBENCH) run --scenarios crates/xbench/scenarios/prose.toml --iterations $(BENCH_ITERATIONS) --warmup $(BENCH_WARMUP) --concurrency $(BENCH_CONCURRENCY)
+	cp crates/xbench/runs/latest.json crates/xbench/runs/prose-sparse.json
+	$(XBENCH) compare crates/xbench/runs/prose-trigram.json crates/xbench/runs/prose-sparse.json
+	$(XBENCH) render --input crates/xbench/runs/prose-sparse.json
 
 bench-s3:
 	$(XBENCH) seed --seed $(BENCH_SEED) --objects $(BENCH_OBJECTS) --size $(BENCH_SIZE)

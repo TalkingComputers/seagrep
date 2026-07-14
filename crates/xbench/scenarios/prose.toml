@@ -1,0 +1,15 @@
+[[scenarios]]
+name = "planted_phrase"
+pattern = "the people of the north came down to the great water"
+
+[[scenarios]]
+name = "unplanted_phrase"
+pattern = "the water of the people came up to the small north"
+
+[[scenarios]]
+name = "rare_word"
+pattern = "xylophone"
+
+[[scenarios]]
+name = "common_word"
+pattern = "water"

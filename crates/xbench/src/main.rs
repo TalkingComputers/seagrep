@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use gen::{
     doc_path, latest_run_path, local_index_dir, objects_dir, read_manifest, remove_dir,
-    reports_dir, write_seed, SeedManifest,
+    reports_dir, write_seed, CorpusKind, SeedManifest,
 };
 use holys3_core::{LocalBlobStore, Strategy};
 use holys3_index::{
@@ -58,10 +58,14 @@ enum Command {
         objects: usize,
         #[arg(long)]
         size: usize,
+        #[arg(long, value_enum, default_value = "random")]
+        corpus: CorpusKind,
     },
     Upload {
         #[arg(long, value_enum)]
         target: UploadTarget,
+        #[arg(long, value_enum, default_value = "trigram")]
+        strategy: StrategyArg,
     },
     Run {
         #[arg(long)]
@@ -93,6 +97,21 @@ enum Command {
 enum UploadTarget {
     Dir,
     S3,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StrategyArg {
+    Trigram,
+    Sparse,
+}
+
+impl From<StrategyArg> for Strategy {
+    fn from(strategy: StrategyArg) -> Strategy {
+        match strategy {
+            StrategyArg::Trigram => Strategy::Trigram,
+            StrategyArg::Sparse => Strategy::Sparse,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,13 +182,14 @@ fn main() -> Result<()> {
             seed,
             objects,
             size,
+            corpus,
         } => {
-            let manifest = write_seed(seed, objects, size)?;
+            let manifest = write_seed(seed, objects, size, corpus)?;
             println!("{}", gen::manifest_path().display());
             println!("objects={}", manifest.objects);
             Ok(())
         }
-        Command::Upload { target } => upload(target),
+        Command::Upload { target, strategy } => upload(target, strategy.into()),
         Command::Run {
             scenarios,
             iterations,
@@ -186,14 +206,14 @@ fn main() -> Result<()> {
     }
 }
 
-fn upload(target: UploadTarget) -> Result<()> {
+fn upload(target: UploadTarget, strategy: Strategy) -> Result<()> {
     match target {
-        UploadTarget::Dir => upload_dir(),
-        UploadTarget::S3 => upload_s3(&read_manifest()?),
+        UploadTarget::Dir => upload_dir(strategy),
+        UploadTarget::S3 => upload_s3(&read_manifest()?, strategy),
     }
 }
 
-fn upload_dir() -> Result<()> {
+fn upload_dir(strategy: Strategy) -> Result<()> {
     remove_dir(&local_index_dir())?;
     std::fs::create_dir_all(local_index_dir())?;
     let listing_started = Instant::now();
@@ -206,7 +226,7 @@ fn upload_dir() -> Result<()> {
         &store,
         &dir_cache_dir(),
         &dir_source_identity()?,
-        Strategy::Trigram,
+        strategy,
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(LocalCorpus::from_listing(shard))),
@@ -221,7 +241,7 @@ fn dir_cache_dir() -> PathBuf {
     reports_dir().join("dir-cache")
 }
 
-fn upload_s3(manifest: &SeedManifest) -> Result<()> {
+fn upload_s3(manifest: &SeedManifest, strategy: Strategy) -> Result<()> {
     let backend = read_s3_backend(DEFAULT_CONCURRENCY)?;
     let uploads = manifest
         .docs
@@ -272,7 +292,7 @@ fn upload_s3(manifest: &SeedManifest) -> Result<()> {
         &store,
         &cache_dir,
         &source,
-        Strategy::Trigram,
+        strategy,
         &listing,
         UpdateOptions::default(),
         &|shard| {
