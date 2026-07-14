@@ -25,6 +25,10 @@ pub(crate) fn open_remote_index(
     );
     let guess = TAIL_GUESS_BYTES.min(terms_len);
     let mut tail = store.get_range(blob, terms_len - guess, guess)?;
+    anyhow::ensure!(
+        tail.len() >= FOOTER_BYTES,
+        "sparse term table tail response is too short"
+    );
     let footer = &tail[tail.len() - FOOTER_BYTES..];
     let index_offset = u64::from_le_bytes(
         footer[16..24]

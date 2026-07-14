@@ -274,7 +274,7 @@ impl TermMap {
                         .context("sparse table block is out of bounds")?;
                     for entry in raw.chunks_exact(crate::sparse_table::ENTRY_BYTES) {
                         let key: [u8; 8] = entry[..8].try_into().expect("eight bytes");
-                        let value = u64::from_le_bytes(entry[8..].try_into().expect("eight bytes"));
+                        let value = u64::from_be_bytes(entry[8..].try_into().expect("eight bytes"));
                         visit(&key, value)?;
                     }
                 }
@@ -293,5 +293,49 @@ impl TermMap {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compaction round-trips dictionaries through visit() -> insert():
+    // whatever key bytes visit emits must be accepted, in order, by a fresh
+    // builder and resolve to the same values afterwards.
+    #[test]
+    fn sparse_visit_round_trips_through_a_new_builder() {
+        let grams: Vec<&[u8]> = vec![b"whale", b"ahab", b"pequod", b"ishmael", b"harpoon"];
+        let mut entries: Vec<(u64, u64)> = grams
+            .iter()
+            .enumerate()
+            .map(|(value, gram)| (holys3_core::hash_ngram(gram), value as u64))
+            .collect();
+        entries.sort_unstable();
+        let mut builder = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        for (hash, value) in &entries {
+            builder.insert(&hash.to_be_bytes(), *value).unwrap();
+        }
+        let bytes = builder.finish().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terms.fst");
+        std::fs::write(&path, &bytes).unwrap();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(&path).unwrap()) }
+            .unwrap();
+        let map = TermMap::open(mmap, Strategy::Sparse).unwrap();
+
+        let mut rebuilt = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
+        map.visit(|key, value| rebuilt.insert(key, value))
+            .expect("visit output must feed a new builder in order");
+        let rebuilt_bytes = rebuilt.finish().unwrap();
+        assert_eq!(bytes, rebuilt_bytes, "round trip must be byte-identical");
+
+        for gram in grams {
+            assert!(
+                map.get(gram).is_some(),
+                "gram {gram:?} must resolve after the round trip"
+            );
+        }
     }
 }

@@ -51,8 +51,8 @@ impl<W: Write> SparseTableWriter<W> {
         if self.block.is_empty() {
             self.block_first_hash = hash;
         }
-        self.block.extend_from_slice(&hash.to_le_bytes());
-        self.block.extend_from_slice(&value.to_le_bytes());
+        self.block.extend_from_slice(&hash.to_be_bytes());
+        self.block.extend_from_slice(&value.to_be_bytes());
         self.last_hash = Some(hash);
         self.entry_count += 1;
         if self.block.len() >= BLOCK_BYTES {
@@ -221,7 +221,7 @@ pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
     );
     let entries = block.len() / ENTRY_BYTES;
     let entry_hash = |at: usize| {
-        u64::from_le_bytes(
+        u64::from_be_bytes(
             block[at * ENTRY_BYTES..at * ENTRY_BYTES + 8]
                 .try_into()
                 .expect("eight bytes"),
@@ -235,7 +235,7 @@ pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
             std::cmp::Ordering::Less => low = mid + 1,
             std::cmp::Ordering::Greater => high = mid,
             std::cmp::Ordering::Equal => {
-                return Ok(Some(u64::from_le_bytes(
+                return Ok(Some(u64::from_be_bytes(
                     block[mid * ENTRY_BYTES + 8..mid * ENTRY_BYTES + 16]
                         .try_into()
                         .expect("eight bytes"),
