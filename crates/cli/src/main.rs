@@ -139,6 +139,9 @@ struct SearchArgs {
     /// Wrap every pattern in word boundaries.
     #[arg(short = 'w', long)]
     word_regexp: bool,
+    /// Print matches from binary content instead of the suppression notice.
+    #[arg(short = 'a', long)]
+    text: bool,
     /// Print only the keys of matching objects.
     #[arg(short = 'l', long, conflicts_with_all = ["count", "count_matches", "json"])]
     files_with_matches: bool,
@@ -645,6 +648,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 line_numbers,
                 column: args.column,
                 context_active: options.before_context > 0 || options.after_context > 0,
+                text: args.text,
             },
             color,
         ))
