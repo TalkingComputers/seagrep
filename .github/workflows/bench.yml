@@ -299,6 +299,57 @@ jobs:
         run: |
           /usr/bin/time -v -o bench-churn-rss.txt target/release/holys3-bench churn --cycles 30 --changes 250 | tee bench-churn.txt
           cp crates/xbench/runs/churn.json bench-churn.json
+      - name: Profile prose corpus (trigram vs sparse)
+        run: |
+          target/release/holys3-bench seed --seed 1 --objects 1000 --size 65536 --corpus prose
+          target/release/holys3-bench upload --target dir
+          target/release/holys3-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
+          cp crates/xbench/runs/latest.json bench-prose-trigram.json
+          target/release/holys3-bench upload --target dir --strategy sparse
+          target/release/holys3-bench run --scenarios crates/xbench/scenarios/prose.toml --iterations 1 --warmup 0 --concurrency 64
+          cp crates/xbench/runs/latest.json bench-prose-sparse.json
+          {
+            echo '#### prose corpus, trigram'
+            target/release/holys3-bench render --input bench-prose-trigram.json
+            echo
+            echo '#### prose corpus, sparse'
+            target/release/holys3-bench render --input bench-prose-sparse.json
+          } > bench-prose.md
+      - name: Gate prose candidate counts
+        run: |
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          def scenarios(name):
+              summary = json.loads(Path(name).read_text())
+              return {scenario["name"]: scenario for scenario in summary["scenarios"]}
+
+          trigram = scenarios("bench-prose-trigram.json")
+          sparse = scenarios("bench-prose-sparse.json")
+          failures = []
+
+          def gate(strategy, name, key, low, high):
+              value = strategy[name][key]
+              if not low <= value <= high:
+                  failures.append(f"{name} {key} {value} outside [{low}, {high}]")
+
+          # Phrase queries built from common words: trigram pruning must still
+          # exhibit the prose collapse (candidates ~= every doc) while the
+          # sparse dictionary must stay near-exact. Deterministic given seed=1.
+          for name in ("planted_phrase", "unplanted_phrase"):
+              gate(trigram, name, "prune_ratio", 0.9, 1.0)
+              gate(sparse, name, "prune_ratio", 0.0, 0.03)
+          gate(trigram, "rare_word", "prune_ratio", 0.0, 0.01)
+          gate(sparse, "rare_word", "prune_ratio", 0.0, 0.01)
+          gate(trigram, "common_word", "prune_ratio", 0.9, 1.0)
+          gate(sparse, "common_word", "prune_ratio", 0.9, 1.0)
+          for name, scenario in sparse.items():
+              if scenario["hits"] != trigram[name]["hits"]:
+                  failures.append(f"{name} hits diverge between strategies")
+          if failures:
+              raise SystemExit("\n".join(failures))
+          PY
       - name: Start MinIO service
         run: |
           docker run -d --name holys3-scale-minio -p 9000:9000 \
@@ -489,6 +540,9 @@ jobs:
           name: bench-scale
           path: |
             bench-scale.md
+            bench-prose.md
+            bench-prose-trigram.json
+            bench-prose-sparse.json
             bench-scale-index.txt
             bench-scale-build.txt
             bench-scale-large.txt
@@ -547,6 +601,9 @@ jobs:
             echo
             echo '### scale'
             if [ -f artifacts/bench-scale.md ]; then cat artifacts/bench-scale.md; else echo 'scale did not produce a table'; fi
+            echo
+            echo '### prose'
+            if [ -f artifacts/bench-prose.md ]; then cat artifacts/bench-prose.md; else echo 'prose did not produce a table'; fi
           } > bench-comment.md
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:

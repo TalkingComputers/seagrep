@@ -52,3 +52,16 @@ cargo run --locked --release -p holys3-bench -- churn --cycles 30 --changes 250
 
 It writes `crates/xbench/runs/churn.json` and mutates the generated corpus;
 reseed before another run.
+
+## Prose corpus
+
+Random-byte corpora make trigrams unrealistically selective. `--corpus prose`
+seeds Zipf-sampled common-English text (hard-wrapped like Gutenberg files)
+where phrase queries collapse trigram pruning — the workload the sparse
+strategy exists for. `make bench-prose` runs the same scenarios against a
+trigram and a sparse index and compares them; CI gates on the deterministic
+candidate counts, not timings.
+
+```sh
+make bench-prose
+```
