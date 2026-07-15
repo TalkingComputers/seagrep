@@ -400,7 +400,7 @@ impl S3Client {
 }
 
 const STREAM_PART_SIZE: usize = 16 * 1024 * 1024;
-/// Matches MULTIPART_CONCURRENCY: the producer blocks when the window is
+/// Matches `MULTIPART_CONCURRENCY`: the producer blocks when the window is
 /// full, so a narrower window would throttle the merge to per-connection
 /// upload speed instead of the link's aggregate.
 const STREAM_PARTS_IN_FLIGHT: usize = 4;
