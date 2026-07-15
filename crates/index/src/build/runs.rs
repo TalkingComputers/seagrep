@@ -158,8 +158,7 @@ impl SparseFileReader {
         let len = (self.len - start).min(SPARSE_FILE_CHUNK);
         self.chunk.resize(len, 0);
         let offset = self.file_offset(start)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut self.chunk)?;
+        read_exact_at(&self.file, &mut self.chunk, offset)?;
         self.chunk_start = start;
         Ok(())
     }
@@ -191,10 +190,31 @@ impl SparseFileReader {
             return Ok(());
         }
         let offset = self.file_offset(range.start)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(bytes)?;
+        read_exact_at(&self.file, bytes, offset)?;
         Ok(())
     }
+}
+
+/// Positional read that never touches the descriptor's shared offset:
+/// spooled gram files are read from rayon workers holding `try_clone`d
+/// handles, and cloned descriptors share one seek position.
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        let read = file.seek_read(&mut bytes[filled..], offset + filled as u64)?;
+        anyhow::ensure!(read > 0, "spooled gram file ended early");
+        filled += read;
+    }
+    Ok(())
 }
 
 fn mark_short_gram(bitmap: &mut [u64], gram: usize) -> bool {
