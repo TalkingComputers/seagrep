@@ -902,6 +902,39 @@ mod tests {
     }
 
     #[test]
+    fn parallel_spooled_runs_match_memory() {
+        let mut spool = tempfile::tempfile().unwrap();
+        let mut memory_docs = Vec::new();
+        let mut spooled_docs = Vec::new();
+        let mut offset = 0u64;
+        for idx in 0..64 {
+            let text = (0..SPARSE_FILE_CHUNK / 3 + idx * 31)
+                .map(|byte| b'a' + u8::try_from((byte * 7 + idx) % 23).unwrap())
+                .collect::<Vec<_>>();
+            spool.write_all(&text).unwrap();
+            let len = u64::try_from(text.len()).unwrap();
+            memory_docs.push((idx, IndexedGrams::Sparse(text.into())));
+            spooled_docs.push((idx, IndexedGrams::SparseSpool { offset, len }));
+            offset += len;
+        }
+        let memory = write_posting_runs(memory_docs, Strategy::Sparse, 1 << 20, None).unwrap();
+        let spooled =
+            write_posting_runs(spooled_docs, Strategy::Sparse, 1 << 20, Some(&spool)).unwrap();
+        let (memory_fst, memory_postings) =
+            merge_posting_runs(memory, Strategy::Sparse, 64).unwrap();
+        let (spooled_fst, spooled_postings) =
+            merge_posting_runs(spooled, Strategy::Sparse, 64).unwrap();
+        assert_eq!(
+            std::fs::read(memory_fst.path()).unwrap(),
+            std::fs::read(spooled_fst.path()).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(memory_postings.path()).unwrap(),
+            std::fs::read(spooled_postings.path()).unwrap()
+        );
+    }
+
+    #[test]
     fn sparse_file_runs_match_memory_across_chunks() {
         let text = (0..SPARSE_FILE_CHUNK + 17)
             .map(|index| if index % 2 == 0 { b'a' } else { b'b' })
@@ -971,7 +1004,7 @@ mod tests {
                 write_posting_record(
                     &mut file,
                     Strategy::Trigram,
-                    b"abc",
+                    u64::from(u32::from_be_bytes(*b"\0abc")),
                     DocId::try_from(id).unwrap(),
                 )
                 .unwrap();

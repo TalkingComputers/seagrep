@@ -3,6 +3,7 @@ use crate::terms::TermBuilder;
 use crate::{encode_posting_block, eval};
 use anyhow::{Context, Result};
 use holys3_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy};
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -10,6 +11,10 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Range;
 use tempfile::TempPath;
+
+/// Posting-run temp files are read and written in bulk; the `BufReader` default
+/// of 8 KiB makes buffer refills a measurable share of merge time.
+const RUN_IO_BUFFER_BYTES: usize = 256 * 1024;
 
 pub(crate) const SPARSE_FILE_CHUNK: usize = 1024 * 1024;
 const SPARSE_TRIGRAM_BITMAP_MIN: usize = 512 * 1024;
@@ -153,8 +158,7 @@ impl SparseFileReader {
         let len = (self.len - start).min(SPARSE_FILE_CHUNK);
         self.chunk.resize(len, 0);
         let offset = self.file_offset(start)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut self.chunk)?;
+        read_exact_at(&self.file, &mut self.chunk, offset)?;
         self.chunk_start = start;
         Ok(())
     }
@@ -186,10 +190,31 @@ impl SparseFileReader {
             return Ok(());
         }
         let offset = self.file_offset(range.start)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(bytes)?;
+        read_exact_at(&self.file, bytes, offset)?;
         Ok(())
     }
+}
+
+/// Positional read that never touches the descriptor's shared offset:
+/// spooled gram files are read from rayon workers holding `try_clone`d
+/// handles, and cloned descriptors share one seek position.
+#[cfg(unix)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut filled = 0usize;
+    while filled < bytes.len() {
+        let read = file.seek_read(&mut bytes[filled..], offset + filled as u64)?;
+        anyhow::ensure!(read > 0, "spooled gram file ended early");
+        filled += read;
+    }
+    Ok(())
 }
 
 fn mark_short_gram(bitmap: &mut [u64], gram: usize) -> bool {
@@ -325,32 +350,41 @@ pub(crate) fn write_posting_runs(
     match strategy {
         Strategy::Trigram => write_trigram_runs(grammed, spool),
         Strategy::Sparse => {
-            let mut runs = Vec::new();
-            for (idx, grams) in grammed {
-                let mut writer = SparseRunWriter::new(idx, sparse_run_bytes)?;
-                match grams {
-                    IndexedGrams::Sparse(text) => writer.add(&text)?,
-                    IndexedGrams::SparseFile(file) => writer.add_file(file)?,
-                    IndexedGrams::SparsePath(path) => {
-                        let file = File::open(&path)?;
-                        writer.add_file(file)?;
+            // The run budget is aggregate: rayon workers each hold their own
+            // entry set, so the per-writer share shrinks with the pool size
+            // to keep peak memory at the serial envelope.
+            let workers = rayon::current_num_threads().max(1);
+            let worker_run_bytes = (sparse_run_bytes / workers)
+                .max(1 << 20)
+                .min(sparse_run_bytes);
+            let runs = grammed
+                .into_par_iter()
+                .map(|(idx, grams)| -> Result<Vec<TempPath>> {
+                    let mut writer = SparseRunWriter::new(idx, worker_run_bytes)?;
+                    match grams {
+                        IndexedGrams::Sparse(text) => writer.add(&text)?,
+                        IndexedGrams::SparseFile(file) => writer.add_file(file)?,
+                        IndexedGrams::SparsePath(path) => {
+                            let file = File::open(&path)?;
+                            writer.add_file(file)?;
+                        }
+                        IndexedGrams::SparseSpool { offset, len } => writer.add_range(
+                            spool
+                                .context("spooled grams have no content spool")?
+                                .try_clone()?,
+                            offset,
+                            len,
+                        )?,
+                        IndexedGrams::Trigram(_)
+                        | IndexedGrams::TrigramBitmap(_)
+                        | IndexedGrams::TrigramSpool { .. } => {
+                            anyhow::bail!("mixed gram strategies in build chunk");
+                        }
                     }
-                    IndexedGrams::SparseSpool { offset, len } => writer.add_range(
-                        spool
-                            .context("spooled grams have no content spool")?
-                            .try_clone()?,
-                        offset,
-                        len,
-                    )?,
-                    IndexedGrams::Trigram(_)
-                    | IndexedGrams::TrigramBitmap(_)
-                    | IndexedGrams::TrigramSpool { .. } => {
-                        anyhow::bail!("mixed gram strategies in build chunk");
-                    }
-                }
-                runs.extend(writer.finish()?);
-            }
-            Ok(runs)
+                    writer.finish()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(runs.into_iter().flatten().collect())
         }
     }
 }
@@ -424,13 +458,12 @@ fn write_trigram_documents(documents: Vec<(usize, Vec<u32>)>) -> Result<TempPath
 fn write_trigram_bitmap_run(idx: usize, bitmap: Vec<u64>) -> Result<TempPath> {
     let id = DocId::try_from(idx)?;
     let mut file = tempfile::NamedTempFile::new()?;
-    let mut writer = BufWriter::new(file.as_file_mut());
+    let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
     for (word_index, mut word) in bitmap.into_iter().enumerate() {
         while word != 0 {
             let bit = usize::try_from(word.trailing_zeros()).expect("u32 fits usize");
             let gram = u32::try_from(word_index * 64 + bit).expect("trigram fits u32");
-            writer.write_all(&gram.to_be_bytes()[1..])?;
-            writer.write_all(&id.to_be_bytes())?;
+            write_posting_record(&mut writer, Strategy::Trigram, u64::from(gram), id)?;
             word &= word - 1;
         }
     }
@@ -441,7 +474,7 @@ fn write_trigram_bitmap_run(idx: usize, bitmap: Vec<u64>) -> Result<TempPath> {
 
 pub(crate) fn write_trigram_run_radix(grammed: Vec<(usize, Vec<u32>)>) -> Result<TempPath> {
     let mut file = tempfile::NamedTempFile::new()?;
-    let mut writer = BufWriter::new(file.as_file_mut());
+    let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
     let mut entries = Vec::new();
     for (idx, grams) in grammed {
         let id = DocId::try_from(idx)?;
@@ -454,10 +487,8 @@ pub(crate) fn write_trigram_run_radix(grammed: Vec<(usize, Vec<u32>)>) -> Result
     radsort::sort(&mut entries);
     entries.dedup();
     for entry in entries {
-        let gram = (entry >> 32) as u32;
         let id = entry as DocId;
-        writer.write_all(&gram.to_be_bytes()[1..])?;
-        writer.write_all(&id.to_be_bytes())?;
+        write_posting_record(&mut writer, Strategy::Trigram, entry >> 32, id)?;
     }
     writer.flush()?;
     drop(writer);
@@ -477,13 +508,12 @@ pub(crate) fn write_trigram_run_merge(grammed: Vec<(usize, Vec<u32>)>) -> Result
         }
     }
     let mut file = tempfile::NamedTempFile::new()?;
-    let mut writer = BufWriter::new(file.as_file_mut());
+    let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
     let mut previous = None;
     while let Some(Reverse((gram, id, document_index, gram_index))) = pending.pop() {
         let record = (gram, id);
         if previous != Some(record) {
-            writer.write_all(&gram.to_be_bytes()[1..])?;
-            writer.write_all(&id.to_be_bytes())?;
+            write_posting_record(&mut writer, Strategy::Trigram, u64::from(gram), id)?;
             previous = Some(record);
         }
         let next_index = gram_index + 1;
@@ -500,10 +530,9 @@ fn write_sparse_run(entries: &rapidhash::RapidHashSet<u64>, id: DocId) -> Result
     let mut ordered = entries.iter().copied().collect::<Vec<_>>();
     radsort::sort(&mut ordered);
     let mut file = tempfile::NamedTempFile::new()?;
-    let mut writer = BufWriter::new(file.as_file_mut());
+    let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
     for hash in ordered {
-        writer.write_all(&hash.to_be_bytes())?;
-        writer.write_all(&id.to_be_bytes())?;
+        write_posting_record(&mut writer, Strategy::Sparse, hash, id)?;
     }
     writer.flush()?;
     drop(writer);
@@ -514,7 +543,8 @@ fn insert_posting_file<W: Write>(
     builder: &mut TermBuilder<W>,
     postings: &mut impl Write,
     offset: &mut u64,
-    gram: &[u8],
+    strategy: Strategy,
+    key: u64,
     mut ids: Vec<DocId>,
     doc_count: u32,
 ) -> Result<()> {
@@ -525,7 +555,11 @@ fn insert_posting_file<W: Write>(
     }
     let mut block = Vec::new();
     encode_posting_block(&mut block, &ids, doc_count);
-    builder.insert(gram, eval::pack_posting(*offset, ids.len())?)?;
+    let gram = key.to_be_bytes();
+    builder.insert(
+        &gram[8 - key_bytes(strategy)..],
+        eval::pack_posting(*offset, ids.len())?,
+    )?;
     postings.write_all(&block)?;
     *offset += u64::try_from(block.len())?;
     Ok(())
@@ -539,29 +573,33 @@ pub(crate) struct PostingRun {
 pub(crate) const MAX_OPEN_POSTING_RUNS: usize = 64;
 
 impl PostingRun {
-    pub(crate) fn read_record(&mut self) -> Result<Option<(Vec<u8>, DocId)>> {
-        match self.strategy {
-            Strategy::Trigram => {
-                let mut record = [0u8; 7];
-                if !read_exact_or_eof(&mut self.reader, &mut record)? {
-                    return Ok(None);
-                }
-                Ok(Some((
-                    record[..3].to_vec(),
-                    DocId::from_be_bytes(record[3..].try_into()?),
-                )))
-            }
-            Strategy::Sparse => {
-                let mut record = [0u8; 12];
-                if !read_exact_or_eof(&mut self.reader, &mut record)? {
-                    return Ok(None);
-                }
-                Ok(Some((
-                    record[..8].to_vec(),
-                    DocId::from_be_bytes(record[8..].try_into()?),
-                )))
-            }
+    /// Records carry their key as a u64 — a zero-extended 3-byte gram for
+    /// trigram runs, the full hash for sparse runs. Big-endian record bytes
+    /// order identically to the integer, so merges compare plain u64s.
+    pub(crate) fn read_record(&mut self) -> Result<Option<(u64, DocId)>> {
+        let mut record = [0u8; 12];
+        let record = &mut record[..record_bytes(self.strategy)];
+        if !read_exact_or_eof(&mut self.reader, record)? {
+            return Ok(None);
         }
+        let (key, id) = record.split_at(record.len() - size_of::<DocId>());
+        let mut padded = [0u8; 8];
+        padded[8 - key.len()..].copy_from_slice(key);
+        Ok(Some((
+            u64::from_be_bytes(padded),
+            DocId::from_be_bytes(id.try_into()?),
+        )))
+    }
+}
+
+fn record_bytes(strategy: Strategy) -> usize {
+    key_bytes(strategy) + size_of::<DocId>()
+}
+
+pub(crate) fn key_bytes(strategy: Strategy) -> usize {
+    match strategy {
+        Strategy::Trigram => 3,
+        Strategy::Sparse => 8,
     }
 }
 
@@ -581,23 +619,15 @@ fn read_exact_or_eof(reader: &mut impl Read, bytes: &mut [u8]) -> Result<bool> {
 pub(crate) fn write_posting_record(
     writer: &mut impl Write,
     strategy: Strategy,
-    gram: &[u8],
+    key: u64,
     id: DocId,
 ) -> Result<()> {
-    match strategy {
-        Strategy::Trigram => {
-            anyhow::ensure!(gram.len() == 3, "temporary trigram has invalid length");
-            writer.write_all(gram)?;
-        }
-        Strategy::Sparse => {
-            anyhow::ensure!(
-                gram.len() == 8,
-                "temporary sparse key must be an 8-byte hash"
-            );
-            writer.write_all(gram)?;
-        }
-    }
-    writer.write_all(&id.to_be_bytes())?;
+    let mut record = [0u8; 12];
+    let len = record_bytes(strategy);
+    let split = len - size_of::<DocId>();
+    record[..split].copy_from_slice(&key.to_be_bytes()[8 - split..]);
+    record[split..len].copy_from_slice(&id.to_be_bytes());
+    writer.write_all(&record[..len])?;
     Ok(())
 }
 
@@ -606,7 +636,7 @@ fn merge_run_group(paths: Vec<TempPath>, strategy: Strategy) -> Result<TempPath>
         .iter()
         .map(|path| {
             Ok(PostingRun {
-                reader: BufReader::new(File::open(path)?),
+                reader: BufReader::with_capacity(RUN_IO_BUFFER_BYTES, File::open(path)?),
                 strategy,
             })
         })
@@ -618,18 +648,15 @@ fn merge_run_group(paths: Vec<TempPath>, strategy: Strategy) -> Result<TempPath>
         }
     }
     let mut file = tempfile::NamedTempFile::new()?;
-    let mut writer = BufWriter::new(file.as_file_mut());
+    let mut writer = BufWriter::with_capacity(RUN_IO_BUFFER_BYTES, file.as_file_mut());
     let mut previous = None;
-    while let Some(Reverse((gram, id, run_idx))) = heap.pop() {
-        if previous
-            .as_ref()
-            .is_none_or(|(previous_gram, previous_id)| previous_gram != &gram || *previous_id != id)
-        {
-            write_posting_record(&mut writer, strategy, &gram, id)?;
-            previous = Some((gram, id));
+    while let Some(Reverse((key, id, run_idx))) = heap.pop() {
+        if previous != Some((key, id)) {
+            write_posting_record(&mut writer, strategy, key, id)?;
+            previous = Some((key, id));
         }
-        if let Some((gram, id)) = runs[run_idx].read_record()? {
-            heap.push(Reverse((gram, id, run_idx)));
+        if let Some((key, id)) = runs[run_idx].read_record()? {
+            heap.push(Reverse((key, id, run_idx)));
         }
     }
     writer.flush()?;
@@ -673,7 +700,7 @@ pub(crate) fn merge_posting_runs(
         .iter()
         .map(|path| {
             Ok(PostingRun {
-                reader: BufReader::new(File::open(path)?),
+                reader: BufReader::with_capacity(RUN_IO_BUFFER_BYTES, File::open(path)?),
                 strategy,
             })
         })
@@ -699,16 +726,17 @@ pub(crate) fn merge_posting_runs(
         BufWriter::new(HashWriter::new(fst.reopen()?)),
     )?;
     let mut postings_len = 0u64;
-    let mut current_gram: Option<Vec<u8>> = None;
+    let mut current_key: Option<u64> = None;
     let mut ids = Vec::new();
-    while let Some(Reverse((gram, id, run_idx))) = heap.pop() {
-        if current_gram.as_deref() != Some(gram.as_slice()) {
-            if let Some(current) = current_gram.replace(gram) {
+    while let Some(Reverse((key, id, run_idx))) = heap.pop() {
+        if current_key != Some(key) {
+            if let Some(current) = current_key.replace(key) {
                 insert_posting_file(
                     &mut builder,
                     &mut postings_writer,
                     &mut postings_len,
-                    &current,
+                    strategy,
+                    current,
                     std::mem::take(&mut ids),
                     doc_count,
                 )?;
@@ -721,12 +749,13 @@ pub(crate) fn merge_posting_runs(
             heap.push(Reverse((next_gram, next_id, run_idx)));
         }
     }
-    if let Some(current) = current_gram {
+    if let Some(current) = current_key {
         insert_posting_file(
             &mut builder,
             &mut postings_writer,
             &mut postings_len,
-            &current,
+            strategy,
+            current,
             ids,
             doc_count,
         )?;

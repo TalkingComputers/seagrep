@@ -465,7 +465,9 @@ jobs:
               if peak_kib > expansion_limit_kib:
                   raise SystemExit(f"{name}: peak RSS {peak_kib} KiB exceeds {expansion_limit_kib} KiB")
 
-          archive_limit_kib = 112 * 1024
+          # 128 MiB: parallel sparse run writing (rayon per-document workers)
+          # adds a few MiB of transient state over the old serial 112 MiB.
+          archive_limit_kib = 128 * 1024
           lines = Path("bench-archive-sparse-index.txt").read_text().splitlines()
           field = next(line for line in lines if "Maximum resident set size" in line)
           peak_kib = int(field.rsplit(":", 1)[1])
