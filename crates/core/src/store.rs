@@ -227,14 +227,16 @@ struct LocalStreamingPut {
 
 impl StreamingPut for LocalStreamingPut {
     fn write(&mut self, bytes: &[u8]) -> AnyhowResult<()> {
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadStarted {
+                bytes: bytes.len() as u64,
+            });
+        }
         self.temp
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("streaming put already ended"))?
             .write_all(bytes)?;
         if let Some(progress) = &self.progress {
-            progress.emit(crate::ProgressEvent::UploadStarted {
-                bytes: bytes.len() as u64,
-            });
             progress.emit(crate::ProgressEvent::UploadedChunk {
                 bytes: bytes.len() as u64,
             });
