@@ -498,12 +498,12 @@ impl StreamingUpload {
         while !self.in_flight.is_empty() {
             self.harvest_one()?;
         }
-        anyhow::ensure!(
-            !self.completed.is_empty(),
-            "streamed upload of s3://{}/{} produced no parts",
-            self.bucket,
-            self.key
-        );
+        if self.completed.is_empty() {
+            // S3 cannot complete a multipart upload with zero parts, so an
+            // empty stream falls back to a plain zero-byte PutObject.
+            self.abort_inner();
+            return self.client.put(&self.bucket, &self.key, &[]);
+        }
         let mut parts = std::mem::take(&mut self.completed);
         parts.sort_unstable_by_key(|part| part.part_number().unwrap_or_default());
         let result = self.client.0.rt.block_on(self.client.finish_multipart(
