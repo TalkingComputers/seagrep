@@ -64,6 +64,10 @@ impl BlobStore for CountingStore {
     }
 }
 
+/// Both tests mutate process-global env vars; they share one lock so a
+/// parallel test runner cannot interleave them.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn test_source() -> SourceIdentity {
     SourceIdentity::Local {
         prefix: "/remote-test/".into(),
@@ -80,6 +84,7 @@ fn search(reader: &SegmentedReader, pattern: &str) -> Result<Vec<(String, u64)>>
 
 #[test]
 fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
+    let _env = ENV_LOCK.lock().expect("env lock");
     let objects: BTreeMap<String, Vec<u8>> = (0..50)
         .map(|index| {
             let body = format!(
@@ -188,5 +193,108 @@ fn remote_readers_cache_the_index_tail_and_match_cached_mode() -> Result<()> {
     let cached_mode = open()?;
     assert_eq!(search(&cached_mode, "quick brown fox")?, remote_hits);
     std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    Ok(())
+}
+
+#[test]
+fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
+    let _env = ENV_LOCK.lock().expect("env lock");
+    let objects: BTreeMap<String, Vec<u8>> = (0..30)
+        .map(|index| {
+            let body = if index % 3 == 0 {
+                format!("padding line for document {index}\nthe rare needle lives here {index}\n")
+            } else {
+                format!("padding line for document {index}\nplain body {index}\n")
+            };
+            (format!("doc-{index:03}.txt"), body.into_bytes())
+        })
+        .collect();
+    let listing: Vec<(String, String, u64)> = objects
+        .iter()
+        .map(|(key, body)| {
+            (
+                key.clone(),
+                format!("{:016x}", holys3_core::hash_ngram(body)),
+                body.len() as u64,
+            )
+        })
+        .collect();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let corpus_for = |shard: &[(String, String, u64)]| {
+        let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
+        let bodies = keys.iter().map(|key| objects[key].clone()).collect();
+        MemCorpus::new(keys, bodies)
+    };
+    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Sparse,
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(corpus_for(shard))),
+    )?;
+
+    let hits = |label: &str| -> Result<usize> {
+        let reader = SegmentedReader::open(
+            Box::new(LocalBlobStore::new(store_dir.path())),
+            cache_dir.path(),
+            &test_source(),
+        )?;
+        let count = search(&reader, "rare needle lives")?.len();
+        let _ = label;
+        Ok(count)
+    };
+
+    assert_eq!(hits("cold")?, 10);
+    let range_files = |dir: &Path| -> usize {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .flat_map(|seg| {
+                std::fs::read_dir(seg.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("pack-") || name.starts_with("postings-")
+            })
+            .count()
+    };
+    assert!(range_files(cache_dir.path()) > 0, "cache populated");
+
+    // A one-byte cap forces the open-time sweep to evict everything; the
+    // sweep runs at open, before any search can repopulate.
+    std::env::set_var("HOLYS3_CACHE_MAX", "1");
+    let swept = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    assert_eq!(
+        range_files(cache_dir.path()),
+        0,
+        "cap of 1 byte evicts all range files"
+    );
+    assert_eq!(search(&swept, "rare needle lives")?.len(), 10);
+    drop(swept);
+
+    // Zero disables range caching: correct results, no new cache writes.
+    std::env::set_var("HOLYS3_CACHE_MAX", "0");
+    let before = range_files(cache_dir.path());
+    assert_eq!(hits("disabled")?, 10);
+    assert_eq!(
+        range_files(cache_dir.path()),
+        before,
+        "disabled cache must not write range files"
+    );
+    std::env::remove_var("HOLYS3_CACHE_MAX");
     Ok(())
 }

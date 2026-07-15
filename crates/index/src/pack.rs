@@ -1,3 +1,4 @@
+use crate::segment::cache::{read_verified, write_back};
 use anyhow::{Context, Result};
 use holys3_core::{BlobStore, DocumentBody, DocumentSpool};
 use serde::{Deserialize, Serialize};
@@ -275,6 +276,7 @@ fn block_runs(
 
 fn visit_blocks(
     store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
     packs: &[PackMeta],
     blocks: &[PackBlock],
     runs: &[PackRun],
@@ -286,7 +288,30 @@ fn visit_blocks(
         let pack = packs.get(pack_id).context("pack ID is out of bounds")?;
         for batch in run_batches(pack_runs, batch_bytes) {
             let batch = &pack_runs[batch];
-            let ranges = batch
+            let mut fetches = Vec::with_capacity(batch.len());
+            for run in batch {
+                // A run is served from disk only when every block hits, so a
+                // fetched run stays one contiguous range; each hit re-verifies
+                // against the docs.bin block hash before use.
+                let cached: Option<Vec<Vec<u8>>> = cache.and_then(|cache| {
+                    run.blocks
+                        .iter()
+                        .map(|block_id| cache.read(pack, &blocks[*block_id]))
+                        .collect()
+                });
+                match cached {
+                    Some(compressed_blocks) => {
+                        for (block_id, compressed) in run.blocks.iter().zip(compressed_blocks) {
+                            visit_compressed_block(blocks, *block_id, &compressed, visit)?;
+                        }
+                    }
+                    None => fetches.push(run),
+                }
+            }
+            if fetches.is_empty() {
+                continue;
+            }
+            let ranges = fetches
                 .iter()
                 .map(|run| (run.offset, run.len))
                 .collect::<Vec<_>>();
@@ -298,12 +323,12 @@ fn visit_blocks(
             );
             let fetched = store.get_ranges(&pack_blob(&pack.hash), &ranges)?;
             anyhow::ensure!(
-                fetched.len() == batch.len(),
+                fetched.len() == fetches.len(),
                 "get_ranges returned {} ranges for {} requests",
                 fetched.len(),
-                batch.len()
+                fetches.len()
             );
-            for (run, bytes) in batch.iter().zip(fetched) {
+            for (run, bytes) in fetches.iter().zip(fetched) {
                 anyhow::ensure!(bytes.len() as u64 == run.len, "pack range length mismatch");
                 let mut cursor = 0usize;
                 for block_id in &run.blocks {
@@ -314,17 +339,10 @@ fn visit_blocks(
                     let compressed = bytes
                         .get(cursor..end)
                         .context("pack range ended inside a block")?;
-                    anyhow::ensure!(
-                        <[u8; 32]>::from(Sha256::digest(compressed)) == block.hash,
-                        "pack block hash mismatch"
-                    );
-                    let decoded =
-                        zstd::bulk::decompress(compressed, usize::try_from(block.decoded_len)?)?;
-                    anyhow::ensure!(
-                        decoded.len() == usize::try_from(block.decoded_len)?,
-                        "pack block decoded length mismatch"
-                    );
-                    visit(*block_id, decoded)?;
+                    if let Some(cache) = cache {
+                        cache.store(pack, block, compressed);
+                    }
+                    visit_compressed_block(blocks, *block_id, compressed, visit)?;
                     cursor = end;
                 }
                 anyhow::ensure!(cursor == bytes.len(), "unparsed bytes remain in pack range");
@@ -332,6 +350,25 @@ fn visit_blocks(
         }
     }
     Ok(())
+}
+
+fn visit_compressed_block(
+    blocks: &[PackBlock],
+    block_id: usize,
+    compressed: &[u8],
+    visit: &mut dyn FnMut(usize, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let block = &blocks[block_id];
+    anyhow::ensure!(
+        <[u8; 32]>::from(Sha256::digest(compressed)) == block.hash,
+        "pack block hash mismatch"
+    );
+    let decoded = zstd::bulk::decompress(compressed, usize::try_from(block.decoded_len)?)?;
+    anyhow::ensure!(
+        decoded.len() == usize::try_from(block.decoded_len)?,
+        "pack block decoded length mismatch"
+    );
+    visit(block_id, decoded)
 }
 
 fn run_batches(runs: &[PackRun], max_bytes: u64) -> impl Iterator<Item = Range<usize>> + '_ {
@@ -362,6 +399,7 @@ fn is_large_request(request: &PackRequest) -> bool {
 
 fn fetch_window(
     store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
     packs: &[PackMeta],
     blocks: &[PackBlock],
     requests: &[PackRequest],
@@ -379,6 +417,7 @@ fn fetch_window(
     let mut decoded = BTreeMap::new();
     visit_blocks(
         store,
+        cache,
         packs,
         blocks,
         &runs,
@@ -437,6 +476,7 @@ fn fetch_window(
 
 fn fetch_large(
     store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
     packs: &[PackMeta],
     blocks: &[PackBlock],
     request: &PackRequest,
@@ -450,6 +490,7 @@ fn fetch_large(
     let mut output_offset = 0u64;
     visit_blocks(
         store,
+        cache,
         packs,
         blocks,
         &runs,
@@ -471,8 +512,37 @@ fn fetch_large(
     consume(request.index, spool.finish()?)
 }
 
+/// Where verified compressed pack blocks persist between queries. Keys live
+/// under the segment cache dir so stale-segment eviction cleans them; every
+/// hit re-verifies against the block hash recorded in the (whole-file
+/// verified) docs.bin block table, so the cache adds no trust surface.
+pub(crate) struct PackBlockCache<'a> {
+    pub(crate) cache_dir: &'a std::path::Path,
+    pub(crate) seg_id: &'a str,
+}
+
+impl PackBlockCache<'_> {
+    fn block_path(&self, pack: &PackMeta, block: &PackBlock) -> std::path::PathBuf {
+        self.cache_dir
+            .join(self.seg_id)
+            .join(format!("pack-{}-{:016x}", pack.hash, block.offset))
+    }
+
+    fn read(&self, pack: &PackMeta, block: &PackBlock) -> Option<Vec<u8>> {
+        read_verified(
+            &self.block_path(pack, block),
+            &crate::sparse_table::hex(&block.hash),
+        )
+    }
+
+    fn store(&self, pack: &PackMeta, block: &PackBlock, compressed: &[u8]) {
+        write_back(self.cache_dir, &self.block_path(pack, block), compressed).ok();
+    }
+}
+
 pub(crate) fn fetch_documents(
     store: &dyn BlobStore,
+    cache: Option<&PackBlockCache<'_>>,
     packs: &[PackMeta],
     blocks: &[PackBlock],
     requests: &[PackRequest],
@@ -480,9 +550,16 @@ pub(crate) fn fetch_documents(
 ) -> Result<()> {
     for window in request_windows(requests) {
         if window.len() == 1 && is_large_request(&requests[window.start]) {
-            fetch_large(store, packs, blocks, &requests[window.start], consume)?;
+            fetch_large(
+                store,
+                cache,
+                packs,
+                blocks,
+                &requests[window.start],
+                consume,
+            )?;
         } else {
-            fetch_window(store, packs, blocks, &requests[window], consume)?;
+            fetch_window(store, cache, packs, blocks, &requests[window], consume)?;
         }
     }
     Ok(())

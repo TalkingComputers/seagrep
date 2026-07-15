@@ -895,6 +895,7 @@ pub struct SegmentedReader {
     root_version: String,
     strategy: Strategy,
     segments: Vec<Segment>,
+    range_cache: bool,
 }
 
 impl SegmentedReader {
@@ -944,12 +945,17 @@ impl SegmentedReader {
             segments.push(segment);
         }
         evict_stale_segments(cache_dir, &segments);
+        let range_cache = range_cache_max()? > 0;
+        if range_cache {
+            evict_range_cache(cache_dir, range_cache_max()?);
+        }
         Ok(SegmentedReader {
             store,
             cache_dir: cache_dir.to_path_buf(),
             root_version,
             strategy,
             segments,
+            range_cache,
         })
     }
 
@@ -1065,17 +1071,57 @@ impl SegmentedReader {
                 |needed| {
                     let doc_count = segment.meta.doc_count;
                     let ranges = posting_ranges(needed, doc_count, segment.meta.postings_len)?;
-                    let blocks = self.store.get_ranges(&postings_name, &ranges)?;
-                    anyhow::ensure!(
-                        blocks.len() == ranges.len(),
-                        "get_ranges returned {} blocks for {} ranges",
-                        blocks.len(),
-                        ranges.len()
-                    );
+                    let range_path = |offset: u64, len: u64| {
+                        self.cache_dir
+                            .join(&segment.meta.seg_id)
+                            .join(format!("postings-{offset:016x}-{len:x}"))
+                    };
+                    let mut cached: Vec<Option<bytes::Bytes>> = ranges
+                        .iter()
+                        .map(|&(offset, len)| {
+                            if !self.range_cache {
+                                return None;
+                            }
+                            cache::read_self_anchored(&range_path(offset, len))
+                                .map(bytes::Bytes::from)
+                        })
+                        .collect();
+                    let missing: Vec<(u64, u64)> = ranges
+                        .iter()
+                        .zip(&cached)
+                        .filter(|(_, hit)| hit.is_none())
+                        .map(|(&range, _)| range)
+                        .collect();
+                    if !missing.is_empty() {
+                        let fetched = self.store.get_ranges(&postings_name, &missing)?;
+                        anyhow::ensure!(
+                            fetched.len() == missing.len(),
+                            "get_ranges returned {} blocks for {} ranges",
+                            fetched.len(),
+                            missing.len()
+                        );
+                        let mut fetched = fetched.into_iter();
+                        for (slot, &(offset, len)) in cached.iter_mut().zip(&ranges) {
+                            if slot.is_none() {
+                                let bytes =
+                                    fetched.next().context("missing fetched posting range")?;
+                                if self.range_cache {
+                                    cache::write_self_anchored(
+                                        &self.cache_dir,
+                                        &range_path(offset, len),
+                                        &bytes,
+                                    )
+                                    .ok();
+                                }
+                                *slot = Some(bytes);
+                            }
+                        }
+                    }
                     needed
                         .iter()
-                        .zip(blocks)
+                        .zip(cached)
                         .map(|((&offset, &count), bytes)| {
+                            let bytes = bytes.context("missing posting range")?;
                             Ok((
                                 offset,
                                 crate::decode_posting_block(&bytes, count, doc_count)?,
@@ -1307,6 +1353,64 @@ fn detect_strategy(
     Ok(strategy)
 }
 
+/// Byte cap for the on-disk pack/postings range cache. `HOLYS3_CACHE_MAX`
+/// overrides; `0` disables range caching entirely (gram-block and whole-file
+/// caches are unaffected — they are bounded and load-bearing).
+fn range_cache_max() -> Result<u64> {
+    const DEFAULT_MAX: u64 = 4 * 1024 * 1024 * 1024;
+    match std::env::var("HOLYS3_CACHE_MAX") {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("HOLYS3_CACHE_MAX is not a byte count: {value:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Best-effort size cap for range-cache files (`pack-*`, `postings-*`):
+/// when they exceed the cap, the oldest-modified files go first until usage
+/// drops under three quarters of it. Whole-file and gram-block caches are
+/// never touched; stale-segment eviction remains the primary cleaner.
+fn evict_range_cache(cache_dir: &Path, max_bytes: u64) {
+    let Ok(segments) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    for segment in segments.flatten() {
+        let Ok(entries) = std::fs::read_dir(segment.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("pack-") || name.starts_with("postings-")) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            total = total.saturating_add(meta.len());
+            files.push((modified, meta.len(), entry.path()));
+        }
+    }
+    if total <= max_bytes {
+        return;
+    }
+    files.sort_unstable_by_key(|(modified, _, _)| *modified);
+    let target = max_bytes / 4 * 3;
+    for (_, len, path) in files {
+        if total <= target {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+}
+
 fn load_segment(
     store: &dyn BlobStore,
     cache_dir: &Path,
@@ -1457,8 +1561,13 @@ impl holys3_core::DocFetcher for SegmentedReader {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let pack_cache = crate::pack::PackBlockCache {
+                cache_dir: &self.cache_dir,
+                seg_id: &segment.meta.seg_id,
+            };
             let fetched = crate::pack::fetch_documents(
                 self.store.as_ref(),
+                self.range_cache.then_some(&pack_cache),
                 &segment.meta.packs,
                 &tables.blocks,
                 &requests,
