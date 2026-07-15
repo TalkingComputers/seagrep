@@ -27,7 +27,7 @@ pub fn is_prose_like(data: &[u8]) -> Option<bool> {
     for &byte in data {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' => alpha += 1,
-            b' ' | b'\n' => space += 1,
+            b' ' | b'\n' | b'\r' | b'\t' => space += 1,
             b'0'..=b'9' => digit += 1,
             b'{' | b'}' | b'[' | b']' | b'"' | b':' | b',' | b'=' | b'<' | b'>' | b'(' | b')'
             | b';' | b'_' | b'/' | b'\\' => structural += 1,
