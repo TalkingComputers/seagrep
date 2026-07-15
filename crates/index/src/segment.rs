@@ -354,7 +354,10 @@ pub fn update_index(
     let strategy = match strategy {
         Some(strategy) => strategy,
         None => match (&root, rebuild) {
-            (RootState::Loaded(list), false) => list.strategy,
+            // Follow the recorded strategy only once the index holds real
+            // content: an empty first build (e.g. watch mode on an empty
+            // bucket) must re-detect when documents finally arrive.
+            (RootState::Loaded(list), false) if !list.segments.is_empty() => list.strategy,
             _ => detect_strategy(listing, make_corpus)?,
         },
     };
@@ -1171,11 +1174,24 @@ fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
 
 /// Collects the decoded logical text of one sampled source — archives
 /// expanded into member text, exactly as indexing ingests them — capped at
-/// the sampling window.
+/// the sampling window. Reaching the cap raises `SampleWindowFull` so the
+/// decoder stops immediately: a sampled source must never cost more than
+/// its window, no matter how far its contents expand.
 struct SampleWindow {
     window: Vec<u8>,
     cap: usize,
 }
+
+#[derive(Debug)]
+struct SampleWindowFull;
+
+impl std::fmt::Display for SampleWindowFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sample window is full")
+    }
+}
+
+impl std::error::Error for SampleWindowFull {}
 
 impl holys3_core::DecodeSink for SampleWindow {
     fn begin(&mut self, _: &holys3_core::LogicalDocumentMeta) -> Result<()> {
@@ -1186,6 +1202,9 @@ impl holys3_core::DecodeSink for SampleWindow {
         let room = self.cap - self.window.len();
         self.window
             .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        if self.window.len() >= self.cap {
+            return Err(anyhow::Error::new(SampleWindowFull));
+        }
         Ok(())
     }
 
@@ -1211,11 +1230,23 @@ fn detect_strategy(
         .filter(|(_, _, size)| *size <= SAMPLE_MAX_ENCODED)
         .cloned()
         .collect();
-    let step = (small.len() / SAMPLE_DOCS).max(1);
+    let small_bytes: u64 = small.iter().map(|(_, _, size)| *size).sum();
+    let listing_bytes: u64 = listing.iter().map(|(_, _, size)| *size).sum();
+    // Sampleable objects must carry real weight: when almost all bytes live
+    // in objects too large to sample, a tiny small-file minority must not
+    // choose the strategy for a corpus it does not represent.
+    if listing_bytes > 0 && small_bytes * 10 < listing_bytes {
+        eprintln!(
+            "note: content is dominated by objects too large to sample; using the trigram strategy (--strategy overrides)"
+        );
+        return Ok(Strategy::Trigram);
+    }
+    let step = small.len().div_ceil(SAMPLE_DOCS).max(1);
     let picks: Vec<(String, String, u64)> =
         small.into_iter().step_by(step).take(SAMPLE_DOCS).collect();
     let mut prose_bytes = 0u64;
     let mut classified_bytes = 0u64;
+    let mut classified_docs = 0usize;
     if !picks.is_empty() {
         let corpus = make_corpus(&picks)?;
         for (idx, (key, _, _)) in picks.iter().enumerate() {
@@ -1226,22 +1257,36 @@ fn detect_strategy(
                 window: Vec::new(),
                 cap: SAMPLE_WINDOW,
             };
-            if holys3_core::decode_source(key, bytes, holys3_core::DECODE_LIMITS, &mut sample)
-                .is_err()
+            if let Err(error) =
+                holys3_core::decode_source(key, bytes, holys3_core::DECODE_LIMITS, &mut sample)
             {
-                continue;
+                if !error.is::<SampleWindowFull>() {
+                    continue;
+                }
             }
             match holys3_core::is_prose_like(&sample.window) {
                 Some(true) => {
                     prose_bytes += sample.window.len() as u64;
                     classified_bytes += sample.window.len() as u64;
+                    classified_docs += 1;
                 }
-                Some(false) => classified_bytes += sample.window.len() as u64,
+                Some(false) => {
+                    classified_bytes += sample.window.len() as u64;
+                    classified_docs += 1;
+                }
                 None => {}
             }
         }
     }
-    let strategy = if classified_bytes > 0 && prose_bytes * 3 >= classified_bytes * 2 {
+    // A vote needs quorum: if most samples vanished or failed to decode,
+    // the survivors do not speak for the corpus.
+    if classified_bytes == 0 || classified_docs * 2 < picks.len() {
+        eprintln!(
+            "note: not enough content could be sampled; using the trigram strategy (--strategy overrides)"
+        );
+        return Ok(Strategy::Trigram);
+    }
+    let strategy = if prose_bytes * 3 >= classified_bytes * 2 {
         Strategy::Sparse
     } else {
         Strategy::Trigram

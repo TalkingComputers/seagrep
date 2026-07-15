@@ -10,6 +10,11 @@
 
 /// Whether decoded content reads as natural-language prose. `None` when the
 /// sample is too short to judge.
+///
+/// Only ASCII letters count as alphabetic, so non-Latin prose (CJK, heavy
+/// diacritics) classifies as structured and gets the trigram strategy — the
+/// conservative direction, since multi-byte scripts produce high-entropy
+/// trigrams that prune well.
 pub fn is_prose_like(data: &[u8]) -> Option<bool> {
     const MIN_SAMPLE_BYTES: usize = 256;
     if data.len() < MIN_SAMPLE_BYTES {
