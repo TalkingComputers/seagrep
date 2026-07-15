@@ -12,7 +12,7 @@ use std::mem::size_of;
 use std::ops::Range;
 use tempfile::TempPath;
 
-/// Posting-run temp files are read and written in bulk; the BufReader default
+/// Posting-run temp files are read and written in bulk; the `BufReader` default
 /// of 8 KiB makes buffer refills a measurable share of merge time.
 const RUN_IO_BUFFER_BYTES: usize = 256 * 1024;
 
