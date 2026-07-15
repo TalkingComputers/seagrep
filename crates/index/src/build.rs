@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::Path;
 
 mod runs;
 
@@ -21,7 +20,7 @@ pub(super) use runs::{
 };
 pub(super) use runs::{
     collect_file_trigrams, key_bytes, merge_posting_runs, write_posting_record, write_posting_runs,
-    IndexedGrams,
+    IndexedGrams, MergedBlob,
 };
 
 /// Docs are fetched and gram-extracted in chunks bounded BOTH by doc count
@@ -102,30 +101,6 @@ pub(super) fn build_chunks(sources: &[SourceObject]) -> impl Iterator<Item = Ran
     })
 }
 
-/// Build terms.fst + postings.bin over the corpus. Also returns the ids of
-/// docs that contributed NO grams because they vanished mid-build (404) or
-/// failed to decompress. Transient fetch misses retry on the next run;
-/// unchanged decode failures wait for the object to change.
-pub(crate) struct TempBlob {
-    file: tempfile::NamedTempFile,
-    len: u64,
-    hash: String,
-}
-
-impl TempBlob {
-    pub(crate) fn path(&self) -> &Path {
-        self.file.path()
-    }
-
-    pub(crate) fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub(crate) fn hash(&self) -> &str {
-        &self.hash
-    }
-}
-
 struct HashWriter<W> {
     inner: W,
     hasher: Sha256,
@@ -163,8 +138,7 @@ impl<W: Write> Write for HashWriter<W> {
 }
 
 pub(crate) struct BuiltIndexFiles {
-    pub fst: TempBlob,
-    pub postings: TempBlob,
+    pub runs: Vec<tempfile::TempPath>,
     pub tables: SegmentTables,
     pub packs: Vec<PackFile>,
 }
@@ -677,11 +651,8 @@ pub(crate) fn build_index_files(
     let packed = pack_builder.finish()?;
     tables.blocks = packed.blocks;
     tables.validate()?;
-    let (fst, postings) =
-        merge_posting_runs(runs, strategy, u32::try_from(tables.documents.len())?)?;
     Ok(BuiltIndexFiles {
-        fst,
-        postings,
+        runs,
         tables,
         packs: packed.packs,
     })

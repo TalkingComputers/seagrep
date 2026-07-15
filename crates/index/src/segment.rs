@@ -735,13 +735,8 @@ fn write_bounded_segments(
     let corpus = make_corpus(docs)?;
     match build_segment_files(corpus.as_ref(), strategy, docs, doc_cap, progress) {
         Ok(built) => {
-            let meta = put_segment_files(
-                store,
-                &built.fst,
-                &built.postings,
-                &built.tables,
-                &built.packs,
-            )?;
+            let meta =
+                merge_and_put_segment(store, strategy, built.runs, &built.tables, &built.packs)?;
             return Ok(vec![meta]);
         }
         Err(error) if error.is::<crate::DocumentCapExceeded>() => {}
@@ -772,10 +767,20 @@ fn write_bounded_segments(
     Ok(segments)
 }
 
-fn put_segment_files(
+/// Segment IDs are random, not content-derived: every blob hash a reader
+/// trusts is recorded in segments.bin, and a random ID is known before the
+/// merge runs, so the dictionary and postings stream to their final keys
+/// while the merge produces them.
+fn random_seg_id() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)?;
+    Ok(hex_encode(&bytes))
+}
+
+pub(crate) fn merge_and_put_segment(
     store: &dyn BlobStore,
-    fst: &crate::TempBlob,
-    postings: &crate::TempBlob,
+    strategy: Strategy,
+    runs: Vec<tempfile::TempPath>,
     tables: &SegmentTables,
     packs: &[PackFile],
 ) -> Result<SegmentMeta> {
@@ -807,31 +812,44 @@ fn put_segment_files(
         );
     }
     let docs_bytes = postcard::to_allocvec(tables)?;
-    let pack_bytes = postcard::to_allocvec(&pack_metas)?;
-    let terms_fst_hash = fst.hash().to_owned();
-    let postings_hash = postings.hash().to_owned();
     let docs_hash = sha256_hex(&[&docs_bytes]);
-    let seg_id = sha256_hex(&[
-        terms_fst_hash.as_bytes(),
-        postings_hash.as_bytes(),
-        docs_hash.as_bytes(),
-        &pack_bytes,
-    ]);
+    let seg_id = random_seg_id()?;
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
     }
-    store.put_file(&segment_blob(&seg_id, "terms.fst"), fst.path())?;
-    store.put_file(&segment_blob(&seg_id, "postings.bin"), postings.path())?;
-    store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
-    let terms_tail_hash = crate::sparse_table::tail_hash_of(fst.path())?.unwrap_or_default();
+    let publish = || -> Result<(crate::build::MergedBlob, crate::build::MergedBlob, String)> {
+        let terms_sink = store.put_streaming(&segment_blob(&seg_id, "terms.fst"))?;
+        let postings_sink = store.put_streaming(&segment_blob(&seg_id, "postings.bin"))?;
+        let merged = crate::build::merge_posting_runs(
+            runs,
+            strategy,
+            u32::try_from(tables.documents.len())?,
+            terms_sink,
+            postings_sink,
+        )?;
+        store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
+        Ok(merged)
+    };
+    let (fst, postings, terms_tail_hash) = match publish() {
+        Ok(merged) => merged,
+        Err(error) => {
+            // Random-keyed blobs from a failed publish are unreferenced and
+            // invisible to readers; delete them so they don't wait for GC.
+            // Packs stay: they are content-addressed and may be shared.
+            for name in ["terms.fst", "postings.bin", "docs.bin"] {
+                store.delete(&segment_blob(&seg_id, name)).ok();
+            }
+            return Err(error);
+        }
+    };
     let meta = SegmentMeta {
         seg_id,
         doc_count: u32::try_from(tables.documents.len())?,
-        terms_fst_len: fst.len(),
-        terms_fst_hash,
+        terms_fst_len: fst.len,
+        terms_fst_hash: fst.hash,
         terms_tail_hash,
-        postings_len: postings.len(),
-        postings_hash,
+        postings_len: postings.len,
+        postings_hash: postings.hash,
         docs_len: docs_bytes.len() as u64,
         docs_hash,
         min_key: tables.sources[0].key.clone(),
@@ -1566,8 +1584,6 @@ mod tests {
         let store = holys3_core::LocalBlobStore::new(store_dir.path());
         let mut segments = Vec::new();
         let mut listing = Vec::new();
-        let (fst, postings) =
-            crate::build::merge_posting_runs(Vec::new(), Strategy::Trigram, 1).unwrap();
         for index in 0..=SEGMENT_COUNT_TARGET {
             let key = format!("doc-{index}");
             let tables = SegmentTables {
@@ -1602,8 +1618,14 @@ mod tests {
             let packed = builder.finish().unwrap();
             let mut tables = tables;
             tables.blocks = packed.blocks;
-            let mut meta =
-                put_segment_files(&store, &fst, &postings, &tables, &packed.packs).unwrap();
+            let mut meta = merge_and_put_segment(
+                &store,
+                Strategy::Trigram,
+                Vec::new(),
+                &tables,
+                &packed.packs,
+            )
+            .unwrap();
             meta.postings_len = MERGE_POSTINGS_CAP + 1;
             segments.push(meta);
             listing.push((key, "v1".to_owned(), 1));

@@ -1,8 +1,8 @@
-use super::{HashWriter, TempBlob};
+use super::HashWriter;
 use crate::terms::TermBuilder;
 use crate::{encode_posting_block, eval};
 use anyhow::{Context, Result};
-use holys3_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy};
+use holys3_core::{iterate_sparse_grams, start_sparse_gram_ranges, DocId, Strategy, StreamingPut};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -690,11 +690,43 @@ pub(crate) fn collapse_posting_runs(
     Ok(runs)
 }
 
-pub(crate) fn merge_posting_runs(
+/// A finished streamed blob: its byte length and whole-content SHA-256.
+pub(crate) struct MergedBlob {
+    pub(crate) len: u64,
+    pub(crate) hash: String,
+}
+
+/// `io::Write` over a `StreamingPut` so the hashing/buffering writer stack
+/// feeds a streaming upload instead of a temp file.
+struct SinkWriter<'a> {
+    sink: Box<dyn StreamingPut + 'a>,
+    written: u64,
+}
+
+impl Write for SinkWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.sink.write(bytes).map_err(std::io::Error::other)?;
+        self.written += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Merge sorted posting runs directly into streaming uploads of the term
+/// dictionary and postings file. Both sinks are finished on success; on any
+/// error they are dropped, which aborts the underlying uploads. Returns the
+/// terms blob, the postings blob, and the sparse index-tail hash (empty for
+/// trigram dictionaries).
+pub(crate) fn merge_posting_runs<'a>(
     runs: Vec<TempPath>,
     strategy: Strategy,
     doc_count: u32,
-) -> Result<(TempBlob, TempBlob)> {
+    terms_sink: Box<dyn StreamingPut + 'a>,
+    postings_sink: Box<dyn StreamingPut + 'a>,
+) -> Result<(MergedBlob, MergedBlob, String)> {
     let paths = collapse_posting_runs(runs, strategy)?;
     let mut runs = paths
         .iter()
@@ -711,9 +743,13 @@ pub(crate) fn merge_posting_runs(
             heap.push(Reverse((gram, id, run_idx)));
         }
     }
-    let fst = tempfile::NamedTempFile::new()?;
-    let postings = tempfile::NamedTempFile::new()?;
-    let mut postings_writer = BufWriter::new(HashWriter::new(postings.reopen()?));
+    let mut postings_writer = BufWriter::with_capacity(
+        RUN_IO_BUFFER_BYTES,
+        HashWriter::new(SinkWriter {
+            sink: postings_sink,
+            written: 0,
+        }),
+    );
     let run_bytes = paths.iter().try_fold(0u64, |total, path| -> Result<u64> {
         total
             .checked_add(std::fs::metadata(path)?.len())
@@ -723,7 +759,13 @@ pub(crate) fn merge_posting_runs(
     let mut builder = TermBuilder::new(
         strategy,
         is_sharded,
-        BufWriter::new(HashWriter::new(fst.reopen()?)),
+        BufWriter::with_capacity(
+            RUN_IO_BUFFER_BYTES,
+            HashWriter::new(SinkWriter {
+                sink: terms_sink,
+                written: 0,
+            }),
+        ),
     )?;
     let mut postings_len = 0u64;
     let mut current_key: Option<u64> = None;
@@ -760,34 +802,36 @@ pub(crate) fn merge_posting_runs(
             doc_count,
         )?;
     }
-    let mut fst_writer = builder.finish()?;
+    let (mut fst_writer, tail_hash) = builder.finish()?;
     fst_writer.flush()?;
     postings_writer.flush()?;
-    let (_, fst_hash) = fst_writer
+    let (fst_sink, fst_hash) = fst_writer
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?
         .finish();
-    let (_, postings_hash) = postings_writer
+    let (postings_sink, postings_hash) = postings_writer
         .into_inner()
         .map_err(std::io::IntoInnerError::into_error)?
         .finish();
-    let fst_len = fst.as_file().metadata()?.len();
-    let written_postings_len = postings.as_file().metadata()?.len();
     anyhow::ensure!(
-        postings_len == written_postings_len,
-        "postings writer tracked {postings_len} bytes but wrote {written_postings_len}"
+        postings_len == postings_sink.written,
+        "postings writer tracked {postings_len} bytes but streamed {}",
+        postings_sink.written
     );
+    let fst_len = fst_sink.written;
+    let postings_written = postings_sink.written;
+    fst_sink.sink.finish()?;
+    postings_sink.sink.finish()?;
     Ok((
-        TempBlob {
-            file: fst,
+        MergedBlob {
             len: fst_len,
             hash: fst_hash,
         },
-        TempBlob {
-            file: postings,
-            len: written_postings_len,
+        MergedBlob {
+            len: postings_written,
             hash: postings_hash,
         },
+        tail_hash.unwrap_or_default(),
     ))
 }
 

@@ -19,6 +19,7 @@ use url::Url;
 
 mod download;
 mod upload;
+pub(crate) use upload::StreamingUpload;
 
 #[cfg(test)]
 use download::coalesce_ranges;

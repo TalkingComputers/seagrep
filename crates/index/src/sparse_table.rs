@@ -4,7 +4,7 @@
 //! ranged reads without downloading the whole dictionary.
 
 use anyhow::{Context, Result};
-use sha2::Digest;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 
 pub(crate) const SPARSE_TABLE_MAGIC: &[u8; 8] = b"H3SPARSE";
@@ -65,7 +65,7 @@ impl<W: Write> SparseTableWriter<W> {
         if self.block.is_empty() {
             return Ok(());
         }
-        let hash = <[u8; 32]>::from(sha2::Sha256::digest(&self.block));
+        let hash = <[u8; 32]>::from(Sha256::digest(&self.block));
         self.index.push(SparseBlockRef {
             first_hash: self.block_first_hash,
             offset: self.written,
@@ -78,20 +78,32 @@ impl<W: Write> SparseTableWriter<W> {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<W> {
+    /// Returns the writer and the SHA-256 of the index+footer tail — the
+    /// hash segment metadata records so remote readers can trust a ranged
+    /// fetch of just the block index.
+    pub(crate) fn finish(mut self) -> Result<(W, String)> {
         self.flush_block()?;
         let index_offset = self.written;
+        let mut tail = Sha256::new();
+        let emit = |writer: &mut W, tail: &mut Sha256, bytes: &[u8]| -> Result<()> {
+            tail.update(bytes);
+            writer.write_all(bytes)?;
+            Ok(())
+        };
         for block in &self.index {
-            self.writer.write_all(&block.first_hash.to_le_bytes())?;
-            self.writer.write_all(&block.offset.to_le_bytes())?;
-            self.writer.write_all(&block.hash)?;
+            emit(&mut self.writer, &mut tail, &block.first_hash.to_le_bytes())?;
+            emit(&mut self.writer, &mut tail, &block.offset.to_le_bytes())?;
+            emit(&mut self.writer, &mut tail, &block.hash)?;
         }
-        self.writer.write_all(&self.entry_count.to_le_bytes())?;
-        self.writer
-            .write_all(&(self.index.len() as u64).to_le_bytes())?;
-        self.writer.write_all(&index_offset.to_le_bytes())?;
-        self.writer.write_all(SPARSE_TABLE_MAGIC)?;
-        Ok(self.writer)
+        emit(&mut self.writer, &mut tail, &self.entry_count.to_le_bytes())?;
+        emit(
+            &mut self.writer,
+            &mut tail,
+            &(self.index.len() as u64).to_le_bytes(),
+        )?;
+        emit(&mut self.writer, &mut tail, &index_offset.to_le_bytes())?;
+        emit(&mut self.writer, &mut tail, SPARSE_TABLE_MAGIC)?;
+        Ok((self.writer, hex(&<[u8; 32]>::from(tail.finalize()))))
     }
 }
 
@@ -247,7 +259,9 @@ pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
 }
 
 /// SHA-256 of a finished table file's index+footer tail, or None when the
-/// file is not a sparse table (trigram dictionaries keep an empty hash).
+/// file is not a sparse table. Production records the hash as the writer
+/// streams the tail; this file-derived variant cross-checks that in tests.
+#[cfg(test)]
 pub(crate) fn tail_hash_of(path: &std::path::Path) -> Result<Option<String>> {
     use sha2::Sha256;
     use std::io::{Read, Seek, SeekFrom};
@@ -292,6 +306,20 @@ pub(crate) fn tail_hash_of(path: &std::path::Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_tail_hash_matches_file_derived_tail_hash() {
+        let mut writer = SparseTableWriter::new(Vec::new()).unwrap();
+        for entry in 0..20_000u64 {
+            writer.insert(entry * 3 + 1, entry).unwrap();
+        }
+        let (bytes, streamed) = writer.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terms.fst");
+        std::fs::write(&path, &bytes).unwrap();
+        let derived = tail_hash_of(&path).unwrap().unwrap();
+        assert_eq!(streamed, derived);
+    }
+
     use super::*;
     use sha2::{Digest, Sha256};
 
@@ -300,7 +328,7 @@ mod tests {
         for (hash, value) in entries {
             writer.insert(*hash, *value).unwrap();
         }
-        writer.finish().unwrap()
+        writer.finish().unwrap().0
     }
 
     fn open(bytes: &[u8]) -> SparseTableIndex {

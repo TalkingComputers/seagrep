@@ -25,7 +25,7 @@ use build::{
     pack_file_trigrams, write_posting_record, write_posting_runs, write_trigram_run_merge,
     write_trigram_run_radix, IndexedGrams, PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
 };
-pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded, TempBlob};
+pub(crate) use build::{build_index_files, BuiltIndexFiles, DocumentCapExceeded};
 
 use anyhow::{Context, Result};
 use eval::Selection;
@@ -614,6 +614,7 @@ impl DocFetcher for LocalFetcher {
 mod tests {
     use super::*;
     use holys3_core::testutil::MemCorpus;
+    use holys3_core::BlobStore as _;
     use holys3_core::{LineEvent, LineKind, LocalBlobStore, MatchOptions, SubMatch};
 
     fn test_source() -> SourceIdentity {
@@ -761,29 +762,36 @@ mod tests {
     }
 
     #[test]
-    fn index_build_returns_file_backed_blobs() {
+    fn merged_blobs_stream_with_truthful_hashes() {
         let corpus = MemCorpus::new(
             vec!["a.log".to_owned(), "b.log".to_owned()],
             vec![b"alpha needle".to_vec(), b"beta needle".to_vec()],
         );
         let built = build_index_files(&corpus, Strategy::Trigram, None, None).unwrap();
-        assert_eq!(
-            built.fst.len(),
-            std::fs::metadata(built.fst.path()).unwrap().len()
-        );
-        assert_eq!(
-            built.postings.len(),
-            std::fs::metadata(built.postings.path()).unwrap().len()
-        );
-        assert!(built.fst.len() > 0);
-        assert!(built.postings.len() > 0);
-        for blob in [&built.fst, &built.postings] {
-            let bytes = std::fs::read(blob.path()).unwrap();
+        let doc_count = u32::try_from(built.tables.documents.len()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(dir.path());
+        let (fst, postings, tail) = merge_posting_runs(
+            built.runs,
+            Strategy::Trigram,
+            doc_count,
+            store.put_streaming("terms.fst").unwrap(),
+            store.put_streaming("postings.bin").unwrap(),
+        )
+        .unwrap();
+        assert!(tail.is_empty(), "trigram dictionaries have no sparse tail");
+        for (name, len, hash) in [
+            ("terms.fst", fst.len, &fst.hash),
+            ("postings.bin", postings.len, &postings.hash),
+        ] {
+            let bytes = store.get(name).unwrap().unwrap();
+            assert!(!bytes.is_empty());
+            assert_eq!(bytes.len() as u64, len);
             let expected = Sha256::digest(&bytes)
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            assert_eq!(blob.hash(), expected);
+            assert_eq!(hash, &expected);
         }
     }
 
@@ -840,8 +848,33 @@ mod tests {
         builder.insert(&[0x00, 0x01, 0x02], 1).unwrap();
         builder.insert(&[0x7f, 0x03, 0x04], 2).unwrap();
         builder.insert(&[0xff, 0x05, 0x06], 3).unwrap();
-        let bytes = builder.finish().unwrap();
+        let (bytes, _) = builder.finish().unwrap();
         assert_eq!(&bytes[..8], b"HS3TERM1");
+    }
+
+    /// Merge runs into a scratch store and return (terms bytes, postings
+    /// bytes, sparse tail hash) — the streamed replacement for reading the
+    /// old temp-file blobs.
+    fn merge_to_store(
+        runs: Vec<tempfile::TempPath>,
+        strategy: Strategy,
+        doc_count: u32,
+    ) -> (Vec<u8>, Vec<u8>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(dir.path());
+        let (fst, postings, tail) = merge_posting_runs(
+            runs,
+            strategy,
+            doc_count,
+            store.put_streaming("terms.fst").unwrap(),
+            store.put_streaming("postings.bin").unwrap(),
+        )
+        .unwrap();
+        let terms_bytes = store.get("terms.fst").unwrap().unwrap();
+        let postings_bytes = store.get("postings.bin").unwrap().unwrap();
+        assert_eq!(terms_bytes.len() as u64, fst.len);
+        assert_eq!(postings_bytes.len() as u64, postings.len);
+        (terms_bytes, postings_bytes, tail)
     }
 
     #[test]
@@ -853,8 +886,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let (terms, _) = merge_posting_runs(runs, Strategy::Trigram, 1).unwrap();
-        let bytes = std::fs::read(terms.path()).unwrap();
+        let (bytes, _, _) = merge_to_store(runs, Strategy::Trigram, 1);
         assert_ne!(&bytes[..8], b"HS3TERM1");
     }
 
@@ -872,8 +904,8 @@ mod tests {
         )
         .unwrap();
         assert!(runs.len() > 1);
-        let (terms, postings) = merge_posting_runs(runs, Strategy::Sparse, 1).unwrap();
-        let table = std::fs::read(terms.path()).unwrap();
+        let (table, postings, tail_hash) = merge_to_store(runs, Strategy::Sparse, 1);
+        assert_eq!(tail_hash.len(), 64);
         let index = sparse_table::SparseTableIndex::parse(table.len() as u64, &table).unwrap();
         let lookup = |hash: u64| -> Option<u64> {
             let block = &index.blocks[index.block_for(hash)?];
@@ -881,7 +913,6 @@ mod tests {
             let end = start + usize::try_from(block.len).unwrap();
             sparse_table::lookup_in_block(&table[start..end], hash).unwrap()
         };
-        let postings = std::fs::read(postings.path()).unwrap();
         let mut expected_hashes: Vec<u64> = expected
             .iter()
             .map(|gram| holys3_core::hash_ngram(gram))
@@ -920,18 +951,10 @@ mod tests {
         let memory = write_posting_runs(memory_docs, Strategy::Sparse, 1 << 20, None).unwrap();
         let spooled =
             write_posting_runs(spooled_docs, Strategy::Sparse, 1 << 20, Some(&spool)).unwrap();
-        let (memory_fst, memory_postings) =
-            merge_posting_runs(memory, Strategy::Sparse, 64).unwrap();
-        let (spooled_fst, spooled_postings) =
-            merge_posting_runs(spooled, Strategy::Sparse, 64).unwrap();
-        assert_eq!(
-            std::fs::read(memory_fst.path()).unwrap(),
-            std::fs::read(spooled_fst.path()).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(memory_postings.path()).unwrap(),
-            std::fs::read(spooled_postings.path()).unwrap()
-        );
+        let (memory_fst, memory_postings, _) = merge_to_store(memory, Strategy::Sparse, 64);
+        let (spooled_fst, spooled_postings, _) = merge_to_store(spooled, Strategy::Sparse, 64);
+        assert_eq!(memory_fst, spooled_fst);
+        assert_eq!(memory_postings, spooled_postings);
     }
 
     #[test]
@@ -972,28 +995,13 @@ mod tests {
             Some(&spool),
         )
         .unwrap();
-        let (memory_fst, memory_postings) =
-            merge_posting_runs(memory, Strategy::Sparse, 1).unwrap();
-        let (streamed_fst, streamed_postings) =
-            merge_posting_runs(streamed, Strategy::Sparse, 1).unwrap();
-        let (spooled_fst, spooled_postings) =
-            merge_posting_runs(spooled, Strategy::Sparse, 1).unwrap();
-        assert_eq!(
-            std::fs::read(memory_fst.path()).unwrap(),
-            std::fs::read(streamed_fst.path()).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(memory_postings.path()).unwrap(),
-            std::fs::read(streamed_postings.path()).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(memory_fst.path()).unwrap(),
-            std::fs::read(spooled_fst.path()).unwrap()
-        );
-        assert_eq!(
-            std::fs::read(memory_postings.path()).unwrap(),
-            std::fs::read(spooled_postings.path()).unwrap()
-        );
+        let (memory_fst, memory_postings, _) = merge_to_store(memory, Strategy::Sparse, 1);
+        let (streamed_fst, streamed_postings, _) = merge_to_store(streamed, Strategy::Sparse, 1);
+        let (spooled_fst, spooled_postings, _) = merge_to_store(spooled, Strategy::Sparse, 1);
+        assert_eq!(memory_fst, streamed_fst);
+        assert_eq!(memory_postings, streamed_postings);
+        assert_eq!(memory_fst, spooled_fst);
+        assert_eq!(memory_postings, spooled_postings);
     }
 
     #[test]

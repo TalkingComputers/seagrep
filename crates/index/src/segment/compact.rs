@@ -1,7 +1,7 @@
 use super::cache::{cached_blob, cached_file, map_file};
 use super::{
-    put_segment_files, validate_segment_tables, SegmentMeta, MERGE_DOCS_CAP, MERGE_POSTINGS_CAP,
-    MERGE_TERMS_CAP, SEGMENT_COUNT_TARGET, SEGMENT_DOC_CAP,
+    validate_segment_tables, SegmentMeta, MERGE_DOCS_CAP, MERGE_POSTINGS_CAP, MERGE_TERMS_CAP,
+    SEGMENT_COUNT_TARGET, SEGMENT_DOC_CAP,
 };
 use crate::format::{DeadSet, DocEntry, SegmentTables, SourceEntry};
 use crate::pack::{fetch_documents, request_windows, PackBuilder, PackRequest, PackSlice};
@@ -269,7 +269,5 @@ pub(super) fn merge_segments(
         .zip(&remaps)
         .map(|((meta, _), remap)| write_compaction_run(store, cache_dir, strategy, meta, remap))
         .collect::<Result<Vec<_>>>()?;
-    let (fst, postings) =
-        crate::build::merge_posting_runs(runs, strategy, u32::try_from(tables.documents.len())?)?;
-    put_segment_files(store, &fst, &postings, &tables, &packed.packs)
+    crate::segment::merge_and_put_segment(store, strategy, runs, &tables, &packed.packs)
 }

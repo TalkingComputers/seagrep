@@ -1763,3 +1763,147 @@ fn duplicate_listing_fails_before_fetching() -> Result<()> {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+/// A store whose streamed writes fail after a byte budget: the build must
+/// error out and abort the streams, leaving no observable segment blobs.
+struct FailingStreamStore {
+    inner: LocalBlobStore,
+    budget: AtomicUsize,
+}
+
+struct BudgetedPut<'a> {
+    inner: Box<dyn holys3_core::StreamingPut + 'a>,
+    budget: &'a AtomicUsize,
+}
+
+impl holys3_core::StreamingPut for BudgetedPut<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        let before = self.budget.fetch_sub(bytes.len(), Ordering::Relaxed);
+        anyhow::ensure!(
+            before >= bytes.len(),
+            "induced stream failure after byte budget"
+        );
+        self.inner.write(bytes)
+    }
+
+    fn finish(self: Box<Self>) -> Result<()> {
+        self.inner.finish()
+    }
+
+    fn abort(self: Box<Self>) {
+        self.inner.abort();
+    }
+}
+
+impl BlobStore for FailingStreamStore {
+    fn put(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(name, bytes)
+    }
+
+    fn put_file(&self, name: &str, path: &Path) -> Result<()> {
+        self.inner.put_file(name, path)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(name)
+    }
+
+    fn get_range(&self, name: &str, start: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(name, start, len)
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn get_versioned(&self, name: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.inner.get_versioned(name)
+    }
+
+    fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> Result<bool> {
+        self.inner.put_if(name, bytes, expected)
+    }
+
+    fn put_streaming<'a>(&'a self, name: &str) -> Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+        Ok(Box::new(BudgetedPut {
+            inner: self.inner.put_streaming(name)?,
+            budget: &self.budget,
+        }))
+    }
+}
+
+#[test]
+fn failed_streamed_merge_leaves_no_segment_blobs() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    for index in 0..20 {
+        bucket.put(
+            &format!("doc-{index:02}.log"),
+            format!("needle document number {index} with some body text").as_bytes(),
+        );
+    }
+    let store = FailingStreamStore {
+        inner: LocalBlobStore::new(store_dir.path()),
+        budget: AtomicUsize::new(64),
+    };
+    let listing = bucket.listing();
+    let error = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Strategy::Sparse,
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )
+    .expect_err("streamed merge must fail on the induced write error");
+    assert!(
+        format!("{error:#}").contains("induced stream failure"),
+        "{error:#}"
+    );
+    let segments_dir = store_dir.path().join("segments");
+    let leftovers: Vec<_> = std::fs::read_dir(&segments_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .flat_map(|dir| std::fs::read_dir(dir.path()).into_iter().flatten())
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with("terms.fst") || name.ends_with("postings.bin")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "aborted streams must not leave observable blobs: {leftovers:?}"
+    );
+    assert!(store.get("segments.bin")?.is_none(), "no root was swapped");
+    Ok(())
+}
+
+#[test]
+fn segments_with_no_grams_round_trip_empty_postings() -> Result<()> {
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let mut bucket = Bucket::default();
+    bucket.put("tiny-a", b"a");
+    bucket.put("tiny-b", b"b");
+    reindex(
+        &bucket,
+        store_dir.path(),
+        cache_dir.path(),
+        Strategy::Sparse,
+    )?;
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    assert_eq!(search_collect(&reader, "anything")?.0.len(), 0);
+    assert_eq!(reader.total_docs(), 2);
+    Ok(())
+}
