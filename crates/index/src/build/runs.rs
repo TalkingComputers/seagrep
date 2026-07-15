@@ -350,10 +350,17 @@ pub(crate) fn write_posting_runs(
     match strategy {
         Strategy::Trigram => write_trigram_runs(grammed, spool),
         Strategy::Sparse => {
+            // The run budget is aggregate: rayon workers each hold their own
+            // entry set, so the per-writer share shrinks with the pool size
+            // to keep peak memory at the serial envelope.
+            let workers = rayon::current_num_threads().max(1);
+            let worker_run_bytes = (sparse_run_bytes / workers)
+                .max(1 << 20)
+                .min(sparse_run_bytes);
             let runs = grammed
                 .into_par_iter()
                 .map(|(idx, grams)| -> Result<Vec<TempPath>> {
-                    let mut writer = SparseRunWriter::new(idx, sparse_run_bytes)?;
+                    let mut writer = SparseRunWriter::new(idx, worker_run_bytes)?;
                     match grams {
                         IndexedGrams::Sparse(text) => writer.add(&text)?,
                         IndexedGrams::SparseFile(file) => writer.add_file(file)?,
@@ -589,7 +596,7 @@ fn record_bytes(strategy: Strategy) -> usize {
     key_bytes(strategy) + size_of::<DocId>()
 }
 
-fn key_bytes(strategy: Strategy) -> usize {
+pub(crate) fn key_bytes(strategy: Strategy) -> usize {
     match strategy {
         Strategy::Trigram => 3,
         Strategy::Sparse => 8,

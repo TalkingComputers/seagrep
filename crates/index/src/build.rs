@@ -20,7 +20,7 @@ pub(super) use runs::{
     PostingRun, MAX_OPEN_POSTING_RUNS, SPARSE_FILE_CHUNK,
 };
 pub(super) use runs::{
-    collect_file_trigrams, merge_posting_runs, write_posting_record, write_posting_runs,
+    collect_file_trigrams, key_bytes, merge_posting_runs, write_posting_record, write_posting_runs,
     IndexedGrams,
 };
 

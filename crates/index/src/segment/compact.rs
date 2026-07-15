@@ -119,6 +119,10 @@ fn write_compaction_run(
         }
         ids.sort_unstable();
         ids.dedup();
+        anyhow::ensure!(
+            gram.len() == crate::build::key_bytes(strategy),
+            "term map gram width does not match the index strategy"
+        );
         let mut padded = [0u8; 8];
         padded[8 - gram.len()..].copy_from_slice(gram);
         let key = u64::from_be_bytes(padded);
