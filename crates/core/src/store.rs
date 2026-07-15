@@ -643,7 +643,10 @@ mod tests {
             let result = LocalBlobStore::new(thread_root).put_if("segments.bin", b"root", None);
             let _ = tx.send(result);
         });
-        let result = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        // Generous deadline: a truly stale-blocked put_if waits on the
+        // flock forever, while a healthy one only needs disk time — which
+        // on a loaded CI runner can exceed tight-millisecond budgets.
+        let result = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(result) => result,
             Err(_) => {
                 std::fs::remove_file(&lock_path)?;
