@@ -320,11 +320,14 @@ pub type CorpusFactory<'a> = dyn Fn(&[(String, String, u64)]) -> Result<Box<dyn 
 /// Incrementally update the segmented index to match `listing`
 /// ((key, etag, size) triples). `make_corpus` builds a fetchable corpus over
 /// a given listing slice, with ids equal to positions in the slice.
+/// `strategy: None` selects automatically: an existing index keeps its
+/// recorded strategy; a fresh build (or `--rebuild`) samples decoded content
+/// and picks sparse for natural-language prose, trigram otherwise.
 pub fn update_index(
     store: &dyn BlobStore,
     cache_dir: &Path,
     source: &SourceIdentity,
-    strategy: Strategy,
+    strategy: Option<Strategy>,
     listing: &[(String, String, u64)],
     options: UpdateOptions,
     make_corpus: &CorpusFactory<'_>,
@@ -348,6 +351,13 @@ pub fn update_index(
         eprintln!("note: --rebuild requested; re-ingesting everything");
     }
     let (root, root_version) = load_segment_list(store)?;
+    let strategy = match strategy {
+        Some(strategy) => strategy,
+        None => match (&root, rebuild) {
+            (RootState::Loaded(list), false) => list.strategy,
+            _ => detect_strategy(listing, make_corpus)?,
+        },
+    };
     let existing = if rebuild {
         if let RootState::Loaded(list) = root {
             replaced = list.segments;
@@ -1159,6 +1169,63 @@ fn parse_remote_terms_min(configured: Option<&str>) -> Result<u64> {
     }
 }
 
+/// Sample a spread of small listing entries, decode them, and classify the
+/// decoded text: the sparse strategy wins only when at least two thirds of
+/// the sampled bytes read as prose. Objects too large to decode eagerly are
+/// skipped; an unsampleable listing conservatively picks trigram.
+fn detect_strategy(
+    listing: &[(String, String, u64)],
+    make_corpus: &CorpusFactory<'_>,
+) -> Result<Strategy> {
+    const SAMPLE_DOCS: usize = 16;
+    const SAMPLE_MAX_ENCODED: u64 = 32 * 1024 * 1024;
+    const SAMPLE_WINDOW: usize = 256 * 1024;
+    let small: Vec<(String, String, u64)> = listing
+        .iter()
+        .filter(|(_, _, size)| *size <= SAMPLE_MAX_ENCODED)
+        .cloned()
+        .collect();
+    let step = (small.len() / SAMPLE_DOCS).max(1);
+    let picks: Vec<(String, String, u64)> =
+        small.into_iter().step_by(step).take(SAMPLE_DOCS).collect();
+    let mut prose_bytes = 0u64;
+    let mut classified_bytes = 0u64;
+    if !picks.is_empty() {
+        let corpus = make_corpus(&picks)?;
+        for (idx, (key, _, _)) in picks.iter().enumerate() {
+            let Ok(bytes) = corpus.fetch(idx) else {
+                continue;
+            };
+            let Ok(decoded) = holys3_core::decode_body(key, bytes.to_vec()) else {
+                continue;
+            };
+            let window = &decoded[..decoded.len().min(SAMPLE_WINDOW)];
+            match holys3_core::is_prose_like(window) {
+                Some(true) => {
+                    prose_bytes += window.len() as u64;
+                    classified_bytes += window.len() as u64;
+                }
+                Some(false) => classified_bytes += window.len() as u64,
+                None => {}
+            }
+        }
+    }
+    let strategy = if classified_bytes > 0 && prose_bytes * 3 >= classified_bytes * 2 {
+        Strategy::Sparse
+    } else {
+        Strategy::Trigram
+    };
+    match strategy {
+        Strategy::Sparse => eprintln!(
+            "note: sampled content reads as natural-language prose; using the sparse strategy (--strategy overrides)"
+        ),
+        Strategy::Trigram => eprintln!(
+            "note: sampled content reads as structured text; using the trigram strategy (--strategy overrides)"
+        ),
+    }
+    Ok(strategy)
+}
+
 fn load_segment(
     store: &dyn BlobStore,
     cache_dir: &Path,
@@ -1460,7 +1527,7 @@ mod tests {
             &store,
             cache_dir.path(),
             &other,
-            Strategy::Trigram,
+            Some(Strategy::Trigram),
             &[],
             UpdateOptions::default(),
             &|_| anyhow::bail!("source mismatch must fail before fetching"),
@@ -1479,7 +1546,7 @@ mod tests {
             &store,
             cache_dir.path(),
             &test_source(),
-            Strategy::Trigram,
+            Some(Strategy::Trigram),
             &listing,
             UpdateOptions::default(),
             &|_| {
@@ -1643,7 +1710,7 @@ mod tests {
             &store,
             cache_dir.path(),
             &test_source(),
-            Strategy::Trigram,
+            Some(Strategy::Trigram),
             &listing,
             UpdateOptions::default(),
             &|_| anyhow::bail!("unchanged index should not fetch"),
