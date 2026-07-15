@@ -224,7 +224,7 @@ mod tests {
         for (hash, value) in &pairs {
             writer.insert(*hash, *value).unwrap();
         }
-        let bytes = writer.finish().unwrap();
+        let (bytes, _) = writer.finish().unwrap();
         let index = SparseTableIndex::parse(bytes.len() as u64, &bytes).unwrap();
         let tail_offset = usize::try_from(
             index

@@ -111,6 +111,32 @@ impl S3BlobStore {
     }
 }
 
+struct S3StreamingPut {
+    upload: Option<client::StreamingUpload>,
+}
+
+impl holys3_core::StreamingPut for S3StreamingPut {
+    fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.upload
+            .as_mut()
+            .context("streaming put already ended")?
+            .write(bytes)
+    }
+
+    fn finish(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.upload
+            .take()
+            .context("streaming put already ended")?
+            .finish()
+    }
+
+    fn abort(mut self: Box<Self>) {
+        if let Some(upload) = self.upload.take() {
+            upload.abort();
+        }
+    }
+}
+
 impl BlobStore for S3BlobStore {
     fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.client.put_with_progress(
@@ -128,6 +154,19 @@ impl BlobStore for S3BlobStore {
             path,
             self.progress.as_ref(),
         )
+    }
+
+    fn put_streaming<'a>(
+        &'a self,
+        name: &str,
+    ) -> anyhow::Result<Box<dyn holys3_core::StreamingPut + 'a>> {
+        Ok(Box::new(S3StreamingPut {
+            upload: Some(self.client.start_streaming_upload(
+                &self.bucket,
+                &self.build_key(name),
+                self.progress.clone(),
+            )?),
+        }))
     }
 
     fn get(&self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {

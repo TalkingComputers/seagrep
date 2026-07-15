@@ -154,11 +154,16 @@ impl<W: Write> TermBuilder<W> {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<W> {
+    /// Returns the writer and, for sparse dictionaries, the SHA-256 of the
+    /// block-index tail recorded in segment metadata.
+    pub(crate) fn finish(self) -> Result<(W, Option<String>)> {
         match self.inner {
-            TermBuilderInner::Single(builder) => Ok(builder.into_inner()?),
-            TermBuilderInner::Sparse(builder) => builder.finish(),
-            TermBuilderInner::Trigram(builder) => builder.finish(),
+            TermBuilderInner::Single(builder) => Ok((builder.into_inner()?, None)),
+            TermBuilderInner::Sparse(builder) => {
+                let (writer, tail_hash) = builder.finish()?;
+                Ok((writer, Some(tail_hash)))
+            }
+            TermBuilderInner::Trigram(builder) => Ok((builder.finish()?, None)),
         }
     }
 }
@@ -316,7 +321,7 @@ mod tests {
         for (hash, value) in &entries {
             builder.insert(&hash.to_be_bytes(), *value).unwrap();
         }
-        let bytes = builder.finish().unwrap();
+        let (bytes, _) = builder.finish().unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("terms.fst");
@@ -328,7 +333,7 @@ mod tests {
         let mut rebuilt = TermBuilder::new(Strategy::Sparse, false, Vec::new()).unwrap();
         map.visit(|key, value| rebuilt.insert(key, value))
             .expect("visit output must feed a new builder in order");
-        let rebuilt_bytes = rebuilt.finish().unwrap();
+        let (rebuilt_bytes, _) = rebuilt.finish().unwrap();
         assert_eq!(bytes, rebuilt_bytes, "round trip must be byte-identical");
 
         for gram in grams {

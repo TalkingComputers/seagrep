@@ -28,5 +28,5 @@ pub use grep::{
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
     content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, IndexAddress,
-    LocalBlobStore, SourceObject, StaleSource,
+    LocalBlobStore, SourceObject, StaleSource, StreamingPut,
 };

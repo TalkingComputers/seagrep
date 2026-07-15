@@ -398,3 +398,146 @@ impl S3Client {
         }
     }
 }
+
+const STREAM_PART_SIZE: usize = 16 * 1024 * 1024;
+const STREAM_PARTS_IN_FLIGHT: usize = 2;
+
+/// A multipart upload fed incrementally: 16 MiB parts dispatch onto the
+/// client runtime as they fill, with a bounded in-flight window so the
+/// producer overlaps compute with upload without unbounded memory. Exactly
+/// one of `finish`/`abort` ends it; dropping an unfinished upload aborts it
+/// so no orphaned parts accrue storage.
+pub(crate) struct StreamingUpload {
+    client: S3Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    buffer: bytes::BytesMut,
+    next_part: i32,
+    in_flight: std::collections::VecDeque<tokio::task::JoinHandle<Result<CompletedPart>>>,
+    completed: Vec<CompletedPart>,
+    progress: Option<ProgressSender>,
+    done: bool,
+}
+
+impl S3Client {
+    pub(crate) fn start_streaming_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        progress: Option<ProgressSender>,
+    ) -> Result<StreamingUpload> {
+        let upload_id = self.0.rt.block_on(self.start_multipart(bucket, key))?;
+        Ok(StreamingUpload {
+            client: self.clone(),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload_id,
+            buffer: bytes::BytesMut::new(),
+            next_part: 1,
+            in_flight: std::collections::VecDeque::new(),
+            completed: Vec::new(),
+            progress,
+            done: false,
+        })
+    }
+}
+
+impl StreamingUpload {
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.buffer.extend_from_slice(bytes);
+        while self.buffer.len() >= STREAM_PART_SIZE {
+            let part = self.buffer.split_to(STREAM_PART_SIZE).freeze();
+            self.dispatch(part)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch(&mut self, part: Bytes) -> Result<()> {
+        while self.in_flight.len() >= STREAM_PARTS_IN_FLIGHT {
+            self.harvest_one()?;
+        }
+        let number = self.next_part;
+        self.next_part = number
+            .checked_add(1)
+            .context("multipart upload exceeds the part-count limit")?;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+        let progress = self.progress.clone();
+        let part_len = part.len() as u64;
+        if let Some(progress) = &self.progress {
+            progress.emit(ProgressEvent::UploadStarted { bytes: part_len });
+        }
+        let handle = self.client.0.rt.spawn(async move {
+            let completed = client
+                .upload_part(&bucket, &key, &upload_id, number, PartSource::Bytes(part))
+                .await?;
+            if let Some(progress) = &progress {
+                progress.emit(ProgressEvent::UploadedChunk { bytes: part_len });
+            }
+            Ok(completed)
+        });
+        self.in_flight.push_back(handle);
+        Ok(())
+    }
+
+    fn harvest_one(&mut self) -> Result<()> {
+        if let Some(handle) = self.in_flight.pop_front() {
+            self.completed.push(self.client.0.rt.block_on(handle)??);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if !self.buffer.is_empty() {
+            let part = self.buffer.split_off(0).freeze();
+            self.dispatch(part)?;
+        }
+        while !self.in_flight.is_empty() {
+            self.harvest_one()?;
+        }
+        anyhow::ensure!(
+            !self.completed.is_empty(),
+            "streamed upload of s3://{}/{} produced no parts",
+            self.bucket,
+            self.key
+        );
+        let mut parts = std::mem::take(&mut self.completed);
+        parts.sort_unstable_by_key(|part| part.part_number().unwrap_or_default());
+        let result = self.client.0.rt.block_on(self.client.finish_multipart(
+            &self.bucket,
+            &self.key,
+            &self.upload_id,
+            parts,
+        ));
+        self.done = result.is_ok();
+        result
+    }
+
+    pub(crate) fn abort(mut self) {
+        self.abort_inner();
+    }
+
+    fn abort_inner(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        for handle in self.in_flight.drain(..) {
+            handle.abort();
+        }
+        self.client.0.rt.block_on(self.client.abort_multipart(
+            &self.bucket,
+            &self.key,
+            &self.upload_id,
+        ));
+    }
+}
+
+impl Drop for StreamingUpload {
+    fn drop(&mut self) {
+        self.abort_inner();
+    }
+}

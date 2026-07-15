@@ -139,6 +139,44 @@ pub trait BlobStore {
     /// matches `expected` (`None` = the blob must not exist). Returns false
     /// when another writer won the race — never silently overwrites.
     fn put_if(&self, name: &str, bytes: &[u8], expected: Option<&str>) -> AnyhowResult<bool>;
+    /// Begin an incremental write to `name`. The blob must not be observable
+    /// until `finish`; a dropped or aborted handle leaves no blob behind.
+    /// The default buffers in memory and publishes through `put`, which is
+    /// correct for any store; stores with native streaming override it.
+    fn put_streaming<'a>(&'a self, name: &str) -> AnyhowResult<Box<dyn StreamingPut + 'a>> {
+        Ok(Box::new(BufferedStreamingPut {
+            store: self,
+            name: name.to_owned(),
+            bytes: Vec::new(),
+        }))
+    }
+}
+
+/// Incremental blob upload in progress. Exactly one of `finish` or `abort`
+/// ends it; the blob becomes observable only after `finish` returns Ok.
+pub trait StreamingPut {
+    fn write(&mut self, bytes: &[u8]) -> AnyhowResult<()>;
+    fn finish(self: Box<Self>) -> AnyhowResult<()>;
+    fn abort(self: Box<Self>);
+}
+
+struct BufferedStreamingPut<'a, S: BlobStore + ?Sized> {
+    store: &'a S,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl<S: BlobStore + ?Sized> StreamingPut for BufferedStreamingPut<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> AnyhowResult<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> AnyhowResult<()> {
+        self.store.put(&self.name, &self.bytes)
+    }
+
+    fn abort(self: Box<Self>) {}
 }
 
 /// Version token for stores without native versions: content-derived.
@@ -181,7 +219,56 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AnyhowResult<()> {
     Ok(())
 }
 
+struct LocalStreamingPut {
+    temp: Option<tempfile::NamedTempFile>,
+    path: PathBuf,
+    progress: Option<crate::ProgressSender>,
+}
+
+impl StreamingPut for LocalStreamingPut {
+    fn write(&mut self, bytes: &[u8]) -> AnyhowResult<()> {
+        self.temp
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("streaming put already ended"))?
+            .write_all(bytes)?;
+        if let Some(progress) = &self.progress {
+            progress.emit(crate::ProgressEvent::UploadStarted {
+                bytes: bytes.len() as u64,
+            });
+            progress.emit(crate::ProgressEvent::UploadedChunk {
+                bytes: bytes.len() as u64,
+            });
+        }
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> AnyhowResult<()> {
+        let temp = self
+            .temp
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("streaming put already ended"))?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
+    fn abort(self: Box<Self>) {}
+}
+
 impl BlobStore for LocalBlobStore {
+    fn put_streaming<'a>(&'a self, name: &str) -> AnyhowResult<Box<dyn StreamingPut + 'a>> {
+        let path = self.root.join(name);
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("blob path has no parent: {}", path.display()))?;
+        std::fs::create_dir_all(parent)?;
+        Ok(Box::new(LocalStreamingPut {
+            temp: Some(tempfile::NamedTempFile::new_in(parent)?),
+            path,
+            progress: self.progress.clone(),
+        }))
+    }
+
     fn delete(&self, name: &str) -> AnyhowResult<()> {
         match std::fs::remove_file(self.root.join(name)) {
             Ok(()) => Ok(()),
