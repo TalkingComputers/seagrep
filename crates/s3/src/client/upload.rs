@@ -509,6 +509,11 @@ impl StreamingUpload {
                 (self.client.clone(), self.bucket.clone(), self.key.clone());
             let progress = self.progress.clone();
             self.abort_inner();
+            if let Some(progress) = &progress {
+                progress.emit(ProgressEvent::UploadStarted {
+                    bytes: body.len() as u64,
+                });
+            }
             client
                 .0
                 .rt
