@@ -971,7 +971,7 @@ mod tests {
                 write_posting_record(
                     &mut file,
                     Strategy::Trigram,
-                    b"abc",
+                    u64::from(u32::from_be_bytes(*b"\0abc")),
                     DocId::try_from(id).unwrap(),
                 )
                 .unwrap();
