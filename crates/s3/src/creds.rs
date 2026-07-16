@@ -68,16 +68,21 @@ impl KeyBase {
     }
 }
 
+/// Wraps the PROFILE-ONLY credentials provider, never the default chain:
+/// the chain falls through to instance metadata when SSO fails, and those
+/// credentials must never be persisted under the SSO key. With a pure-SSO
+/// profile (the only mode that constructs this) the inner provider can only
+/// yield SSO-derived credentials or fail loudly.
 #[derive(Debug)]
 pub(crate) struct DiskCachedProvider {
     inner: SharedCredentialsProvider,
-    base: Option<KeyBase>,
+    base: KeyBase,
     #[cfg(test)]
     verify_base: bool,
 }
 
 impl DiskCachedProvider {
-    pub(crate) fn new(inner: SharedCredentialsProvider, base: Option<KeyBase>) -> Self {
+    pub(crate) fn new(inner: SharedCredentialsProvider, base: KeyBase) -> Self {
         Self {
             inner,
             base,
@@ -90,35 +95,33 @@ impl DiskCachedProvider {
     fn with_path(inner: SharedCredentialsProvider, path: PathBuf) -> Self {
         Self {
             inner,
-            base: Some(KeyBase {
+            base: KeyBase {
                 path,
                 frozen: [0; 32],
-            }),
+            },
             verify_base: false,
         }
     }
 
-    fn base_is_current(&self, base: &KeyBase) -> bool {
+    fn base_is_current(&self) -> bool {
         #[cfg(test)]
         if !self.verify_base {
             return true;
         }
-        base.still_current()
+        self.base.still_current()
     }
 
     async fn load(&self) -> provider::Result {
-        if let Some(base) = &self.base {
-            if let Some(credentials) = read_cached(&base.path, SystemTime::now()) {
-                return Ok(credentials);
-            }
+        if let Some(credentials) = read_cached(&self.base.path, SystemTime::now()) {
+            return Ok(credentials);
         }
         let credentials = self.inner.provide_credentials().await?;
-        if let (Some(base), Some(_)) = (&self.base, credentials.expiry()) {
+        if credentials.expiry().is_some() {
             // The write-side bracket: only persist while every keyed input
             // still matches the pre-load snapshot. A failed cache write must
             // not fail the request it accelerates.
-            if self.base_is_current(base) {
-                let _ = write_cached(&base.path, &credentials);
+            if self.base_is_current() {
+                let _ = write_cached(&self.base.path, &credentials);
             }
         }
         Ok(credentials)

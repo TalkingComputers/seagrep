@@ -343,15 +343,31 @@ impl S3Client {
                 .to_owned();
             let cached_provider = if has_static_credentials {
                 None
+            } else if let Some(base) = cache_base {
+                // Cache-enabled mode resolves through the profile provider
+                // alone: the default chain would silently fall through to
+                // instance metadata when SSO fails, and those credentials
+                // must never be persisted under the SSO key. For a pure-SSO
+                // profile a loud "log in again" beats a silent identity
+                // switch.
+                let profile_only =
+                    aws_config::profile::ProfileFileCredentialsProvider::builder().build();
+                let provider = crate::creds::DiskCachedProvider::new(
+                    aws_credential_types::provider::SharedCredentialsProvider::new(profile_only),
+                    base,
+                );
+                provider.provide_credentials().await.context(
+                    "no AWS credentials: run `aws sso login` for the active AWS profile",
+                )?;
+                Some(provider)
             } else {
                 let chain = shared.credentials_provider().context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
-                let provider = crate::creds::DiskCachedProvider::new(chain, cache_base);
-                provider.provide_credentials().await.context(
+                chain.provide_credentials().await.context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
-                Some(provider)
+                None
             };
             let mut service = aws_sdk_s3::config::Builder::from(&shared)
                 .retry_config(aws_config::retry::RetryConfig::disabled())
