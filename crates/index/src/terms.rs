@@ -168,13 +168,21 @@ impl<W: Write> TermBuilder<W> {
     }
 }
 
+/// Lazily decoded dictionary blocks: block id -> its (hash, value) entries.
+type DecodedBlocks =
+    std::sync::Mutex<rapidhash::RapidHashMap<usize, std::sync::Arc<Vec<(u64, u64)>>>>;
+
 pub(crate) enum TermMap {
     Single(fst::Map<memmap2::Mmap>),
     /// Sparse dictionaries key by `hash_ngram` of the gram, not gram bytes:
-    /// a sorted block table bisected in place, never an FST.
+    /// a sorted block table, never an FST. Varint blocks decode sequentially,
+    /// so each touched block is decoded once into `decoded` and bisected on
+    /// every later lookup — a per-gram scan of a 128 KiB block would repeat
+    /// that decode for every gram landing in it.
     Sparse {
         index: crate::sparse_table::SparseTableIndex,
         bytes: memmap2::Mmap,
+        decoded: DecodedBlocks,
     },
     /// Large sparse dictionary accessed by ranged reads: only the block
     /// index is resident; lookups are resolved per query by the reader.
@@ -192,6 +200,7 @@ impl TermMap {
         if !is_sharded {
             return Ok(match strategy {
                 Strategy::Sparse => Self::Sparse {
+                    decoded: DecodedBlocks::default(),
                     index: crate::sparse_table::SparseTableIndex::parse(
                         bytes.len() as u64,
                         &bytes,
@@ -229,15 +238,40 @@ impl TermMap {
     pub(crate) fn get(&self, gram: &[u8]) -> Option<u64> {
         match self {
             Self::Single(map) => map.get(gram),
-            Self::Sparse { index, bytes } => {
+            Self::Sparse {
+                index,
+                bytes,
+                decoded,
+            } => {
                 let hash = holys3_core::hash_ngram(gram);
-                let block = index.block_for(hash)?;
-                let block = &index.blocks[block];
-                let start = usize::try_from(block.offset).ok()?;
-                let end = start.checked_add(usize::try_from(block.len).ok()?)?;
-                crate::sparse_table::lookup_in_block(bytes.get(start..end)?, hash)
-                    .ok()
-                    .flatten()
+                let block_id = index.block_for(hash)?;
+                let entries = {
+                    let mut cache = decoded.lock().ok()?;
+                    match cache.get(&block_id) {
+                        Some(entries) => entries.clone(),
+                        None => {
+                            let block = &index.blocks[block_id];
+                            let start = usize::try_from(block.offset).ok()?;
+                            let end = start.checked_add(usize::try_from(block.len).ok()?)?;
+                            let mut entries = Vec::new();
+                            crate::sparse_table::for_each_entry(
+                                bytes.get(start..end)?,
+                                |hash, value| {
+                                    entries.push((hash, value));
+                                    Ok(())
+                                },
+                            )
+                            .ok()?;
+                            let entries = std::sync::Arc::new(entries);
+                            cache.insert(block_id, entries.clone());
+                            entries
+                        }
+                    }
+                };
+                let at = entries
+                    .binary_search_by_key(&hash, |(entry, _)| *entry)
+                    .ok()?;
+                Some(entries[at].1)
             }
             Self::SparseRemote { .. } => {
                 unreachable!("remote sparse lookups are resolved by the reader per query")
@@ -268,7 +302,7 @@ impl TermMap {
             Self::SparseRemote { .. } => {
                 anyhow::bail!("remote sparse dictionaries do not support iteration")
             }
-            Self::Sparse { index, bytes } => {
+            Self::Sparse { index, bytes, .. } => {
                 for block in &index.blocks {
                     let start = usize::try_from(block.offset)?;
                     let end = start

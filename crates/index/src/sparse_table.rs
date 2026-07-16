@@ -295,6 +295,7 @@ impl SparseTableIndex {
 }
 
 /// Bisect one verified block's raw bytes for `hash`.
+#[cfg(test)]
 pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
     let mut found = None;
     let mut done = false;
