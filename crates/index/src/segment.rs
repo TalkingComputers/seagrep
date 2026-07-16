@@ -895,7 +895,34 @@ pub struct SegmentedReader {
     root_version: String,
     strategy: Strategy,
     segments: Vec<Segment>,
-    range_cache: bool,
+    range_cache_max: u64,
+    range_written: std::sync::atomic::AtomicU64,
+}
+
+impl SegmentedReader {
+    fn range_cache(&self) -> bool {
+        self.range_cache_max > 0
+    }
+
+    /// The open-time sweep bounds cache size across processes; this bounds
+    /// it within one long-lived reader by re-sweeping after every quarter
+    /// cap of fresh writes.
+    fn note_range_written(&self, bytes: u64) {
+        self.range_written
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.sweep_if_due();
+    }
+
+    fn sweep_if_due(&self) {
+        use std::sync::atomic::Ordering;
+        if self.range_cache_max == 0 {
+            return;
+        }
+        if self.range_written.load(Ordering::Relaxed) >= self.range_cache_max / 4 {
+            self.range_written.store(0, Ordering::Relaxed);
+            evict_range_cache(&self.cache_dir, self.range_cache_max);
+        }
+    }
 }
 
 impl SegmentedReader {
@@ -945,9 +972,9 @@ impl SegmentedReader {
             segments.push(segment);
         }
         evict_stale_segments(cache_dir, &segments);
-        let range_cache = range_cache_max()? > 0;
-        if range_cache {
-            evict_range_cache(cache_dir, range_cache_max()?);
+        let range_cache_max = range_cache_max()?;
+        if range_cache_max > 0 {
+            evict_range_cache(cache_dir, range_cache_max);
         }
         Ok(SegmentedReader {
             store,
@@ -955,7 +982,8 @@ impl SegmentedReader {
             root_version,
             strategy,
             segments,
-            range_cache,
+            range_cache_max,
+            range_written: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1079,13 +1107,14 @@ impl SegmentedReader {
                     let mut cached: Vec<Option<bytes::Bytes>> = ranges
                         .iter()
                         .map(|&(offset, len)| {
-                            if !self.range_cache {
+                            if !self.range_cache() {
                                 return None;
                             }
                             cache::read_self_anchored(&range_path(offset, len))
                                 .map(bytes::Bytes::from)
                         })
                         .collect();
+                    let misses: Vec<bool> = cached.iter().map(Option::is_none).collect();
                     let missing: Vec<(u64, u64)> = ranges
                         .iter()
                         .zip(&cached)
@@ -1101,32 +1130,37 @@ impl SegmentedReader {
                             missing.len()
                         );
                         let mut fetched = fetched.into_iter();
-                        for (slot, &(offset, len)) in cached.iter_mut().zip(&ranges) {
+                        for slot in cached.iter_mut() {
                             if slot.is_none() {
-                                let bytes =
-                                    fetched.next().context("missing fetched posting range")?;
-                                if self.range_cache {
-                                    cache::write_self_anchored(
-                                        &self.cache_dir,
-                                        &range_path(offset, len),
-                                        &bytes,
-                                    )
-                                    .ok();
-                                }
-                                *slot = Some(bytes);
+                                *slot =
+                                    Some(fetched.next().context("missing fetched posting range")?);
                             }
                         }
                     }
                     needed
                         .iter()
-                        .zip(cached)
-                        .map(|((&offset, &count), bytes)| {
-                            let bytes = bytes.context("missing posting range")?;
-                            Ok((
-                                offset,
-                                crate::decode_posting_block(&bytes, count, doc_count)?,
-                            ))
-                        })
+                        .zip(&ranges)
+                        .zip(cached.into_iter().zip(misses))
+                        .map(
+                            |(((&offset, &count), &(range_offset, range_len)), (bytes, miss))| {
+                                let bytes = bytes.context("missing posting range")?;
+                                let decoded =
+                                    crate::decode_posting_block(&bytes, count, doc_count)?;
+                                // Cache only after a successful decode: a
+                                // malformed response must stay a transient
+                                // failure, never a poisoned permanent hit.
+                                if miss && self.range_cache() {
+                                    self.note_range_written(bytes.len() as u64);
+                                    cache::write_self_anchored(
+                                        &self.cache_dir,
+                                        &range_path(range_offset, range_len),
+                                        &bytes,
+                                    )
+                                    .ok();
+                                }
+                                Ok((offset, decoded))
+                            },
+                        )
                         .collect()
                 },
             ))?;
@@ -1379,13 +1413,24 @@ fn evict_range_cache(cache_dir: &Path, max_bytes: u64) {
     let mut files = Vec::new();
     let mut total = 0u64;
     for segment in segments.flatten() {
+        // Never follow symlinks: a link planted in the cache dir must not
+        // let the sweep enumerate or delete files outside it.
+        if !segment.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(segment.path()) else {
             continue;
         };
         for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !(name.starts_with("pack-") || name.starts_with("postings-")) {
+            let evictable = name.starts_with("pack-")
+                || name.starts_with("postings-")
+                || name.starts_with(".tmp");
+            if !evictable {
                 continue;
             }
             let Ok(meta) = entry.metadata() else {
@@ -1564,16 +1609,18 @@ impl holys3_core::DocFetcher for SegmentedReader {
             let pack_cache = crate::pack::PackBlockCache {
                 cache_dir: &self.cache_dir,
                 seg_id: &segment.meta.seg_id,
+                written: &self.range_written,
             };
             let fetched = crate::pack::fetch_documents(
                 self.store.as_ref(),
-                self.range_cache.then_some(&pack_cache),
+                self.range_cache().then_some(&pack_cache),
                 &segment.meta.packs,
                 &tables.blocks,
                 &requests,
                 consume,
             );
             self.classify_index_result(fetched)?;
+            self.sweep_if_due();
         }
         Ok(())
     }

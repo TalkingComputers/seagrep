@@ -231,7 +231,7 @@ fn range_cache_evicts_to_its_cap_and_stays_correct() -> Result<()> {
         &LocalBlobStore::new(store_dir.path()),
         cache_dir.path(),
         &test_source(),
-        Strategy::Sparse,
+        Some(Strategy::Sparse),
         &listing,
         UpdateOptions::default(),
         &|shard| Ok(Box::new(corpus_for(shard))),

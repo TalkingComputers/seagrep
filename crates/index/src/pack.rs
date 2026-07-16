@@ -519,6 +519,7 @@ fn fetch_large(
 pub(crate) struct PackBlockCache<'a> {
     pub(crate) cache_dir: &'a std::path::Path,
     pub(crate) seg_id: &'a str,
+    pub(crate) written: &'a std::sync::atomic::AtomicU64,
 }
 
 impl PackBlockCache<'_> {
@@ -536,6 +537,10 @@ impl PackBlockCache<'_> {
     }
 
     fn store(&self, pack: &PackMeta, block: &PackBlock, compressed: &[u8]) {
+        self.written.fetch_add(
+            compressed.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         write_back(self.cache_dir, &self.block_path(pack, block), compressed).ok();
     }
 }
