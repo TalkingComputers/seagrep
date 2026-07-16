@@ -1,7 +1,7 @@
-//! Sorted hash table replacing the FST for sparse term dictionaries: fixed
-//! 16-byte (hash, value) entries in 128 KiB blocks, a per-block first-hash
-//! index, and per-block SHA-256 so blocks can be fetched and verified by
-//! ranged reads without downloading the whole dictionary.
+//! Sorted hash table replacing the FST for sparse term dictionaries:
+//! delta-varint (hash, value) entries in 128 KiB blocks, a per-block
+//! first-hash index, and per-block SHA-256 so blocks can be fetched and
+//! verified by ranged reads without downloading the whole dictionary.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -15,8 +15,8 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 pub(crate) const BLOCK_BYTES: usize = 128 * 1024;
 
 /// LEB128. Sorted hash deltas average well under five bytes on real corpora
-/// (vs eight raw), and singleton values are small doc ids; together they
-/// roughly halve the dictionary.
+/// (vs eight raw), and singleton values fold their count tag into one small
+/// doc-id varint; together they roughly halve the dictionary.
 fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -52,7 +52,9 @@ fn read_varint(block: &[u8], cursor: &mut usize) -> Result<u64> {
 
 /// Decode every (hash, value) entry of a block in order. The first entry
 /// stores its hash raw (big-endian); the rest store deltas from the previous
-/// hash. Values are plain varints.
+/// hash. A value is one tag varint whose low bit marks a singleton — the
+/// tag's high bits are then the doc id — else the high bits are the posting
+/// count and a second varint carries the offset.
 pub(crate) fn for_each_entry(
     block: &[u8],
     mut visit: impl FnMut(u64, u64) -> Result<()>,
@@ -61,9 +63,15 @@ pub(crate) fn for_each_entry(
     let mut cursor = 8usize;
     let mut hash = u64::from_be_bytes(block[..8].try_into().expect("eight bytes"));
     let read_value = |cursor: &mut usize| -> Result<u64> {
-        let count = read_varint(block, cursor)?;
+        let tag = read_varint(block, cursor)?;
+        if tag & 1 == 1 {
+            return crate::eval::pack_posting(tag >> 1, 1);
+        }
+        // The writer always folds count == 1 into an odd tag; accepting the
+        // two-varint spelling too would give singletons a second encoding.
+        anyhow::ensure!(tag >> 1 != 1, "sparse table singleton is not canonical");
         let offset = read_varint(block, cursor)?;
-        crate::eval::pack_posting(offset, usize::try_from(count)?)
+        crate::eval::pack_posting(offset, usize::try_from(tag >> 1)?)
     };
     let value = read_value(&mut cursor)?;
     visit(hash, value)?;
@@ -118,12 +126,19 @@ impl<W: Write> SparseTableWriter<W> {
             let last = self.last_hash.context("delta after the first entry")?;
             write_varint(&mut self.block, hash - last);
         }
-        // Values split into (count, offset-or-doc-id) varints: the packed
-        // u64 keeps the count in its high bits, which would force every
-        // value to six-plus varint bytes.
+        // The packed u64 keeps the count in its high bits, which would force
+        // every value to six-plus varint bytes, so values split into varints.
+        // Singletons dominate real dictionaries (87% of grams on books), so
+        // count == 1 folds into the doc-id varint's low bit and costs one
+        // varint; other counts shift left and a second varint carries the
+        // offset.
         let (offset, count) = crate::eval::unpack_posting(value);
-        write_varint(&mut self.block, u64::from(count));
-        write_varint(&mut self.block, offset);
+        if count == 1 {
+            write_varint(&mut self.block, (offset << 1) | 1);
+        } else {
+            write_varint(&mut self.block, u64::from(count) << 1);
+            write_varint(&mut self.block, offset);
+        }
         self.last_hash = Some(hash);
         self.entry_count += 1;
         if self.block.len() >= BLOCK_BYTES {
@@ -438,6 +453,54 @@ mod tests {
         assert_eq!(get(&bytes, &index, 0), None);
         assert_eq!(get(&bytes, &index, 2), None);
         assert_eq!(get(&bytes, &index, u64::MAX), None);
+    }
+
+    #[test]
+    fn singletons_cost_one_varint() {
+        // A singleton (count == 1) folds its tag into the doc-id varint; a
+        // two-doc list at the same postings offset costs a second varint.
+        let single = crate::eval::pack_posting(300, 1).unwrap();
+        let pair = crate::eval::pack_posting(300, 2).unwrap();
+        let singleton_table = build(&[(10, single)]);
+        let pair_table = build(&[(10, pair)]);
+        assert!(
+            singleton_table.len() < pair_table.len(),
+            "singleton {} must be smaller than pair {}",
+            singleton_table.len(),
+            pair_table.len()
+        );
+        let index = open(&singleton_table);
+        assert_eq!(get(&singleton_table, &index, 10), Some(single));
+        let index = open(&pair_table);
+        assert_eq!(get(&pair_table, &index, 10), Some(pair));
+    }
+
+    #[test]
+    fn value_tags_reject_hostile_and_noncanonical_spellings() {
+        // Maximum representable singleton: the full 40-bit offset space.
+        let max_single = crate::eval::pack_posting((1 << 40) - 1, 1).unwrap();
+        let table = build(&[(10, max_single)]);
+        let index = open(&table);
+        assert_eq!(get(&table, &index, 10), Some(max_single));
+
+        // Raw block: an odd tag whose doc id exceeds the 40-bit offset
+        // space must error through pack_posting, not wrap.
+        let mut block = 10u64.to_be_bytes().to_vec();
+        write_varint(&mut block, (1u64 << 41) | 1);
+        assert!(for_each_entry(&block, |_, _| Ok(())).is_err());
+
+        // Raw block: the two-varint spelling of count == 1 is not canonical
+        // and must be rejected, not decoded as a singleton.
+        let mut block = 10u64.to_be_bytes().to_vec();
+        write_varint(&mut block, 1 << 1);
+        write_varint(&mut block, 300);
+        let error = for_each_entry(&block, |_, _| Ok(())).expect_err("non-canonical singleton");
+        assert!(error.to_string().contains("canonical"), "{error:#}");
+
+        // Raw block: a varint running past ten bytes must error, not spin.
+        let mut block = 10u64.to_be_bytes().to_vec();
+        block.extend_from_slice(&[0xff; 10]);
+        assert!(for_each_entry(&block, |_, _| Ok(())).is_err());
     }
 
     #[test]
