@@ -489,3 +489,82 @@ fn repeat_queries_serve_ranges_from_the_local_cache() -> Result<()> {
     assert_eq!(cold, warm_again);
     Ok(())
 }
+
+#[test]
+fn partially_cached_large_documents_reassemble_in_order() -> Result<()> {
+    let _lock = env_lock();
+    let _remote_min = EnvGuard::new("HOLYS3_SPARSE_REMOTE_MIN");
+    let _cache_max = EnvGuard::new("HOLYS3_CACHE_MAX");
+    std::env::remove_var("HOLYS3_SPARSE_REMOTE_MIN");
+    std::env::set_var("HOLYS3_CACHE_MAX", (4u64 << 30).to_string());
+
+    // A small doc first in pack order shares its pack block with the head of
+    // a large multi-block doc; querying the small doc caches that block, so
+    // the later large-doc fetch mixes a cache hit (first blocks) with misses.
+    let mut objects: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    objects.insert(
+        "aaa-small.log".into(),
+        b"tiny document with the shared-needle inside\n".to_vec(),
+    );
+    let mut large = Vec::new();
+    // Past the 32 MiB decoded threshold so the fetch takes the
+    // order-sensitive large-document path.
+    for line in 0..500_000u32 {
+        large.extend_from_slice(
+            format!("large doc line {line:06} with plenty of padding text to fill blocks\n")
+                .as_bytes(),
+        );
+    }
+    large.extend_from_slice(b"the shared-needle also lives at the very end\n");
+    objects.insert("bbb-large.log".into(), large);
+
+    let listing: Vec<(String, String, u64)> = objects
+        .iter()
+        .map(|(key, body)| {
+            (
+                key.clone(),
+                format!("{:016x}", holys3_core::hash_ngram(body)),
+                body.len() as u64,
+            )
+        })
+        .collect();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let corpus_for = |shard: &[(String, String, u64)]| {
+        let keys: Vec<String> = shard.iter().map(|(key, _, _)| key.clone()).collect();
+        let bodies = keys.iter().map(|key| objects[key].clone()).collect();
+        MemCorpus::new(keys, bodies)
+    };
+    update_index(
+        &LocalBlobStore::new(store_dir.path()),
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Sparse),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(corpus_for(shard))),
+    )?;
+
+    let open = || {
+        SegmentedReader::open(
+            Box::new(LocalBlobStore::new(store_dir.path())),
+            cache_dir.path(),
+            &test_source(),
+        )
+    };
+    // Warm the cache with only the small doc's block(s).
+    let warm = open()?;
+    assert_eq!(search(&warm, "tiny document with")?.len(), 1);
+    drop(warm);
+
+    // The large doc now fetches with mixed hits and misses; both needles and
+    // an interior line must come back intact and in order.
+    let reader = open()?;
+    let hits = search(&reader, "shared-needle")?;
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    let interior = search(&reader, "large doc line 250000 with plenty")?;
+    assert_eq!(interior.len(), 1);
+    let repeat = search(&reader, "large doc line 499999 with plenty")?;
+    assert_eq!(repeat.len(), 1);
+    Ok(())
+}

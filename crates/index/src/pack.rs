@@ -288,7 +288,7 @@ fn visit_blocks(
         let pack = packs.get(pack_id).context("pack ID is out of bounds")?;
         for batch in run_batches(pack_runs, batch_bytes) {
             let batch = &pack_runs[batch];
-            let mut fetches = Vec::with_capacity(batch.len());
+            let mut resolved: Vec<Option<Vec<Vec<u8>>>> = Vec::with_capacity(batch.len());
             for run in batch {
                 // A run is served from disk only when every block hits, so a
                 // fetched run stays one contiguous range; each hit re-verifies
@@ -299,56 +299,72 @@ fn visit_blocks(
                         .map(|block_id| cache.read(pack, &blocks[*block_id]))
                         .collect()
                 });
-                match cached {
-                    Some(compressed_blocks) => {
-                        for (block_id, compressed) in run.blocks.iter().zip(compressed_blocks) {
-                            visit_compressed_block(blocks, *block_id, &compressed, visit)?;
-                        }
-                    }
-                    None => fetches.push(run),
-                }
+                resolved.push(cached);
             }
-            if fetches.is_empty() {
-                continue;
-            }
-            let ranges = fetches
+            let misses: Vec<usize> = resolved
                 .iter()
-                .map(|run| (run.offset, run.len))
-                .collect::<Vec<_>>();
-            anyhow::ensure!(
-                ranges
+                .enumerate()
+                .filter(|(_, hit)| hit.is_none())
+                .map(|(at, _)| at)
+                .collect();
+            if !misses.is_empty() {
+                let ranges = misses
                     .iter()
-                    .all(|(offset, len)| offset.saturating_add(*len) <= pack.len),
-                "pack range is out of bounds"
-            );
-            let fetched = store.get_ranges(&pack_blob(&pack.hash), &ranges)?;
-            anyhow::ensure!(
-                fetched.len() == fetches.len(),
-                "get_ranges returned {} ranges for {} requests",
-                fetched.len(),
-                fetches.len()
-            );
-            for (run, bytes) in fetches.iter().zip(fetched) {
-                anyhow::ensure!(bytes.len() as u64 == run.len, "pack range length mismatch");
-                let mut cursor = 0usize;
-                for block_id in &run.blocks {
-                    let block = &blocks[*block_id];
-                    let end = cursor
-                        .checked_add(usize::try_from(block.compressed_len)?)
-                        .context("compressed block range overflows")?;
-                    let compressed = bytes
-                        .get(cursor..end)
-                        .context("pack range ended inside a block")?;
-                    visit_compressed_block(blocks, *block_id, compressed, visit)?;
-                    // Cache only after the block verifies: a corrupt fetch
-                    // must stay a transient failure, never clobber a valid
-                    // on-disk entry.
-                    if let Some(cache) = cache {
-                        cache.store(pack, block, compressed);
+                    .map(|&at| (batch[at].offset, batch[at].len))
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    ranges
+                        .iter()
+                        .all(|(offset, len)| offset.saturating_add(*len) <= pack.len),
+                    "pack range is out of bounds"
+                );
+                let fetched = store.get_ranges(&pack_blob(&pack.hash), &ranges)?;
+                anyhow::ensure!(
+                    fetched.len() == misses.len(),
+                    "get_ranges returned {} ranges for {} requests",
+                    fetched.len(),
+                    misses.len()
+                );
+                for (&at, bytes) in misses.iter().zip(fetched) {
+                    let run = &batch[at];
+                    anyhow::ensure!(bytes.len() as u64 == run.len, "pack range length mismatch");
+                    let mut cursor = 0usize;
+                    let mut compressed_blocks = Vec::with_capacity(run.blocks.len());
+                    for block_id in &run.blocks {
+                        let block = &blocks[*block_id];
+                        let end = cursor
+                            .checked_add(usize::try_from(block.compressed_len)?)
+                            .context("compressed block range overflows")?;
+                        let compressed = bytes
+                            .get(cursor..end)
+                            .context("pack range ended inside a block")?;
+                        anyhow::ensure!(
+                            <[u8; 32]>::from(Sha256::digest(compressed)) == block.hash,
+                            "pack block hash mismatch"
+                        );
+                        // Cache only after the block verifies: a corrupt
+                        // fetch must stay a transient failure, never a
+                        // written artifact.
+                        if let Some(cache) = cache {
+                            cache.store(pack, block, compressed);
+                        }
+                        compressed_blocks.push(compressed.to_vec());
+                        cursor = end;
                     }
-                    cursor = end;
+                    anyhow::ensure!(cursor == bytes.len(), "unparsed bytes remain in pack range");
+                    resolved[at] = Some(compressed_blocks);
                 }
-                anyhow::ensure!(cursor == bytes.len(), "unparsed bytes remain in pack range");
+            }
+            // Visit every run in its original order: fetch_large consumes
+            // blocks with sequential offset bookkeeping, so a hits-first
+            // traversal would reassemble a partially-cached large document
+            // out of order.
+            for (run, compressed_blocks) in batch.iter().zip(resolved) {
+                let compressed_blocks =
+                    compressed_blocks.context("pack run was neither cached nor fetched")?;
+                for (block_id, compressed) in run.blocks.iter().zip(compressed_blocks) {
+                    visit_compressed_block(blocks, *block_id, &compressed, visit)?;
+                }
             }
         }
     }
