@@ -60,15 +60,15 @@ pub fn trigram_grams_bytes(data: &[u8]) -> Vec<Vec<u8>> {
 
 /// Stable u64 hash of an n-gram's bytes. Deterministic across runs/platforms
 /// (used as the on-disk + in-memory gram key).
-/// Sparse gram keys are 48-bit hashes. Truncation shrinks the sorted-delta
-/// entries in the dictionary by about a third, and collisions only merge two
-/// grams' postings — a slightly larger candidate superset that verification
-/// filters exactly (the same property collision-tolerant hashing has always
-/// relied on). At a billion distinct grams the expected number of colliding
-/// pairs is in the low thousands. Changing this width changes the index
-/// format.
+/// Sparse gram keys are 40-bit hashes. Truncation shrinks the dictionary's
+/// sorted hash deltas (measured on real prose: −22% of the whole dictionary
+/// vs 48 bits), and a collision only merges two grams' postings — a slightly
+/// larger candidate superset that verification filters exactly, and that
+/// `prune_and` deprioritizes like any common gram. Measured on a 126M-gram
+/// corpus: 0.01% of grams collide, adding 0.0003 candidate docs per query
+/// gram on average. Changing this width changes the index format.
 pub fn hash_ngram(gram: &[u8]) -> u64 {
-    rapidhash::v3::rapidhash_v3(gram) & ((1 << 48) - 1)
+    rapidhash::v3::rapidhash_v3(gram) & ((1 << 40) - 1)
 }
 
 /// Deterministic weight of an adjacent byte pair. Drives sparse-ngram
