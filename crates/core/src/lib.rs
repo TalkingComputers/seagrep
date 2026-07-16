@@ -1,6 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 //! Shared types, gram extraction, storage traits, and scan verification.
 
+mod cache;
 mod codec;
 mod detect;
 mod grams;
@@ -12,6 +13,7 @@ pub mod testutil;
 
 pub type DocId = u32;
 
+pub use cache::{cache_home, read_cache_home};
 pub use codec::{
     decode_body, decode_requested, decode_requested_body, decode_source, decode_source_body,
     is_raw_body, is_raw_source, DecodeLimits, DecodeSink, DecodeSummary, DocumentBody,

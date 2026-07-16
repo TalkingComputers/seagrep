@@ -304,6 +304,14 @@ impl S3Client {
             .enable_all()
             .build()?;
         let endpoint_for_sdk = endpoint_base.clone();
+        // Snapshot the credential-cache key before the SDK reads any of its
+        // inputs; the provider re-verifies it before writing, bracketing the
+        // SDK's reads so an edit in between voids the cache write.
+        let cache_base = if credentials.is_none() {
+            crate::creds::key_base()
+        } else {
+            None
+        };
         let (sdk, upload_sdk, region) = rt.block_on(async move {
             let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .retry_config(aws_config::retry::RetryConfig::disabled())
@@ -333,14 +341,34 @@ impl S3Client {
                 )?
                 .as_ref()
                 .to_owned();
-            if !has_static_credentials {
-                let provider = shared.credentials_provider().context(
-                    "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
-                )?;
+            let cached_provider = if has_static_credentials {
+                None
+            } else if let Some(base) = cache_base {
+                // Cache-enabled mode resolves through the profile provider
+                // alone: the default chain would silently fall through to
+                // instance metadata when SSO fails, and those credentials
+                // must never be persisted under the SSO key. For a pure-SSO
+                // profile a loud "log in again" beats a silent identity
+                // switch.
+                let profile_only =
+                    aws_config::profile::ProfileFileCredentialsProvider::builder().build();
+                let provider = crate::creds::DiskCachedProvider::new(
+                    aws_credential_types::provider::SharedCredentialsProvider::new(profile_only),
+                    base,
+                );
                 provider.provide_credentials().await.context(
+                    "no AWS credentials: run `aws sso login` for the active AWS profile",
+                )?;
+                Some(provider)
+            } else {
+                let chain = shared.credentials_provider().context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
-            }
+                chain.provide_credentials().await.context(
+                    "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
+                )?;
+                None
+            };
             let mut service = aws_sdk_s3::config::Builder::from(&shared)
                 .retry_config(aws_config::retry::RetryConfig::disabled())
                 .timeout_config(
@@ -357,6 +385,9 @@ impl S3Client {
                     .disable_s3_express_session_auth(true)
                     .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
                     .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+            }
+            if let Some(provider) = cached_provider {
+                service = service.credentials_provider(provider);
             }
             let service = service.build();
             let upload_service = service
