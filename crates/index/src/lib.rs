@@ -55,7 +55,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older holys3 must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 12;
+const INDEX_FORMAT: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -241,12 +241,12 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
 /// Returns local ids in `0..doc_count`.
 pub(crate) fn candidates_with(
-    get: impl Fn(&[u8]) -> Option<u64>,
+    get: impl Fn(&[u8]) -> Result<Option<u64>>,
     doc_count: u32,
     q: &Query,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, u32>) -> Result<BTreeMap<u64, Vec<DocId>>>,
 ) -> Result<Vec<DocId>> {
-    let resolved = eval::resolve(q, doc_count, &get);
+    let resolved = eval::resolve(q, doc_count, &get)?;
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
@@ -764,8 +764,12 @@ mod tests {
     #[test]
     fn merged_blobs_stream_with_truthful_hashes() {
         let corpus = MemCorpus::new(
-            vec!["a.log".to_owned(), "b.log".to_owned()],
-            vec![b"alpha needle".to_vec(), b"beta needle".to_vec()],
+            vec!["a.log".to_owned(), "b.log".to_owned(), "c.log".to_owned()],
+            vec![
+                b"alpha needle".to_vec(),
+                b"beta needle".to_vec(),
+                b"gamma unrelated".to_vec(),
+            ],
         );
         let built = build_index_files(&corpus, Strategy::Trigram, None, None).unwrap();
         let doc_count = u32::try_from(built.tables.documents.len()).unwrap();

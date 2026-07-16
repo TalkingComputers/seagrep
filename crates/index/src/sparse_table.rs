@@ -12,9 +12,72 @@ pub(crate) const SPARSE_TABLE_MAGIC: &[u8; 8] = b"H3SPARSE";
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-pub(crate) const ENTRY_BYTES: usize = 16;
-pub(crate) const BLOCK_ENTRIES: usize = 8192;
-pub(crate) const BLOCK_BYTES: usize = ENTRY_BYTES * BLOCK_ENTRIES;
+pub(crate) const BLOCK_BYTES: usize = 128 * 1024;
+
+/// LEB128. Sorted hash deltas average well under five bytes on real corpora
+/// (vs eight raw), and singleton values are small doc ids; together they
+/// roughly halve the dictionary.
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_varint(block: &[u8], cursor: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *block
+            .get(*cursor)
+            .context("sparse table block ended inside a varint")?;
+        *cursor += 1;
+        anyhow::ensure!(shift < 64, "sparse table varint overflows u64");
+        anyhow::ensure!(
+            shift < 63 || byte & 0x7f <= 1,
+            "sparse table varint overflows u64"
+        );
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+/// Decode every (hash, value) entry of a block in order. The first entry
+/// stores its hash raw (big-endian); the rest store deltas from the previous
+/// hash. Values are plain varints.
+pub(crate) fn for_each_entry(
+    block: &[u8],
+    mut visit: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<()> {
+    anyhow::ensure!(block.len() > 8, "sparse table block is too short");
+    let mut cursor = 8usize;
+    let mut hash = u64::from_be_bytes(block[..8].try_into().expect("eight bytes"));
+    let read_value = |cursor: &mut usize| -> Result<u64> {
+        let count = read_varint(block, cursor)?;
+        let offset = read_varint(block, cursor)?;
+        crate::eval::pack_posting(offset, usize::try_from(count)?)
+    };
+    let value = read_value(&mut cursor)?;
+    visit(hash, value)?;
+    while cursor < block.len() {
+        let delta = read_varint(block, &mut cursor)?;
+        anyhow::ensure!(delta > 0, "sparse table hashes must be strictly ascending");
+        hash = hash
+            .checked_add(delta)
+            .context("sparse table hash delta overflows")?;
+        let value = read_value(&mut cursor)?;
+        visit(hash, value)?;
+    }
+    Ok(())
+}
 const INDEX_ENTRY_BYTES: usize = 8 + 8 + 32;
 pub(crate) const FOOTER_BYTES: usize = 8 + 8 + 8 + 8;
 
@@ -50,9 +113,17 @@ impl<W: Write> SparseTableWriter<W> {
         );
         if self.block.is_empty() {
             self.block_first_hash = hash;
+            self.block.extend_from_slice(&hash.to_be_bytes());
+        } else {
+            let last = self.last_hash.context("delta after the first entry")?;
+            write_varint(&mut self.block, hash - last);
         }
-        self.block.extend_from_slice(&hash.to_be_bytes());
-        self.block.extend_from_slice(&value.to_be_bytes());
+        // Values split into (count, offset-or-doc-id) varints: the packed
+        // u64 keeps the count in its high bits, which would force every
+        // value to six-plus varint bytes.
+        let (offset, count) = crate::eval::unpack_posting(value);
+        write_varint(&mut self.block, u64::from(count));
+        write_varint(&mut self.block, offset);
         self.last_hash = Some(hash);
         self.entry_count += 1;
         if self.block.len() >= BLOCK_BYTES {
@@ -184,8 +255,10 @@ impl SparseTableIndex {
             let len = next_offset
                 .checked_sub(offset)
                 .context("sparse table block length underflows")?;
+            // Varint entries have no fixed width; blocks may exceed the
+            // flush target by one entry's worth of bytes.
             anyhow::ensure!(
-                len > 0 && len.is_multiple_of(ENTRY_BYTES as u64) && len <= BLOCK_BYTES as u64,
+                len > 8 && len <= (BLOCK_BYTES + 32) as u64,
                 "sparse table block length is invalid"
             );
             expected_offset = next_offset;
@@ -202,12 +275,8 @@ impl SparseTableIndex {
                 .all(|pair| pair[0].first_hash < pair[1].first_hash),
             "sparse table block index is not sorted"
         );
-        let capacity: u64 = blocks
-            .iter()
-            .map(|block| block.len / ENTRY_BYTES as u64)
-            .sum();
         anyhow::ensure!(
-            capacity == entry_count,
+            (entry_count == 0) == blocks.is_empty(),
             "sparse table entry count does not match its blocks"
         );
         Ok(Self {
@@ -226,36 +295,23 @@ impl SparseTableIndex {
 }
 
 /// Bisect one verified block's raw bytes for `hash`.
+#[cfg(test)]
 pub(crate) fn lookup_in_block(block: &[u8], hash: u64) -> Result<Option<u64>> {
-    anyhow::ensure!(
-        !block.is_empty() && block.len().is_multiple_of(ENTRY_BYTES),
-        "sparse table block length is invalid"
-    );
-    let entries = block.len() / ENTRY_BYTES;
-    let entry_hash = |at: usize| {
-        u64::from_be_bytes(
-            block[at * ENTRY_BYTES..at * ENTRY_BYTES + 8]
-                .try_into()
-                .expect("eight bytes"),
-        )
-    };
-    let mut low = 0usize;
-    let mut high = entries;
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match entry_hash(mid).cmp(&hash) {
-            std::cmp::Ordering::Less => low = mid + 1,
-            std::cmp::Ordering::Greater => high = mid,
-            std::cmp::Ordering::Equal => {
-                return Ok(Some(u64::from_be_bytes(
-                    block[mid * ENTRY_BYTES + 8..mid * ENTRY_BYTES + 16]
-                        .try_into()
-                        .expect("eight bytes"),
-                )));
-            }
+    let mut found = None;
+    let mut done = false;
+    for_each_entry(block, |entry_hash, value| {
+        if done {
+            return Ok(());
         }
-    }
-    Ok(None)
+        if entry_hash >= hash {
+            if entry_hash == hash {
+                found = Some(value);
+            }
+            done = true;
+        }
+        Ok(())
+    })?;
+    Ok(found)
 }
 
 /// SHA-256 of a finished table file's index+footer tail, or None when the
@@ -345,21 +401,40 @@ mod tests {
 
     #[test]
     fn round_trips_entries_across_block_boundaries() {
-        let entries: Vec<(u64, u64)> = (0..(BLOCK_ENTRIES as u64 * 2 + 7))
-            .map(|i| (i * 3 + 1, i * 7))
-            .collect();
+        // Enough small-delta entries to fill several varint blocks, plus
+        // wide deltas and large values to exercise multi-byte varints.
+        let mut entries: Vec<(u64, u64)> = (0..80_000u64).map(|i| (i * 3 + 1, i * 7)).collect();
+        entries.push((1 << 60, u64::MAX));
+        entries.push((u64::MAX - 5, 1));
         let bytes = build(&entries);
         let index = open(&bytes);
         assert_eq!(index.entry_count, entries.len() as u64);
-        assert_eq!(index.blocks.len(), 3);
+        assert!(index.blocks.len() > 2, "spans multiple blocks");
+        let boundary = usize::try_from(
+            index.blocks[0].len * u64::try_from(entries.len()).unwrap()
+                / u64::try_from(bytes.len()).unwrap(),
+        )
+        .unwrap();
         for (hash, value) in [
             entries[0],
-            entries[BLOCK_ENTRIES - 1],
-            entries[BLOCK_ENTRIES],
+            entries[boundary.min(entries.len() - 1)],
+            entries[entries.len() - 2],
             *entries.last().unwrap(),
         ] {
             assert_eq!(get(&bytes, &index, hash), Some(value), "hash {hash}");
         }
+        // every entry survives the round trip
+        let mut walked = Vec::new();
+        for block in &index.blocks {
+            let start = usize::try_from(block.offset).unwrap();
+            let end = start + usize::try_from(block.len).unwrap();
+            for_each_entry(&bytes[start..end], |hash, value| {
+                walked.push((hash, value));
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(walked, entries);
         assert_eq!(get(&bytes, &index, 0), None);
         assert_eq!(get(&bytes, &index, 2), None);
         assert_eq!(get(&bytes, &index, u64::MAX), None);
