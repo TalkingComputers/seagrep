@@ -543,8 +543,12 @@ fn reports_changed_root_when_garbage_collection_invalidates_reader() -> Result<(
     let store_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let mut bucket = Bucket::default();
+    // "needle" must live in TWO docs so its candidates still require a
+    // postings fetch — singleton grams inline their doc id and would let a
+    // stale reader answer without touching the store.
     bucket.put("logs/a", b"needle old");
-    bucket.put("logs/b", b"hay old");
+    bucket.put("logs/b", b"hay needle old");
+    bucket.put("logs/c", b"just hay old");
     reindex(
         &bucket,
         store_dir.path(),
@@ -558,7 +562,8 @@ fn reports_changed_root_when_garbage_collection_invalidates_reader() -> Result<(
     )?;
 
     bucket.put("logs/a", b"needle new");
-    bucket.put("logs/b", b"hay new");
+    bucket.put("logs/b", b"hay needle new");
+    bucket.put("logs/c", b"just hay new");
     reindex(
         &bucket,
         store_dir.path(),

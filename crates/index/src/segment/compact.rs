@@ -93,6 +93,21 @@ fn write_compaction_run(
     map.visit(|gram, packed| {
         let (offset, count) = crate::eval::unpack_posting(packed);
         anyhow::ensure!(count > 0, "term map contains an empty posting list");
+        if count == 1 {
+            // Singleton grams inline their doc id in the offset field; no
+            // posting block exists to read.
+            let id = u32::try_from(offset).context("singleton doc id overflows u32")?;
+            let mut padded = [0u8; 8];
+            padded[8 - gram.len()..].copy_from_slice(gram);
+            let key = u64::from_be_bytes(padded);
+            if let Some(new_id) = remap
+                .get(usize::try_from(id)?)
+                .context("singleton document ID is out of bounds")?
+            {
+                crate::build::write_posting_record(&mut writer, strategy, key, *new_id)?;
+            }
+            return Ok(());
+        }
         anyhow::ensure!(
             count <= meta.doc_count,
             "term map posting count exceeds its segment document count"

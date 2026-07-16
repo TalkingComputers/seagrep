@@ -277,11 +277,9 @@ impl TermMap {
                     let raw = bytes
                         .get(start..end)
                         .context("sparse table block is out of bounds")?;
-                    for entry in raw.chunks_exact(crate::sparse_table::ENTRY_BYTES) {
-                        let key: [u8; 8] = entry[..8].try_into().expect("eight bytes");
-                        let value = u64::from_be_bytes(entry[8..].try_into().expect("eight bytes"));
-                        visit(&key, value)?;
-                    }
+                    crate::sparse_table::for_each_entry(raw, |hash, value| {
+                        visit(&hash.to_be_bytes(), value)
+                    })?;
                 }
             }
             Self::Trigram(maps) => {

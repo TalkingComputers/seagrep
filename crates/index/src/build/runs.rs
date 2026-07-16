@@ -553,13 +553,17 @@ fn insert_posting_file<W: Write>(
     if ids.is_empty() {
         return Ok(());
     }
+    let gram = key.to_be_bytes();
+    let gram = &gram[8 - key_bytes(strategy)..];
+    // Singleton grams inline their doc id in the offset field and write no
+    // posting block at all: `count == 1` is the tag.
+    if let [id] = ids.as_slice() {
+        builder.insert(gram, eval::pack_posting(u64::from(*id), 1)?)?;
+        return Ok(());
+    }
     let mut block = Vec::new();
     encode_posting_block(&mut block, &ids, doc_count);
-    let gram = key.to_be_bytes();
-    builder.insert(
-        &gram[8 - key_bytes(strategy)..],
-        eval::pack_posting(*offset, ids.len())?,
-    )?;
+    builder.insert(gram, eval::pack_posting(*offset, ids.len())?)?;
     postings.write_all(&block)?;
     *offset += u64::try_from(block.len())?;
     Ok(())

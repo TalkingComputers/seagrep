@@ -45,7 +45,12 @@ pub(crate) fn unpack_posting(value: u64) -> (u64, u32) {
 pub(crate) enum Resolved {
     All,
     None,
-    Gram { offset: u64, count: u32 },
+    /// A singleton gram: exactly one document, id inlined in the term value.
+    Doc(DocId),
+    Gram {
+        offset: u64,
+        count: u32,
+    },
     And(Vec<Resolved>),
     Or(Vec<Resolved>),
 }
@@ -66,6 +71,10 @@ pub(crate) fn resolve(
                 let (offset, count) = unpack_posting(value);
                 if count >= doc_count {
                     Resolved::All
+                } else if count == 1 {
+                    // Singleton grams inline their doc id in the offset
+                    // field: no postings entry exists and none is fetched.
+                    Resolved::Doc(offset as DocId)
                 } else {
                     Resolved::Gram { offset, count }
                 }
@@ -135,7 +144,7 @@ pub(crate) fn blocks_needed(resolved: &Resolved, out: &mut BTreeMap<u64, u32>) {
                 blocks_needed(child, out);
             }
         }
-        Resolved::All | Resolved::None => {}
+        Resolved::All | Resolved::None | Resolved::Doc(_) => {}
     }
 }
 
@@ -150,6 +159,7 @@ pub(crate) fn eval(resolved: &Resolved, blocks: &BTreeMap<u64, Vec<DocId>>) -> R
     Ok(match resolved {
         Resolved::All => Selection::All,
         Resolved::None => Selection::Ids(Vec::new()),
+        Resolved::Doc(id) => Selection::Ids(vec![*id]),
         Resolved::Gram { offset, .. } => Selection::Ids(
             blocks
                 .get(offset)
