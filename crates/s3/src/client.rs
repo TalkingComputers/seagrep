@@ -304,6 +304,14 @@ impl S3Client {
             .enable_all()
             .build()?;
         let endpoint_for_sdk = endpoint_base.clone();
+        // Snapshot the credential-cache key before the SDK reads any of its
+        // inputs; the provider re-verifies it before writing, bracketing the
+        // SDK's reads so an edit in between voids the cache write.
+        let cache_base = if credentials.is_none() {
+            crate::creds::key_base()
+        } else {
+            None
+        };
         let (sdk, upload_sdk, region) = rt.block_on(async move {
             let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .retry_config(aws_config::retry::RetryConfig::disabled())
@@ -339,7 +347,7 @@ impl S3Client {
                 let chain = shared.credentials_provider().context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
-                let provider = crate::creds::DiskCachedProvider::new(chain);
+                let provider = crate::creds::DiskCachedProvider::new(chain, cache_base);
                 provider.provide_credentials().await.context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;

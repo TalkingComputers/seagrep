@@ -45,17 +45,27 @@ struct StoredCredentials {
     expires_unix_secs: u64,
 }
 
-/// The config-derived part of the cache key, frozen when the SDK froze its
-/// own view of the same files (provider construction happens within the same
-/// load): profile selection plus both shared config files. The SSO token
-/// cache is deliberately NOT frozen — the SSO provider re-reads it on every
-/// resolution, so the key hashes it live per lookup and a fresh `aws sso
-/// login` moves the key.
-#[derive(Debug)]
-struct KeyBase {
-    dir: PathBuf,
-    sso_cache_dir: PathBuf,
+/// The complete cache key state, frozen once per process. The SDK also
+/// freezes its view of every keyed input for the process lifetime: the
+/// profile files at load and the SSO token in memory until it expires — so
+/// a per-process snapshot is the *matching* granularity, and a fresh
+/// `aws sso login` reaches the key on the next process.
+///
+/// Call [`key_base`] BEFORE `ConfigLoader::load` and verify it afterwards
+/// with [`KeyBase::still_current`]: an edit to any keyed input in between —
+/// the whole window in which the SDK reads them — lands on one side of that
+/// bracket and voids the write, so credentials can never be stored under a
+/// key describing inputs the SDK did not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyBase {
+    path: PathBuf,
     frozen: [u8; 32],
+}
+
+impl KeyBase {
+    fn still_current(&self) -> bool {
+        key_base().as_ref() == Some(self)
+    }
 }
 
 #[derive(Debug)]
@@ -63,16 +73,16 @@ pub(crate) struct DiskCachedProvider {
     inner: SharedCredentialsProvider,
     base: Option<KeyBase>,
     #[cfg(test)]
-    path_override: Option<PathBuf>,
+    verify_base: bool,
 }
 
 impl DiskCachedProvider {
-    pub(crate) fn new(inner: SharedCredentialsProvider) -> Self {
+    pub(crate) fn new(inner: SharedCredentialsProvider, base: Option<KeyBase>) -> Self {
         Self {
             inner,
-            base: key_base(),
+            base,
             #[cfg(test)]
-            path_override: None,
+            verify_base: true,
         }
     }
 
@@ -80,49 +90,35 @@ impl DiskCachedProvider {
     fn with_path(inner: SharedCredentialsProvider, path: PathBuf) -> Self {
         Self {
             inner,
-            base: None,
-            path_override: Some(path),
+            base: Some(KeyBase {
+                path,
+                frozen: [0; 32],
+            }),
+            verify_base: false,
         }
     }
 
-    fn path(&self) -> Option<PathBuf> {
+    fn base_is_current(&self, base: &KeyBase) -> bool {
         #[cfg(test)]
-        if let Some(path) = &self.path_override {
-            return Some(path.clone());
+        if !self.verify_base {
+            return true;
         }
-        let base = self.base.as_ref()?;
-        let mut hasher = Sha256::new();
-        hasher.update(base.frozen);
-        for (name, bytes) in sso_token_cache_state(&base.sso_cache_dir)? {
-            hasher.update(&name);
-            hasher.update([0]);
-            hasher.update(&bytes);
-            hasher.update([0]);
-        }
-        let key = hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Some(base.dir.join(format!("{key}.json")))
+        base.still_current()
     }
 
     async fn load(&self) -> provider::Result {
-        // The key is derived fresh per lookup so a mid-process `aws sso
-        // login` moves it and the stale entry stops matching.
-        let path = self.path();
-        if let Some(path) = &path {
-            if let Some(credentials) = read_cached(path, SystemTime::now()) {
+        if let Some(base) = &self.base {
+            if let Some(credentials) = read_cached(&base.path, SystemTime::now()) {
                 return Ok(credentials);
             }
         }
         let credentials = self.inner.provide_credentials().await?;
-        if let (Some(path), Some(_)) = (&path, credentials.expiry()) {
-            // Re-derive the key: if any keyed input changed while the chain
-            // resolved, these credentials belong to the new key, not the one
-            // we read. A failed cache write must not fail the request.
-            if self.path() == Some(path.to_path_buf()) {
-                let _ = write_cached(path, &credentials);
+        if let (Some(base), Some(_)) = (&self.base, credentials.expiry()) {
+            // The write-side bracket: only persist while every keyed input
+            // still matches the pre-load snapshot. A failed cache write must
+            // not fail the request it accelerates.
+            if self.base_is_current(base) {
+                let _ = write_cached(&base.path, &credentials);
             }
         }
         Ok(credentials)
@@ -149,37 +145,46 @@ fn read_keyed_file(path: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// The lines of the active profile's section. Config files title profile
-/// sections `[profile name]` (`[default]` for the default profile);
-/// credentials files title them `[name]`.
-fn profile_section<'a>(text: &'a str, profile: &str, prefixed: bool) -> Vec<&'a str> {
-    let mut lines = Vec::new();
-    let mut in_profile = false;
-    for line in text.lines() {
-        let line = line.trim();
+/// The lowercase key of every `key = value` line inside sections whose
+/// header `matches`. Indented lines are value continuations, not keys, and
+/// the SDK lowercases keys, so `SSO_SESSION` and `sso_session` are one key.
+fn section_keys(text: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut active = false;
+    for raw in text.lines() {
+        let line = raw.trim();
         if line.starts_with('[') {
             let header = line.trim_start_matches('[').trim_end_matches(']').trim();
-            in_profile = header == profile || (prefixed && header == format!("profile {profile}"));
-        } else if in_profile {
-            lines.push(line);
+            active = matches(header);
+        } else if active && !raw.starts_with([' ', '\t']) {
+            if let Some((key, _)) = line.split_once('=') {
+                keys.push(key.trim().to_lowercase());
+            }
         }
     }
-    lines
+    keys
 }
 
-/// True when the active profile resolves through SSO and nothing else: its
-/// config section carries an SSO marker and neither file's section names a
-/// competing credential source. A section mixing `credential_process` or an
-/// assume-role with SSO fields is not keyable and must not cache.
+/// True when the active profile resolves through SSO and nothing else.
+///
+/// Enabling is strict: the SSO marker must sit in the section header form
+/// the SDK actually reads from the config file (`[profile name]`, or
+/// `[default]`). Disqualifying is lax: a competing credential source in any
+/// header form that could plausibly bind to this profile — in either file,
+/// since the credentials file wins for the same name — disables the cache.
+/// When unsure, no cache: the failure mode of strictness is a slow first
+/// call, the failure mode of laxness is caching an unkeyable identity.
 fn profile_selects_sso(config: &str, credentials: &str, profile: &str) -> bool {
-    let config_section = profile_section(config, profile, true);
-    if !config_section
+    let strict = |header: &str| {
+        header == format!("profile {profile}") || (profile == "default" && header == "default")
+    };
+    if !section_keys(config, strict)
         .iter()
-        .any(|line| line.starts_with("sso_session") || line.starts_with("sso_start_url"))
+        .any(|key| key == "sso_session" || key == "sso_start_url")
     {
         return false;
     }
-    let credentials_section = profile_section(credentials, profile, false);
+    let lax = |header: &str| header == profile || header == format!("profile {profile}");
     const COMPETING_SOURCES: [&str; 6] = [
         "credential_process",
         "credential_source",
@@ -188,19 +193,19 @@ fn profile_selects_sso(config: &str, credentials: &str, profile: &str) -> bool {
         "source_profile",
         "aws_access_key_id",
     ];
-    !config_section
+    !section_keys(config, lax)
         .iter()
-        .chain(credentials_section.iter())
-        .any(|line| COMPETING_SOURCES.iter().any(|key| line.starts_with(key)))
+        .chain(section_keys(credentials, lax).iter())
+        .any(|key| COMPETING_SOURCES.contains(&key.as_str()))
 }
 
-/// Everything SSO resolution reads to pick an identity, snapshotted while
-/// the SDK holds the same view: the profile selection and both shared config
-/// files. Environments that resolve credentials some other way return
-/// `None`: no cache. `AWS_DEFAULT_PROFILE` is deliberately ignored — the
-/// Rust SDK only honors `AWS_PROFILE`, and the key must select exactly the
-/// profile the SDK resolves.
-fn key_base() -> Option<KeyBase> {
+/// Everything SSO resolution reads to pick an identity: the profile
+/// selection, both shared config files, and the SSO token cache.
+/// Environments that resolve credentials some other way return `None`: no
+/// cache. `AWS_DEFAULT_PROFILE` is deliberately ignored — the Rust SDK only
+/// honors `AWS_PROFILE`, and the key must select exactly the profile the
+/// SDK resolves.
+pub(crate) fn key_base() -> Option<KeyBase> {
     for var in [
         "AWS_ACCESS_KEY_ID",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
@@ -238,14 +243,22 @@ fn key_base() -> Option<KeyBase> {
     hasher.update([0]);
     hasher.update(&credentials);
     hasher.update([0]);
-    let mut dir = holys3_core::cache_home().ok()?;
-    dir.push("holys3");
-    dir.push("credentials");
-    Some(KeyBase {
-        dir,
-        sso_cache_dir: home.join(".aws/sso/cache"),
-        frozen: hasher.finalize().into(),
-    })
+    for (name, bytes) in sso_token_cache_state(&home.join(".aws/sso/cache"))? {
+        hasher.update(&name);
+        hasher.update([0]);
+        hasher.update(&bytes);
+        hasher.update([0]);
+    }
+    let frozen: [u8; 32] = hasher.finalize().into();
+    let key = frozen
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut path = holys3_core::cache_home().ok()?;
+    path.push("holys3");
+    path.push("credentials");
+    path.push(format!("{key}.json"));
+    Some(KeyBase { path, frozen })
 }
 
 /// The SSO token cache contents, sorted by file name. A missing directory is
