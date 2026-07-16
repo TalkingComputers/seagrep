@@ -2203,6 +2203,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -2213,6 +2214,9 @@ dependencies = [
  "holys3-core",
  "percent-encoding",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "url",

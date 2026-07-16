@@ -3,6 +3,7 @@
 
 mod cache;
 mod client;
+mod creds;
 pub mod fetch;
 
 use anyhow::Context;

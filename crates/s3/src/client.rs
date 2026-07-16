@@ -333,14 +333,18 @@ impl S3Client {
                 )?
                 .as_ref()
                 .to_owned();
-            if !has_static_credentials {
-                let provider = shared.credentials_provider().context(
+            let cached_provider = if has_static_credentials {
+                None
+            } else {
+                let chain = shared.credentials_provider().context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
+                let provider = crate::creds::DiskCachedProvider::new(chain);
                 provider.provide_credentials().await.context(
                     "no AWS credentials: set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or configure the active AWS profile",
                 )?;
-            }
+                Some(provider)
+            };
             let mut service = aws_sdk_s3::config::Builder::from(&shared)
                 .retry_config(aws_config::retry::RetryConfig::disabled())
                 .timeout_config(
@@ -357,6 +361,9 @@ impl S3Client {
                     .disable_s3_express_session_auth(true)
                     .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
                     .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+            }
+            if let Some(provider) = cached_provider {
+                service = service.credentials_provider(provider);
             }
             let service = service.build();
             let upload_service = service
