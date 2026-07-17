@@ -8,6 +8,7 @@ mod pack;
 mod remote_terms;
 mod search;
 mod segment;
+mod postings_table;
 mod sparse_table;
 mod terms;
 

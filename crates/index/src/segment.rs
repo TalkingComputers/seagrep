@@ -58,6 +58,12 @@ pub(crate) struct SegmentMeta {
     pub terms_tail_hash: String,
     pub postings_len: u64,
     pub postings_hash: String,
+    /// Length of postings.bin's data region; the remainder is the per-block
+    /// verification table + footer.
+    pub postings_data_len: u64,
+    /// SHA-256 of the verification table + footer tail — lets readers trust
+    /// a ranged fetch of just the table.
+    pub postings_tail_hash: String,
     pub docs_len: u64,
     pub docs_hash: String,
     pub min_key: String,
@@ -835,7 +841,13 @@ pub(crate) fn merge_and_put_segment(
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
     }
-    let publish = || -> Result<(crate::build::MergedBlob, crate::build::MergedBlob, String)> {
+    type Published = (
+        crate::build::MergedBlob,
+        crate::build::MergedBlob,
+        String,
+        crate::build::PostingsTail,
+    );
+    let publish = || -> Result<Published> {
         let terms_sink = store.put_streaming(&segment_blob(&seg_id, "terms.fst"))?;
         let postings_sink = store.put_streaming(&segment_blob(&seg_id, "postings.bin"))?;
         let merged = crate::build::merge_posting_runs(
@@ -848,7 +860,7 @@ pub(crate) fn merge_and_put_segment(
         store.put(&segment_blob(&seg_id, "docs.bin"), &docs_bytes)?;
         Ok(merged)
     };
-    let (fst, postings, terms_tail_hash) = match publish() {
+    let (fst, postings, terms_tail_hash, postings_tail) = match publish() {
         Ok(merged) => merged,
         Err(error) => {
             // Random-keyed blobs from a failed publish are unreferenced and
@@ -868,6 +880,8 @@ pub(crate) fn merge_and_put_segment(
         terms_tail_hash,
         postings_len: postings.len,
         postings_hash: postings.hash,
+        postings_data_len: postings_tail.data_len,
+        postings_tail_hash: postings_tail.tail_hash,
         docs_len: docs_bytes.len() as u64,
         docs_hash,
         min_key: tables.sources[0].key.clone(),
