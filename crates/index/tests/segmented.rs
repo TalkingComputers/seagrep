@@ -2034,3 +2034,46 @@ fn colliding_gram_hashes_keep_results_exact() -> Result<()> {
     assert_eq!(matches.len(), 1);
     Ok(())
 }
+
+#[test]
+fn undecodable_objects_surface_in_search_stats() -> Result<()> {
+    let mut bucket = Bucket::default();
+    bucket.put("good.txt", b"a searchable needle line\n");
+    // A truncated gzip stream sniffs as gzip but fails mid-decode; the
+    // object is excluded with a build warning and queries must surface
+    // the gap, not hide it.
+    bucket.put(
+        "poison.gz",
+        &[
+            0x1f, 0x8b, 0x08, 0x00, 0xc5, 0x60, 0x5a, 0x6a, 0x02, 0xff, 0xed, 0xca, 0xc1, 0x0d,
+            0x80, 0x20, 0x10, 0x44, 0xd1, 0xbb, 0x55, 0x4c, 0x6d, 0xba,
+        ],
+    );
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let store = LocalBlobStore::new(store_dir.path());
+    let listing = bucket.listing();
+    let report = update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    assert_eq!(report.added, 2, "both objects are tracked as sources");
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let (matches, stats) = search_collect(&reader, "searchable needle")?;
+    assert_eq!(stats.hits, ["good.txt"]);
+    assert_eq!(matches.len(), 1);
+    assert_eq!(
+        stats.excluded_objects, 1,
+        "the poisoned object must be counted as unsearchable"
+    );
+    Ok(())
+}

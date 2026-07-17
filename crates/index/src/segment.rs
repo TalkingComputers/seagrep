@@ -70,6 +70,9 @@ pub(crate) struct SegmentMeta {
     pub max_key: String,
     pub dead_hash: String,
     pub dead_len: u64,
+    /// Sources excluded at build time (undecodable objects). Queries surface
+    /// this so completeness gaps are visible without the build log.
+    pub failed_source_count: u32,
     pub packs: Vec<PackMeta>,
 }
 
@@ -893,6 +896,9 @@ pub(crate) fn merge_and_put_segment(
         max_key: tables.sources[tables.sources.len() - 1].key.clone(),
         dead_hash: String::new(),
         dead_len: 0,
+        failed_source_count: u32::try_from(
+            tables.sources.iter().filter(|source| source.failed).count(),
+        )?,
         packs: pack_metas,
     };
     Ok(meta)
@@ -1618,6 +1624,13 @@ fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) {
 }
 
 impl crate::IndexReader for SegmentedReader {
+    fn excluded_objects(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| segment.meta.failed_source_count as usize)
+            .sum()
+    }
+
     fn strategy(&self) -> Strategy {
         self.strategy
     }
@@ -1742,6 +1755,7 @@ mod tests {
             max_key: "z".into(),
             dead_hash: String::new(),
             dead_len: 0,
+            failed_source_count: 0,
             packs: vec![PackMeta {
                 hash: "e".repeat(64),
                 len: 1,

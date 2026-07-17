@@ -139,10 +139,6 @@ impl PostingsTableIndex {
         Ok(Self { data_len, hashes })
     }
 
-    pub(crate) fn tail_len(&self) -> u64 {
-        self.hashes.len() as u64 * 32 + FOOTER_BYTES as u64
-    }
-
     /// The data-region byte range of verification block `index`.
     pub(crate) fn block_range(&self, index: usize) -> (u64, u64) {
         let offset = index as u64 * VERIFY_BLOCK_BYTES as u64;

@@ -72,11 +72,18 @@ pub struct SearchStats {
     pub candidates: usize,
     pub total_docs: usize,
     pub bytes_fetched: usize,
+    /// Source objects the index could not decode at build time: their
+    /// contents are not searchable, and results cannot include them.
+    pub excluded_objects: usize,
 }
 
 pub trait IndexReader: DocFetcher {
     fn strategy(&self) -> Strategy;
     fn total_docs(&self) -> usize;
+    /// Objects excluded at build time (undecodable); zero when unknown.
+    fn excluded_objects(&self) -> usize {
+        0
+    }
     fn candidate_docs(
         &self,
         q: &Query,
