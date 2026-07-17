@@ -1,7 +1,7 @@
 import subprocess, json, os, re, sys
 from collections import defaultdict
 
-H3 = "/Users/parsabahraminejad/Desktop/Experiments/holys3/target/release/seagrep"
+H3 = os.environ.get("SEAGREP_BIN", "target/release/seagrep")
 ENV = {**os.environ, "AWS_ACCESS_KEY_ID": "minioadmin", "AWS_SECRET_ACCESS_KEY": "minioadmin"}
 ENV.pop("AWS_PROFILE", None)
 SG_ARGS = ["s3://parity", "--index", "s3://holys3-index/parity-idx",
@@ -30,6 +30,8 @@ PATTERNS = [
 def run_sg(pattern, flags):
     cmd = [H3, *flags, "-a", "--line-number", pattern, *SG_ARGS]
     p = subprocess.run(cmd, capture_output=True, text=False, env=ENV)
+    if p.returncode not in (0, 1):  # 1 = no matches, same contract as rg
+        sys.exit(f"seagrep failed ({p.returncode}): {p.stderr.decode(errors='replace')}")
     hits = defaultdict(set)
     for raw in p.stdout.splitlines():
         line = raw.decode(errors="surrogateescape")
@@ -41,6 +43,8 @@ def run_sg(pattern, flags):
 def run_rg(pattern, flags):
     cmd = ["rg", *flags, "-a", "--no-mmap", "--line-number", "--no-heading", pattern, "."]
     p = subprocess.run(cmd, capture_output=True, text=False, cwd="/tmp/parity/decoded", env=ENV)
+    if p.returncode not in (0, 1):
+        sys.exit(f"ripgrep failed ({p.returncode}): {p.stderr.decode(errors='replace')}")
     hits = defaultdict(set)
     for raw in p.stdout.splitlines():
         line = raw.decode(errors="surrogateescape")
@@ -60,3 +64,4 @@ for pattern, flags in PATTERNS:
             print(f"  seagrep: {sorted(sg.get(f, set()))}")
             print(f"  ripgrep: {sorted(rg.get(f, set()))}")
 print(f"\n{'PARITY CLEAN' if divergences == 0 else f'{divergences} divergences'} across {len(PATTERNS)} patterns")
+sys.exit(1 if divergences else 0)
