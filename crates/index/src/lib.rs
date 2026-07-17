@@ -5,6 +5,7 @@ mod build;
 mod eval;
 mod format;
 mod pack;
+mod delta_blocks;
 mod postings_table;
 mod remote_terms;
 mod search;
