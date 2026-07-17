@@ -79,7 +79,11 @@ pub fn is_index_key(prefix: &str, key: &str) -> bool {
 }
 
 fn legacy_index_namespace(prefix: &str) -> String {
-    build_index_namespace(prefix).replace(".seagrep", ".holys3")
+    if prefix.is_empty() {
+        ".holys3".into()
+    } else {
+        format!("{}.holys3", list_prefix(prefix))
+    }
 }
 
 /// Index blob storage under an S3 key prefix.
@@ -559,6 +563,16 @@ mod tests {
         assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
         assert!(is_index_key("", ".holys3/segments/x/terms.fst"));
         assert!(!is_index_key("root/path", "root/path/.holys3-data/log"));
+        // a source prefix that itself contains ".seagrep" must not corrupt
+        // the legacy namespace derivation
+        assert!(is_index_key(
+            "data.seagrep/logs",
+            "data.seagrep/logs/.holys3/CURRENT"
+        ));
+        assert!(is_index_key(
+            "data.seagrep/logs",
+            "data.seagrep/logs/.seagrep/CURRENT"
+        ));
     }
 
     #[test]
