@@ -202,7 +202,9 @@ jobs:
           # Git baseline instead of the registry: the registry only knows the
           # pre-rename crate names, and pre-release semver is main-relative
           # anyway. Crates absent from the baseline are new and skipped.
-          baseline-rev: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # Scheduled and manual runs have neither a PR base nor a push
+          # "before" ref, so they self-compare, which trivially passes.
+          baseline-rev: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
 
   workflow-lint:
     name: workflow lint
