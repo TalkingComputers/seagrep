@@ -567,7 +567,16 @@ fn execute_search(
     let candidate_prefix =
         pick_candidate_prefix(&target_prefix, execution.scope.and_then(Scope::key_prefix));
     let search_stats = search_with_reopen(
-        || SegmentedReader::open(index.store(), index.cache(), &source_identity),
+        || {
+            SegmentedReader::open(index.store(), index.cache(), &source_identity).with_context(
+                || {
+                    format!(
+                        "index location: {} (default is the .seagrep namespace inside the searched bucket; pass --index if it lives elsewhere)",
+                        index.location()
+                    )
+                },
+            )
+        },
         execution.pattern,
         KeyScope {
             prefix: candidate_prefix,
