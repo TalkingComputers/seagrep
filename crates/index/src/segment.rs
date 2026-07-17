@@ -1133,8 +1133,7 @@ impl SegmentedReader {
                             .join(&segment.meta.seg_id)
                             .join(format!("postings-block-{index:08x}"))
                     };
-                    let mut payloads =
-                        std::collections::BTreeMap::<usize, bytes::Bytes>::new();
+                    let mut payloads = std::collections::BTreeMap::<usize, bytes::Bytes>::new();
                     let mut missing = Vec::new();
                     for &index in &block_set {
                         let hit = self.range_cache().then(|| {
@@ -1151,8 +1150,10 @@ impl SegmentedReader {
                         }
                     }
                     if !missing.is_empty() {
-                        let block_ranges: Vec<(u64, u64)> =
-                            missing.iter().map(|&index| table.block_range(index)).collect();
+                        let block_ranges: Vec<(u64, u64)> = missing
+                            .iter()
+                            .map(|&index| table.block_range(index))
+                            .collect();
                         let fetched = self.store.get_ranges(&postings_name, &block_ranges)?;
                         anyhow::ensure!(
                             fetched.len() == missing.len(),
@@ -1163,12 +1164,7 @@ impl SegmentedReader {
                         for (&index, bytes) in missing.iter().zip(fetched) {
                             table.verify(index, &bytes)?;
                             if self.range_cache() {
-                                cache::write_back(
-                                    &self.cache_dir,
-                                    &block_path(index),
-                                    &bytes,
-                                )
-                                .ok();
+                                cache::write_back(&self.cache_dir, &block_path(index), &bytes).ok();
                                 self.note_range_written(bytes.len() as u64);
                             }
                             payloads.insert(index, bytes);
@@ -1539,9 +1535,7 @@ impl SegmentedReader {
             table.data_len == meta.postings_data_len,
             "postings table data length does not match segment metadata"
         );
-        let _ = segment
-            .postings_table
-            .set(std::sync::Arc::new(table));
+        let _ = segment.postings_table.set(std::sync::Arc::new(table));
         Ok(segment
             .postings_table
             .get()

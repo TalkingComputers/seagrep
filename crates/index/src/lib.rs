@@ -5,10 +5,10 @@ mod build;
 mod eval;
 mod format;
 mod pack;
+mod postings_table;
 mod remote_terms;
 mod search;
 mod segment;
-mod postings_table;
 mod sparse_table;
 mod terms;
 
