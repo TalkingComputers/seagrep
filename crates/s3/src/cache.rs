@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use fs4::FileExt;
-use holys3_core::{DocumentBody, DocumentSpool};
+use seagrep_core::{DocumentBody, DocumentSpool};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const MAGIC: &[u8; 8] = b"HS3CACH2";
-const STATE_MAGIC: &[u8; 8] = b"HS3STAT2";
+const MAGIC: &[u8; 8] = b"SGCACHE2";
+const STATE_MAGIC: &[u8; 8] = b"SGSTATE2";
 const HEADER_LEN: usize = 56;
 #[cfg(not(test))]
 const CACHE_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;
