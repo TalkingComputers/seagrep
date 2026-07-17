@@ -86,8 +86,10 @@ pub(crate) fn decode_delta_blocks(bytes: &[u8], count: u32, doc_count: u32) -> R
     Ok(ids)
 }
 
-/// Exact encoded length without materializing the encoding; the build path
-/// tracks offsets with it.
+/// Exact encoded length without materializing the encoding; tests use it to
+/// pin the writer's length accounting (the build path measures the actual
+/// buffer).
+#[cfg(test)]
 pub(crate) fn encoded_len(ids: &[DocId]) -> u64 {
     let mut total = 0u64;
     let mut previous: Option<DocId> = None;
