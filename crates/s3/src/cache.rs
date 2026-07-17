@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const MAGIC: &[u8; 8] = b"HS3CACH2";
-const STATE_MAGIC: &[u8; 8] = b"HS3STAT2";
+const MAGIC: &[u8; 8] = b"SGCACHE2";
+const STATE_MAGIC: &[u8; 8] = b"SGSTATE2";
 const HEADER_LEN: usize = 56;
 #[cfg(not(test))]
 const CACHE_MEMORY_LIMIT: u64 = 8 * 1024 * 1024;

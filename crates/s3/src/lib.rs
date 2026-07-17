@@ -61,11 +61,25 @@ pub fn list_prefix(prefix: &str) -> String {
 }
 
 pub fn is_index_key(prefix: &str, key: &str) -> bool {
-    let namespace = build_index_namespace(prefix);
-    key == namespace
-        || key
-            .strip_prefix(&namespace)
-            .is_some_and(|relative| relative.starts_with('/'))
+    // `.holys3` is the pre-rename namespace: buckets indexed before the
+    // seagrep rename still hold blobs there, and treating them as source
+    // objects would index the old index. Recognize both until those
+    // buckets are cleaned (drop with the first release).
+    [
+        build_index_namespace(prefix),
+        legacy_index_namespace(prefix),
+    ]
+    .iter()
+    .any(|namespace| {
+        key == *namespace
+            || key
+                .strip_prefix(namespace.as_str())
+                .is_some_and(|relative| relative.starts_with('/'))
+    })
+}
+
+fn legacy_index_namespace(prefix: &str) -> String {
+    build_index_namespace(prefix).replace(".seagrep", ".holys3")
 }
 
 /// Index blob storage under an S3 key prefix.
@@ -541,6 +555,10 @@ mod tests {
         ));
         assert!(!is_index_key("root/path", "root/path/.seagrep-data/log"));
         assert!(!is_index_key("root/path", "root/path/file.txt"));
+        // pre-rename namespace: never listed as source
+        assert!(is_index_key("root/path", "root/path/.holys3/CURRENT"));
+        assert!(is_index_key("", ".holys3/segments/x/terms.fst"));
+        assert!(!is_index_key("root/path", "root/path/.holys3-data/log"));
     }
 
     #[test]

@@ -51,7 +51,9 @@ jobs:
       - name: Run base Criterion benches
         if: github.event_name == 'pull_request'
         working-directory: benchmark-base
-        run: cargo bench --locked -p seagrep-index --bench hot_paths -- --noplot --save-baseline pull-request-base
+        # No -p: the base checkout may predate the seagrep package rename,
+        # and hot_paths is the only bench target with this name either way.
+        run: cargo bench --locked --bench hot_paths -- --noplot --save-baseline pull-request-base
       - name: Import base baselines
         if: github.event_name == 'pull_request'
         # The base build gets its own target dir so its artifacts can never
