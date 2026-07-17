@@ -3380,7 +3380,6 @@ dependencies = [
  "brotli",
  "bytes",
  "bzip2",
- "encoding_rs",
  "encoding_rs_io",
  "flate2",
  "fs4",

@@ -14,7 +14,6 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-encoding_rs.workspace = true
 encoding_rs_io.workspace = true
 serde.workspace = true
 regex.workspace = true
