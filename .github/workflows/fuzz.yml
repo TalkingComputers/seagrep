@@ -34,8 +34,10 @@ jobs:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
       - name: Run fuzzer
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.seconds || '900' }}
         run: |
-          seconds="${{ github.event.inputs.seconds || '900' }}"
+          seconds="$FUZZ_SECONDS"
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
           cargo fuzz run ${{ matrix.target }} -- -max_total_time="$seconds" -timeout=30 -rss_limit_mb=4096
