@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn decode_source_projects_orc_file() {
-        use arrow_array_58::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
         use std::sync::Arc;
         let batch = RecordBatch::try_from_iter(vec![
             ("id", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),

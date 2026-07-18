@@ -214,9 +214,9 @@ pub(super) fn orc_to_json_lines(
     let reader = orc_rust::ArrowReaderBuilder::try_new(bytes)
         .with_context(context)?
         .build();
-    let mut writer = arrow_json_58::writer::WriterBuilder::new()
+    let mut writer = arrow_json::writer::WriterBuilder::new()
         .with_explicit_nulls(true)
-        .build::<_, arrow_json_58::writer::LineDelimited>(DecodeWriter::new(
+        .build::<_, arrow_json::writer::LineDelimited>(DecodeWriter::new(
             key,
             limit,
             0,

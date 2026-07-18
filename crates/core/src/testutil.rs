@@ -192,7 +192,7 @@ pub mod encode {
     }
 
     pub fn orc_of_lines(lines: &[&str]) -> Vec<u8> {
-        use arrow_array_58::{ArrayRef, RecordBatch, StringArray};
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
         use std::sync::Arc;
         let batch = RecordBatch::try_from_iter(vec![(
             "line",
