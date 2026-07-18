@@ -84,6 +84,12 @@ pub trait DocFetcher {
 }
 
 pub trait BlobStore {
+    /// Every blob name under this store's root, when the backend can
+    /// enumerate them. `None` means the capability is unavailable (test
+    /// doubles); callers degrade to meta-driven garbage collection.
+    fn list_blobs(&self) -> AnyhowResult<Option<Vec<String>>> {
+        Ok(None)
+    }
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
     fn put_file(&self, name: &str, path: &Path) -> AnyhowResult<()>;
     fn get_file(&self, name: &str, file: &mut std::fs::File, len: u64) -> AnyhowResult<()> {
@@ -258,6 +264,25 @@ impl StreamingPut for LocalStreamingPut {
 }
 
 impl BlobStore for LocalBlobStore {
+    fn list_blobs(&self) -> AnyhowResult<Option<Vec<String>>> {
+        let mut names = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&self.root) {
+                    names.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        Ok(Some(names))
+    }
+
     fn put_streaming<'a>(&'a self, name: &str) -> AnyhowResult<Box<dyn StreamingPut + 'a>> {
         let path = self.root.join(name);
         let parent = path

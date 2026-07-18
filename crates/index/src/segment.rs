@@ -278,7 +278,20 @@ enum RootState {
     Absent,
     /// Present but undecodable (old format, corruption): a definitive
     /// rebuild signal, unlike a transient store failure which is `Err`.
-    Unreadable(String),
+    /// Carries the raw bytes so leading layout-stable fields can still be
+    /// prefix-parsed for the source-identity check.
+    Unreadable(String, Vec<u8>),
+}
+
+/// Leading fields of every root format ever shipped: (format, source).
+/// Parses the prefix even when the full root does not, so incompatible
+/// roots keep their source-identity guarantee. `None` (pre-postcard bytes,
+/// true corruption) skips the check rather than mis-asserting.
+fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
+    let (_format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+    postcard::take_from_bytes::<SourceIdentity>(rest)
+        .ok()
+        .map(|(source, _)| source)
 }
 
 /// A failing store is an error so a transient outage can never silently
@@ -293,7 +306,10 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
         None => Ok((RootState::Absent, None)),
         Some((bytes, version)) => match parse_segment_list(&bytes) {
             Ok(list) => Ok((RootState::Loaded(list), Some(version))),
-            Err(err) => Ok((RootState::Unreadable(format!("{err:#}")), Some(version))),
+            Err(err) => Ok((
+                RootState::Unreadable(format!("{err:#}"), bytes),
+                Some(version),
+            )),
         },
     }
 }
@@ -361,6 +377,10 @@ pub fn update_index(
     }
     let mut forced = rebuild;
     let mut replaced: Vec<SegmentMeta> = Vec::new();
+    // Blobs present BEFORE a forced-from-unreadable rebuild: the new root
+    // cannot reference them (segment ids are random per build), so anything
+    // here that the published root does not claim is old-format garbage.
+    let mut stale_inventory: Option<Vec<String>> = None;
     if rebuild {
         eprintln!("note: --rebuild requested; re-ingesting everything");
     }
@@ -406,7 +426,20 @@ pub fn update_index(
                 eprintln!("note: no existing index; building from scratch");
                 Vec::new()
             }
-            RootState::Unreadable(reason) => {
+            RootState::Unreadable(reason, root_bytes) => {
+                // The full root is unparseable (old format, corruption) but
+                // its leading fields have been layout-stable across every
+                // format: enforce source identity when they parse, and
+                // inventory the prefix so the rebuild can sweep blobs the
+                // new root does not reference (#59).
+                if let Some(old_source) = parse_root_source(&root_bytes) {
+                    anyhow::ensure!(
+                        old_source == *source,
+                        "index was built for {old_source}, which does not match requested source {source}; \
+                         delete the index location or point --index elsewhere"
+                    );
+                }
+                stale_inventory = store.list_blobs().unwrap_or(None);
                 eprintln!("note: {reason}; rebuilding from scratch");
                 forced = true;
                 Vec::new()
@@ -608,6 +641,26 @@ pub fn update_index(
         "another seagrep index run updated this index concurrently; rerun to pick up its result"
     );
     collect_garbage(store, &replaced, &list.segments);
+    // Blobs from an incompatible-format root: nothing could parse their
+    // metadata, but the pre-rebuild inventory names them and the published
+    // root (content-addressed packs included) claims everything still live.
+    if let Some(inventory) = stale_inventory {
+        let kept: std::collections::HashSet<String> =
+            list.segments.iter().flat_map(meta_blobs).collect();
+        let mut removed_blobs = 0usize;
+        for blob in inventory {
+            if blob != "segments.bin" && !kept.contains(&blob) {
+                if store.delete(&blob).is_err() {
+                    eprintln!("warning: failed to delete old-format index blob {blob}");
+                } else {
+                    removed_blobs += 1;
+                }
+            }
+        }
+        if removed_blobs > 0 {
+            eprintln!("note: removed {removed_blobs} blob(s) left by the old index format");
+        }
+    }
     Ok(UpdateReport {
         added,
         removed,
