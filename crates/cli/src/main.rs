@@ -597,9 +597,7 @@ fn execute_search(
     if execution.stats_line {
         eprintln!(
             "candidates={} total={} hits={}",
-            search_stats.candidates,
-            search_stats.total_docs,
-            search_stats.hits.len(),
+            search_stats.candidates, search_stats.total_docs, search_stats.hit_count,
         );
     }
     Ok(search_stats)
@@ -696,7 +694,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         let sink = json::JsonSink::new();
         let stats = execute_search(&source, &index, execution, &sink)?;
         sink.write_summary(&stats, started.elapsed())?;
-        return Ok(!stats.hits.is_empty());
+        return Ok(stats.hit_count > 0);
     }
     let sink: Box<dyn MatchSink> = if args.files_with_matches {
         Box::new(printer::PathSink::new(color))
@@ -715,7 +713,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         ))
     };
     let stats = execute_search(&source, &index, execution, sink.as_ref())?;
-    Ok(!stats.hits.is_empty())
+    Ok(stats.hit_count > 0)
 }
 
 fn run() -> Result<bool> {

@@ -67,6 +67,13 @@ pub trait MatchSink: Sync {
         true
     }
 
+    /// Whether `SearchStats.hits` should carry every matching key. Sinks
+    /// that only need `hit_count` return false so a query matching millions
+    /// of docs does not materialize and sort millions of strings.
+    fn wants_hit_keys(&self) -> bool {
+        true
+    }
+
     /// Called once per doc with at least one verified match.
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow>;
 }
@@ -132,15 +139,17 @@ fn search_batch(
     bounded_len: Option<usize>,
     options: MatchOptions,
     sink: &dyn MatchSink,
-) -> Result<(Vec<String>, usize, bool)> {
+) -> Result<(Vec<String>, usize, usize, bool)> {
     let workers = std::thread::available_parallelism()?
         .get()
         .min(documents.len());
 
     let bytes_fetched = AtomicUsize::new(0);
+    let hit_count = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     let wants_matches = sink.wants_matches();
+    let wants_hit_keys = sink.wants_hit_keys();
     let documents_ref = documents;
     // `re` is cloned per rayon split: the meta engine's shared scratch Cache
     // contends under exactly this all-threads-search workload.
@@ -184,7 +193,10 @@ fn search_batch(
             }
             Vec::new()
         };
-        lock(&hits)?.push(key.clone());
+        hit_count.fetch_add(1, Ordering::Relaxed);
+        if wants_hit_keys {
+            lock(&hits)?.push(key.clone());
+        }
         let doc = DocResult {
             events: &events,
             bytes_searched,
@@ -260,7 +272,12 @@ fn search_batch(
     let hits = hits
         .into_inner()
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))?;
-    Ok((hits, bytes_fetched.into_inner(), stopped))
+    Ok((
+        hits,
+        hit_count.into_inner(),
+        bytes_fetched.into_inner(),
+        stopped,
+    ))
 }
 
 /// Streaming search: candidate docs are fetched concurrently, decompressed
@@ -282,6 +299,7 @@ pub fn search_streaming(
     if options.max_count == Some(0) {
         return Ok(SearchStats {
             hits: Vec::new(),
+            hit_count: 0,
             candidates: 0,
             total_docs,
             bytes_fetched: 0,
@@ -293,6 +311,7 @@ pub fn search_streaming(
     let whole_document = can_search_as_document(pattern)?;
     let bounded_len = bounded_match_len(pattern)?;
     let mut hits = Vec::new();
+    let mut hit_count = 0usize;
     let mut candidates = 0usize;
     let mut bytes_fetched = 0usize;
     let visited = reader.visit_candidates(
@@ -307,7 +326,7 @@ pub fn search_streaming(
             if documents.is_empty() {
                 return Ok(true);
             }
-            let (batch_hits, batch_bytes, stopped) = search_batch(
+            let (batch_hits, batch_count, batch_bytes, stopped) = search_batch(
                 &documents,
                 reader,
                 &re,
@@ -317,6 +336,9 @@ pub fn search_streaming(
                 sink,
             )?;
             hits.extend(batch_hits);
+            hit_count = hit_count
+                .checked_add(batch_count)
+                .context("hit count overflows usize")?;
             bytes_fetched = bytes_fetched
                 .checked_add(batch_bytes)
                 .context("fetched byte count overflows usize")?;
@@ -334,6 +356,7 @@ pub fn search_streaming(
     hits.sort_unstable();
     Ok(SearchStats {
         hits,
+        hit_count,
         candidates,
         total_docs,
         bytes_fetched,
@@ -546,7 +569,7 @@ mod tests {
             largest: AtomicUsize::new(0),
         };
         let re = regex::bytes::Regex::new("needle").unwrap();
-        let (hits, bytes, stopped) = search_batch(
+        let (hits, hit_count, bytes, stopped) = search_batch(
             &documents,
             &fetcher,
             &re,
@@ -557,6 +580,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits, ["doc"]);
+        assert_eq!(hit_count, 1);
         assert_eq!(bytes, 7);
         assert!(!stopped);
         rayon::ThreadPoolBuilder::new()

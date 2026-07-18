@@ -144,6 +144,10 @@ impl StandardSink {
 }
 
 impl MatchSink for StandardSink {
+    fn wants_hit_keys(&self) -> bool {
+        false
+    }
+
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
         let mut state = lock(&self.state)?;
         let state = &mut *state;
@@ -217,6 +221,10 @@ impl PathSink {
 }
 
 impl MatchSink for PathSink {
+    fn wants_hit_keys(&self) -> bool {
+        false
+    }
+
     fn wants_matches(&self) -> bool {
         false // engine stops at first match per doc (rg -l)
     }
@@ -246,6 +254,10 @@ impl CountSink {
 }
 
 impl MatchSink for CountSink {
+    fn wants_hit_keys(&self) -> bool {
+        false
+    }
+
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
         let n = if self.count_matches {
             doc.events.iter().map(|e| e.submatches.len()).sum::<usize>()
@@ -285,6 +297,10 @@ impl QuietSink {
 }
 
 impl MatchSink for QuietSink {
+    fn wants_hit_keys(&self) -> bool {
+        false
+    }
+
     fn wants_matches(&self) -> bool {
         false
     }

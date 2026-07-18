@@ -68,8 +68,11 @@ pub struct IndexStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchStats {
-    /// Sorted keys of docs with at least one verified match.
+    /// Sorted keys of docs with at least one verified match. Empty when the
+    /// sink's `wants_hit_keys` is false; `hit_count` is authoritative.
     pub hits: Vec<String>,
+    /// Number of docs with at least one verified match, collected or not.
+    pub hit_count: usize,
     pub candidates: usize,
     pub total_docs: usize,
     pub bytes_fetched: usize,
@@ -1195,6 +1198,44 @@ mod tests {
         let (_, full_stats) = search_collect(&r, "world").unwrap();
         assert_eq!(stats.hits, full_stats.hits);
         assert_eq!(stats.hits, vec!["x", "z"]);
+    }
+
+    #[test]
+    fn count_only_sink_agrees_with_collected_hits() {
+        struct CountOnlySink;
+        impl MatchSink for CountOnlySink {
+            fn wants_matches(&self) -> bool {
+                false
+            }
+            fn wants_hit_keys(&self) -> bool {
+                false
+            }
+            fn on_doc(&self, _key: &str, _doc: &DocResult<'_>) -> Result<SinkFlow> {
+                Ok(SinkFlow::Continue)
+            }
+        }
+        let c = MemCorpus::new(
+            vec!["x".into(), "y".into(), "z".into()],
+            vec![
+                b"abc world".to_vec(),
+                b"nomatch".to_vec(),
+                b"world world".to_vec(),
+            ],
+        );
+        let (_s, _c, r) = build_tmp(&c, Strategy::Trigram);
+        let stats = search_streaming(
+            &r,
+            "world",
+            KeyScope::default(),
+            MatchOptions::default(),
+            &CountOnlySink,
+        )
+        .unwrap();
+        let (_, full_stats) = search_collect(&r, "world").unwrap();
+        assert!(stats.hits.is_empty(), "count-only mode must not collect");
+        assert_eq!(stats.hit_count, full_stats.hits.len());
+        assert_eq!(full_stats.hit_count, full_stats.hits.len());
+        assert_eq!(stats.hit_count, 2);
     }
 
     #[test]
