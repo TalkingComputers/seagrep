@@ -1,6 +1,6 @@
 use crate::codec::{decode_source, DecodeSink, DocumentBody, LogicalDocumentMeta, DECODE_LIMITS};
 use crate::grep::has_line_match;
-use anyhow::Result as AnyhowResult;
+use anyhow::{Context as AnyhowContext, Result as AnyhowResult};
 use bytes::Bytes;
 use fs4::FileExt;
 use std::io::{Seek, Write};
@@ -265,14 +265,26 @@ impl StreamingPut for LocalStreamingPut {
 
 impl BlobStore for LocalBlobStore {
     fn list_blobs(&self) -> AnyhowResult<Option<Vec<String>>> {
+        // A partial listing must never masquerade as a complete inventory:
+        // callers delete what the inventory names and nothing else, so a
+        // swallowed error here silently strands blobs. Only a root that
+        // does not exist yet is a legitimate empty store.
         let mut names = Vec::new();
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && dir == self.root => {
+                    return Ok(Some(Vec::new()))
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("listing {}", dir.display()))
+                }
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
+            for entry in entries {
+                let path = entry
+                    .with_context(|| format!("listing an entry of {}", dir.display()))?
+                    .path();
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(relative) = path.strip_prefix(&self.root) {
