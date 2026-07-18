@@ -37,7 +37,10 @@ seagrep pays the scan once, at index time. After that:
   without a single network request.
 - Results are exact. The index only narrows the candidate set; a real Rust
   regex over snapshot bytes decides every match, so there are no index
-  approximations and no false positives.
+  approximations and no false positives. Matching semantics
+  are verified differentially against ripgrep (`scripts/rg-parity/`), every
+  index range is SHA-256-verified at query time, and a search over a bucket
+  containing undecodable objects says so instead of silently skipping them.
 - Compressed objects (gzip, zstd, bzip2, xz, lz4, snappy, brotli, zlib)
   decompress transparently, including the multi-member concatenations that
   ALB and CloudTrail actually deliver.
@@ -164,6 +167,7 @@ exception. Brotli and zlib have no reliable container magic, so only `.br`,
 | brotli, zlib                          | decompressed via validated `.br`/`.zlib`/`.zz` extension hint                                                                                                                                          |
 | ZIP, TAR                              | every regular member is its own document at `object.zip!/member/path`; nested archives recurse to four layers; encrypted members and ZIPs with byte-identical duplicate member names reject the source |
 | Parquet, Avro, Arrow IPC/Feather, ORC | each row becomes one canonical JSON line; line numbers refer to rows                                                                                                                                   |
+| UTF-16 / BOM-marked text              | BOM-sniffed and transcoded to UTF-8 exactly like ripgrep, so Windows-exported logs match UTF-8 patterns                                                                                                |
 | everything else                       | searched as plain text (JSONL, CSV, syslog, …)                                                                                                                                                         |
 
 Projection and decompression happen at one canonical decoder boundary, so the
@@ -222,6 +226,19 @@ automatically.
 format, and memory bounds in detail.
 
 ## Performance
+
+Real corpora on real S3 (us-east-2; index built once, timings are full
+process wall time including credential handling):
+
+| corpus                     | source   | objects | build   | index size   | repeat query |
+| -------------------------- | -------- | ------: | ------- | ------------ | -----------: |
+| Project Gutenberg books    | 10.65 GB |  20,016 | 8.5 min | ≈1.0× source |       0.33 s |
+| Linux kernel source mirror | 1.56 GB  |  95,843 | 2.2 min | 0.39× source |       0.56 s |
+
+One caveat worth knowing: candidates are whole documents, so a common token
+inside very large objects (multi-GB gzip, 100 MB parquet shards) degrades to
+decoding those objects — seconds, not sub-second, the same work ripgrep would
+do. Block-level candidates are the planned fix.
 
 Numbers from the tracked benchmark: 25,000 synthetic 4 KiB objects on MinIO,
 release build, three measured iterations after one warmup. Every corpus,
