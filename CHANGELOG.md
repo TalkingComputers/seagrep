@@ -4,7 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.6.1] - 2026-07-17
+
+### Removed
+
+- Recognition of the pre-rename `.holys3` index namespace; `.seagrep` is the only index namespace.
+
+## [0.6.0] - 2026-07-17
 
 ### Added
 
