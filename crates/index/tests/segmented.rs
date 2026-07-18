@@ -816,16 +816,6 @@ fn gzipped_objects_and_prefix_pruning() -> Result<()> {
 
 #[test]
 fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
-    // This test asserts IMMEDIATE eviction; production spares recently
-    // touched directories so a concurrent update's scratch survives (#42).
-    std::env::set_var("SEAGREP_EVICTION_GRACE_SECS", "0");
-    let _reset = DeferReset;
-    struct DeferReset;
-    impl Drop for DeferReset {
-        fn drop(&mut self) {
-            std::env::remove_var("SEAGREP_EVICTION_GRACE_SECS");
-        }
-    }
     let store_dir = tempfile::tempdir()?;
     let cache = tempfile::tempdir()?;
     let mut bucket = Bucket::default();
@@ -859,9 +849,23 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
         "docs healed",
     )?;
 
-    // Replacing the corpus retires the old segment; its cache dir goes too.
+    // Replacing the corpus retires the old segment. Its cache dir was
+    // touched recently, so the eviction grace spares it: a concurrent
+    // update's scratch must survive a reader's open (#42).
     bucket.put("a", b"replacement world");
     reindex(&bucket, store_dir.path(), cache.path(), Strategy::Trigram)?;
+    drop(SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache.path(),
+        &test_source(),
+    )?);
+    assert!(
+        seg_dir.exists(),
+        "recently-touched stale segment cache dir is spared"
+    );
+
+    // Once the directory ages past the grace, the next open evicts it.
+    backdate_dir(&seg_dir, std::time::Duration::from_secs(2 * 60 * 60))?;
     drop(SegmentedReader::open(
         Box::new(LocalBlobStore::new(store_dir.path())),
         cache.path(),
@@ -871,6 +875,24 @@ fn corrupt_cache_self_heals_and_stale_segments_evict() -> Result<()> {
         !seg_dir.exists(),
         "stale segment cache dir should be evicted"
     );
+    Ok(())
+}
+
+/// Rewinds a directory's mtime so the eviction sweep sees it as aged out.
+fn backdate_dir(path: &Path, by: std::time::Duration) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Directories only open with backup semantics, and SetFileTime
+        // wants write access.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options
+        .open(path)?
+        .set_modified(std::time::SystemTime::now() - by)?;
     Ok(())
 }
 
