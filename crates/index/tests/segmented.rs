@@ -2187,3 +2187,76 @@ fn utf16_archive_members_are_searchable() -> Result<()> {
     assert_eq!(matches[0].1.line, 1);
     Ok(())
 }
+
+#[test]
+fn incompatible_roots_sweep_their_blobs_and_keep_identity() -> Result<()> {
+    // #59: an old-format root cannot be parsed, but its leading fields are
+    // layout-stable — identity still enforces, and blobs the new root does
+    // not reference are swept after the rebuild publishes.
+    let mut bucket = Bucket::default();
+    bucket.put("a.txt", b"a searchable needle\n");
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let store = LocalBlobStore::new(store_dir.path());
+
+    // fabricate an incompatible root: valid (format, source) prefix, then
+    // bytes no current parser accepts
+    // format 12 was the first shipped postcard root; the identity gate
+    // only trusts prefixes claiming a format that actually existed
+    let mut fake_root = postcard::to_allocvec(&(12u32, test_source()))?;
+    fake_root.extend_from_slice(b"\xff\xff\xff not a segment list");
+    store.put("segments.bin", &fake_root)?;
+    store.put(
+        &format!("segments/{}/terms.fst", "9".repeat(64)),
+        b"old format dictionary",
+    )?;
+    store.put("builds/abcdef/manifest.bin", b"ancient layout")?;
+
+    // a mismatched source must refuse before any rebuild
+    let listing = bucket.listing();
+    let other = SourceIdentity::Local {
+        prefix: "/other/".into(),
+    };
+    let error = update_index(
+        &store,
+        cache_dir.path(),
+        &other,
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )
+    .expect_err("identity mismatch must refuse the rebuild");
+    assert!(format!("{error:#}").contains("was built for"), "{error:#}");
+
+    // the matching source rebuilds and sweeps the unreferenced blobs
+    update_index(
+        &store,
+        cache_dir.path(),
+        &test_source(),
+        Some(Strategy::Trigram),
+        &listing,
+        UpdateOptions::default(),
+        &|shard| Ok(Box::new(bucket.corpus_over(shard))),
+    )?;
+    let leftovers: Vec<String> = store
+        .list_blobs()?
+        .expect("local stores enumerate blobs")
+        .into_iter()
+        .filter(|blob| blob.contains("9".repeat(64).as_str()) || blob.starts_with("builds/"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "old blobs must be swept: {leftovers:?}"
+    );
+
+    let reader = SegmentedReader::open(
+        Box::new(LocalBlobStore::new(store_dir.path())),
+        cache_dir.path(),
+        &test_source(),
+    )?;
+    let (matches, stats) = search_collect(&reader, "searchable needle")?;
+    assert_eq!(stats.hits, ["a.txt"]);
+    assert_eq!(matches.len(), 1);
+    Ok(())
+}

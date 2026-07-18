@@ -278,7 +278,30 @@ enum RootState {
     Absent,
     /// Present but undecodable (old format, corruption): a definitive
     /// rebuild signal, unlike a transient store failure which is `Err`.
-    Unreadable(String),
+    /// Carries the raw bytes so leading layout-stable fields can still be
+    /// prefix-parsed for the source-identity check.
+    Unreadable(String, Vec<u8>),
+}
+
+/// Leading fields of every root format ever shipped: (format, source).
+/// Parses the prefix even when the full root does not, so incompatible
+/// roots keep their source-identity guarantee. `None` (pre-postcard bytes,
+/// true corruption) skips the check rather than asserting wrongly.
+fn parse_root_source(bytes: &[u8]) -> Option<SourceIdentity> {
+    let (format, rest) = postcard::take_from_bytes::<u32>(bytes).ok()?;
+    // Only formats that actually shipped postcard roots: random corruption
+    // that happens to decode must not fabricate a mismatched identity and
+    // wrongly refuse a rebuild. 12 introduced this root layout; a root from
+    // a FUTURE format (downgraded binary) skips the check — corruption
+    // resistance beats covering an unsupported downgrade path.
+    if !(12..=INDEX_FORMAT).contains(&format) {
+        return None;
+    }
+    let (source, _) = postcard::take_from_bytes::<SourceIdentity>(rest).ok()?;
+    // Real roots validate on write and on load; a decodable-but-invalid
+    // identity is corruption and must not block the rebuild.
+    source.validate().ok()?;
+    Some(source)
 }
 
 /// A failing store is an error so a transient outage can never silently
@@ -293,7 +316,10 @@ fn load_segment_list(store: &dyn BlobStore) -> Result<(RootState, Option<String>
         None => Ok((RootState::Absent, None)),
         Some((bytes, version)) => match parse_segment_list(&bytes) {
             Ok(list) => Ok((RootState::Loaded(list), Some(version))),
-            Err(err) => Ok((RootState::Unreadable(format!("{err:#}")), Some(version))),
+            Err(err) => Ok((
+                RootState::Unreadable(format!("{err:#}"), bytes),
+                Some(version),
+            )),
         },
     }
 }
@@ -361,19 +387,37 @@ pub fn update_index(
     }
     let mut forced = rebuild;
     let mut replaced: Vec<SegmentMeta> = Vec::new();
+    // Blobs present BEFORE a forced-from-unreadable rebuild: the new root
+    // cannot reference them (segment ids are random per build), so anything
+    // here that the published root does not claim is old-format garbage.
+    let mut stale_inventory: Option<Vec<String>> = None;
     if rebuild {
         eprintln!("note: --rebuild requested; re-ingesting everything");
     }
     let (root, root_version) = load_segment_list(store)?;
     // Reject a source mismatch before strategy detection: auto-selection may
     // sample the target, and an invalid index/target pairing must fail
-    // without any fetching.
-    if let (RootState::Loaded(list), false) = (&root, rebuild) {
-        anyhow::ensure!(
-            list.source == *source,
-            "index was built for {}, not {source}; use --rebuild to replace it",
-            list.source
-        );
+    // without any fetching. An unreadable root (old format, corruption)
+    // keeps the guarantee through its leading layout-stable fields; `None`
+    // (prefix unparsable) skips the check rather than asserting wrongly.
+    match (&root, rebuild) {
+        (RootState::Loaded(list), false) => {
+            anyhow::ensure!(
+                list.source == *source,
+                "index was built for {}, not {source}; use --rebuild to replace it",
+                list.source
+            );
+        }
+        (RootState::Unreadable(_, root_bytes), false) => {
+            if let Some(old_source) = parse_root_source(root_bytes) {
+                anyhow::ensure!(
+                    old_source == *source,
+                    "index was built for {old_source}, which does not match requested source {source}; \
+                     use --rebuild to replace it or point --index elsewhere"
+                );
+            }
+        }
+        _ => {}
     }
     let strategy = match strategy {
         Some(strategy) => strategy,
@@ -386,8 +430,12 @@ pub fn update_index(
         },
     };
     let existing = if rebuild {
-        if let RootState::Loaded(list) = root {
-            replaced = list.segments;
+        match root {
+            RootState::Loaded(list) => replaced = list.segments,
+            // An unreadable root has no SegmentMeta to feed collect_garbage,
+            // so the pre-build inventory is the only way its blobs get swept.
+            RootState::Unreadable(..) => stale_inventory = inventory_stale_blobs(store),
+            RootState::Absent => {}
         }
         Vec::new()
     } else {
@@ -406,7 +454,11 @@ pub fn update_index(
                 eprintln!("note: no existing index; building from scratch");
                 Vec::new()
             }
-            RootState::Unreadable(reason) => {
+            RootState::Unreadable(reason, _) => {
+                // Source identity was already enforced above; inventory the
+                // store so the rebuild can sweep blobs the new root does not
+                // reference (#59).
+                stale_inventory = inventory_stale_blobs(store);
                 eprintln!("note: {reason}; rebuilding from scratch");
                 forced = true;
                 Vec::new()
@@ -608,6 +660,41 @@ pub fn update_index(
         "another seagrep index run updated this index concurrently; rerun to pick up its result"
     );
     collect_garbage(store, &replaced, &list.segments);
+    // Blobs from an incompatible-format root: nothing could parse their
+    // metadata, but the pre-rebuild inventory names them and the published
+    // root (content-addressed packs included) claims everything still live.
+    if let Some(inventory) = stale_inventory {
+        let kept: std::collections::HashSet<String> =
+            list.segments.iter().flat_map(meta_blobs).collect();
+        let mut removed_blobs = 0usize;
+        for blob in inventory {
+            // Packs are content-addressed and therefore RE-REFERENCEABLE: a
+            // concurrent run could republish identical content under the
+            // same key between our publish and this sweep, and deleting it
+            // would break that run's root. Old packs are mostly reused by
+            // the rebuild anyway; the truly orphaned ones stay, bounded and
+            // harmless. Segment blobs are random-keyed per build and can
+            // never be referenced again.
+            // segments.lock is the local put_if flock target: unlinking it
+            // while another indexer holds the lock lets a third run create a
+            // fresh inode and take a second, useless lock.
+            if blob == "segments.bin"
+                || blob == "segments.lock"
+                || blob.starts_with("packs/")
+                || kept.contains(&blob)
+            {
+                continue;
+            }
+            if store.delete(&blob).is_err() {
+                eprintln!("warning: failed to delete old-format index blob {blob}");
+            } else {
+                removed_blobs += 1;
+            }
+        }
+        if removed_blobs > 0 {
+            eprintln!("note: removed {removed_blobs} blob(s) left by the old index format");
+        }
+    }
     Ok(UpdateReport {
         added,
         removed,
@@ -616,6 +703,22 @@ pub fn update_index(
         compacted,
         up_to_date: false,
     })
+}
+
+/// Enumerate blobs ahead of a rebuild over an unreadable root. `Ok(None)`
+/// means the backend cannot enumerate (test doubles) and the sweep quietly
+/// degrades; a listing failure is loud — the leak it would hide has no
+/// other signal and no retry once the root is readable again.
+fn inventory_stale_blobs(store: &dyn BlobStore) -> Option<Vec<String>> {
+    match store.list_blobs() {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to list existing index blobs; old-format blobs will not be swept: {error:#}"
+            );
+            None
+        }
+    }
 }
 
 fn meta_blobs(meta: &SegmentMeta) -> Vec<String> {

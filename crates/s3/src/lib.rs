@@ -157,6 +157,22 @@ impl seagrep_core::StreamingPut for S3StreamingPut {
 }
 
 impl BlobStore for S3BlobStore {
+    fn list_blobs(&self) -> anyhow::Result<Option<Vec<String>>> {
+        let prefix = list_prefix(&self.root);
+        let objects = self.client.list(&self.bucket, &prefix)?;
+        Ok(Some(
+            objects
+                .into_iter()
+                .filter_map(|object| {
+                    object
+                        .key
+                        .strip_prefix(&prefix)
+                        .map(|relative| relative.to_owned())
+                })
+                .collect(),
+        ))
+    }
+
     fn put(&self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.client.put_with_progress(
             &self.bucket,

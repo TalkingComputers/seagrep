@@ -1,6 +1,6 @@
 use crate::codec::{decode_source, DecodeSink, DocumentBody, LogicalDocumentMeta, DECODE_LIMITS};
 use crate::grep::has_line_match;
-use anyhow::Result as AnyhowResult;
+use anyhow::{Context as AnyhowContext, Result as AnyhowResult};
 use bytes::Bytes;
 use fs4::FileExt;
 use std::io::{Seek, Write};
@@ -84,6 +84,12 @@ pub trait DocFetcher {
 }
 
 pub trait BlobStore {
+    /// Every blob name under this store's root, when the backend can
+    /// enumerate them. `None` means the capability is unavailable (test
+    /// doubles); callers degrade to meta-driven garbage collection.
+    fn list_blobs(&self) -> AnyhowResult<Option<Vec<String>>> {
+        Ok(None)
+    }
     fn put(&self, name: &str, bytes: &[u8]) -> AnyhowResult<()>;
     fn put_file(&self, name: &str, path: &Path) -> AnyhowResult<()>;
     fn get_file(&self, name: &str, file: &mut std::fs::File, len: u64) -> AnyhowResult<()> {
@@ -258,6 +264,48 @@ impl StreamingPut for LocalStreamingPut {
 }
 
 impl BlobStore for LocalBlobStore {
+    fn list_blobs(&self) -> AnyhowResult<Option<Vec<String>>> {
+        // A partial listing must never masquerade as a complete inventory:
+        // callers delete what the inventory names and nothing else, so a
+        // swallowed error here silently strands blobs. Only a root that
+        // does not exist yet is a legitimate empty store.
+        let mut names = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && dir == self.root => {
+                    return Ok(Some(Vec::new()))
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("listing {}", dir.display()))
+                }
+            };
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("listing an entry of {}", dir.display()))?;
+                // `file_type` does not follow symlinks, and symlinks are
+                // skipped outright: this store never creates them, following
+                // a directory link would let the sweep reach outside the
+                // store (or loop forever on `link -> .`), and naming one
+                // would make the sweep unlink it.
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("inspecting an entry of {}", dir.display()))?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if let Ok(relative) = path.strip_prefix(&self.root) {
+                    names.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        Ok(Some(names))
+    }
+
     fn put_streaming<'a>(&'a self, name: &str) -> AnyhowResult<Box<dyn StreamingPut + 'a>> {
         let path = self.root.join(name);
         let parent = path
@@ -526,6 +574,23 @@ mod tests {
         let mut bytes = Vec::new();
         output.read_to_end(&mut bytes)?;
         assert_eq!(bytes, b"file-backed index blob");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_blobs_does_not_follow_directory_symlinks() -> AnyhowResult<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::write(outside.path().join("victim.bin"), b"not ours")?;
+        let store = LocalBlobStore::new(root.path());
+        store.put("segments/a/postings.bin", b"blob")?;
+        // An escape link must not expose the target's files as deletable
+        // names, and a cyclic link must not recurse forever.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape"))?;
+        std::os::unix::fs::symlink(root.path(), root.path().join("cycle"))?;
+        let names = store.list_blobs()?.expect("local stores enumerate blobs");
+        assert_eq!(names, vec!["segments/a/postings.bin".to_owned()]);
         Ok(())
     }
 
