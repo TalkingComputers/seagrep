@@ -1006,7 +1006,7 @@ impl SegmentedReader {
             };
             segments.push(segment);
         }
-        evict_stale_segments(cache_dir, &segments);
+        evict_stale_segments(cache_dir, &segments)?;
         let range_cache_max = range_cache_max()?;
         if range_cache_max > 0 {
             evict_range_cache(cache_dir, range_cache_max);
@@ -1626,7 +1626,41 @@ fn load_segment(
     })
 }
 
-fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) {
+fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) -> Result<()> {
+    evict_stale_segments_older_than(cache_dir, segments, eviction_grace()?);
+    Ok(())
+}
+
+/// A concurrent update stages compaction inputs under a not-yet-committed
+/// segment id; a reader opening in that window would see the directory as
+/// stale and delete it mid-merge, aborting the update with ENOENT (#42).
+/// Recently-touched directories are therefore spared — genuinely stale ones
+/// age past the grace and go on a later open.
+const EVICTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// `SEAGREP_EVICTION_GRACE_SECS` overrides the grace; a malformed value
+/// fails loudly.
+fn eviction_grace() -> Result<std::time::Duration> {
+    parse_eviction_grace(std::env::var("SEAGREP_EVICTION_GRACE_SECS").ok().as_deref())
+}
+
+fn parse_eviction_grace(configured: Option<&str>) -> Result<std::time::Duration> {
+    match configured {
+        None => Ok(EVICTION_GRACE),
+        Some(value) => value
+            .parse()
+            .map(std::time::Duration::from_secs)
+            .with_context(|| {
+                format!("SEAGREP_EVICTION_GRACE_SECS is not a number of seconds: {value:?}")
+            }),
+    }
+}
+
+fn evict_stale_segments_older_than(
+    cache_dir: &Path,
+    segments: &[Segment],
+    grace: std::time::Duration,
+) {
     let current: std::collections::HashSet<&str> = segments
         .iter()
         .map(|segment| segment.meta.seg_id.as_str())
@@ -1634,8 +1668,21 @@ fn evict_stale_segments(cache_dir: &Path, segments: &[Segment]) {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
-        if !current.contains(entry.file_name().to_string_lossy().as_ref()) {
+        if current.contains(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
+        // Unreadable metadata or a future mtime leaves the age unknown;
+        // sparing is safe (the directory ages out on a later open) while
+        // deleting could remove a concurrent update's live scratch (#42).
+        let aged_out = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= grace);
+        if aged_out {
             std::fs::remove_dir_all(entry.path()).ok();
         }
     }
@@ -1798,6 +1845,20 @@ mod tests {
         let error = parse_remote_terms_min(Some("64MB")).unwrap_err();
         assert!(
             error.to_string().contains("SEAGREP_SPARSE_REMOTE_MIN"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn eviction_grace_rejects_malformed_configuration() {
+        assert_eq!(parse_eviction_grace(None).unwrap(), EVICTION_GRACE);
+        assert_eq!(
+            parse_eviction_grace(Some("0")).unwrap(),
+            std::time::Duration::ZERO
+        );
+        let error = parse_eviction_grace(Some("1h")).unwrap_err();
+        assert!(
+            error.to_string().contains("SEAGREP_EVICTION_GRACE_SECS"),
             "{error:#}"
         );
     }
@@ -1996,6 +2057,22 @@ mod tests {
         let path = cached_file(&store, cache_dir.path(), &segment_id, name, 4, &hash).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"good");
         assert!(path.with_file_name("terms.fst.verified").is_file());
+    }
+
+    #[test]
+    fn eviction_spares_recently_touched_stale_directories() {
+        // #42: a concurrent update's compaction scratch must survive a
+        // reader's eviction sweep; genuinely old leftovers still go.
+        let cache = tempfile::tempdir().unwrap();
+        let staged = cache.path().join("f".repeat(64));
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("terms.fst"), b"mid-merge scratch").unwrap();
+
+        evict_stale_segments_older_than(cache.path(), &[], EVICTION_GRACE);
+        assert!(staged.exists(), "fresh scratch must survive the sweep");
+
+        evict_stale_segments_older_than(cache.path(), &[], std::time::Duration::ZERO);
+        assert!(!staged.exists(), "aged-out directories are removed");
     }
 
     #[test]
