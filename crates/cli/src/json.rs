@@ -157,6 +157,10 @@ impl JsonSink {
 }
 
 impl MatchSink for JsonSink {
+    fn wants_hit_keys(&self) -> bool {
+        false
+    }
+
     fn on_doc(&self, key: &str, doc: &DocResult<'_>) -> Result<SinkFlow> {
         let path = || data_from(key.as_bytes());
         let mut m_lines = 0u64;
