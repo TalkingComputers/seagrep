@@ -700,8 +700,16 @@ fn run_files(args: SearchArgs) -> Result<bool> {
     let target_prefix = list_prefix(&source.prefix);
     let candidate_prefix =
         pick_candidate_prefix(&target_prefix, scope.as_ref().and_then(Scope::key_prefix));
-    let mut keys: Vec<String> = reader
-        .candidate_docs(&seagrep_query::Query::All, candidate_prefix)?
+    // Retrying after a concurrent index publish is safe: no key has been
+    // printed yet. Mirrors search_with_reopen on the search path.
+    let candidates = match reader.candidate_docs(&seagrep_query::Query::All, candidate_prefix) {
+        Err(error) if error.is::<IndexChanged>() => {
+            let reader = open(&index)?;
+            reader.candidate_docs(&seagrep_query::Query::All, candidate_prefix)
+        }
+        result => result,
+    }?;
+    let mut keys: Vec<String> = candidates
         .into_iter()
         .map(|doc| doc.display_key)
         .filter(|key| {
