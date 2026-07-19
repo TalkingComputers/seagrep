@@ -6,6 +6,22 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-18
+
+### Changed
+
+- `SearchStats` gains an always-populated `hit_count`; `hits` carries every
+  matching key only when the sink's new `MatchSink::wants_hit_keys` returns
+  true (the default). The CLI sinks decline, so a query matching millions of
+  documents no longer materializes and sorts millions of keys. (#77)
+- The release binary is built with unwinding again: verifier panic isolation
+  and `Drop` cleanup (multipart-upload aborts, temp files) require it. (#75)
+
+### Added
+
+- Nightly fuzzing of the decode boundary (`decode_source`) with committed
+  format seeds and crash artifact upload. (#80)
+
 ## [0.6.1] - 2026-07-17
 
 ### Removed
