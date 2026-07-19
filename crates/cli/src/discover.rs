@@ -74,14 +74,33 @@ pub(crate) fn remember_index(source: &S3Source, index: &IndexArgs) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let staged = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
     let Ok(bytes) = serde_json::to_vec_pretty(&map) else {
         return;
     };
-    if std::fs::write(&staged, bytes).is_err() {
+    // A unique, freshly-created temp file (never a pre-existing path, so a
+    // planted symlink cannot redirect the write), persisted over the map.
+    let Ok(mut staged) = tempfile::Builder::new()
+        .prefix(".index-locations-")
+        .tempfile_in(dir)
+    else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    if std::io::Write::write_all(staged.as_file_mut(), &bytes).is_err() {
         return;
     }
-    let _ = std::fs::rename(&staged, &path);
+    let _ = staged.persist(&path);
 }
 
 /// Parent prefixes of the searched prefix, nearest first, ending at the
@@ -153,17 +172,32 @@ pub(crate) fn discover_fallback(
         }
     }
     if let Some(entry) = read_map().remove(&source_key(source)) {
+        // A remembered entry is a hint, never load-bearing: if it is stale,
+        // unreachable, or no longer covers this source, fall through so the
+        // caller reports the original missing-index error.
         let args = IndexArgs {
             location: Some(entry.location),
             index_region: entry.index_region,
             index_endpoint: entry.index_endpoint,
         };
-        let storage = open_index_storage(source, &args, concurrency)?;
-        eprintln!(
-            "note: using remembered index {} (recorded from an earlier --index run)",
-            storage.location()
-        );
-        return Ok(Some(storage));
+        match open_index_storage(source, &args, concurrency) {
+            Ok(storage) => {
+                match SegmentedReader::open(storage.store(), storage.cache(), &identity) {
+                    Ok(_) => {
+                        eprintln!(
+                            "note: using remembered index {} (recorded from an earlier --index run)",
+                            storage.location()
+                        );
+                        return Ok(Some(storage));
+                    }
+                    Err(error) => eprintln!(
+                        "note: ignoring remembered index {}: {error:#}",
+                        storage.location()
+                    ),
+                }
+            }
+            Err(error) => eprintln!("note: ignoring remembered index: {error:#}"),
+        }
     }
     Ok(None)
 }
@@ -171,6 +205,23 @@ pub(crate) fn discover_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_map_tolerates_missing_and_corrupt_files() {
+        // Serializes on XDG_CACHE_HOME; combine both cases in one test to
+        // avoid parallel-test races on the env var.
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation, single-threaded within this test.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", dir.path()) };
+        assert!(read_map().is_empty(), "missing file reads as empty");
+        let path = map_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(read_map().is_empty(), "corrupt file reads as empty");
+        std::fs::write(&path, b"[1, 2, 3]").unwrap();
+        assert!(read_map().is_empty(), "wrong shape reads as empty");
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+    }
 
     #[test]
     fn parent_chain_walks_to_root() {
