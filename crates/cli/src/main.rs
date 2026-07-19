@@ -704,14 +704,19 @@ fn run_files(args: SearchArgs) -> Result<bool> {
         .candidate_docs(&seagrep_query::Query::All, candidate_prefix)?
         .into_iter()
         .map(|doc| doc.display_key)
-        .filter(|key| match scope.as_ref() {
-            Some(scope) => {
-                scope
-                    .key_prefix()
-                    .is_none_or(|prefix| key.starts_with(prefix))
-                    && scope.matches(key)
-            }
-            None => true,
+        .filter(|key| {
+            // candidate_prefix only prunes segments; enforce it per key,
+            // matching KeyScope::admits in the search path.
+            candidate_prefix.is_none_or(|prefix| key.starts_with(prefix))
+                && match scope.as_ref() {
+                    Some(scope) => {
+                        scope
+                            .key_prefix()
+                            .is_none_or(|prefix| key.starts_with(prefix))
+                            && scope.matches(key)
+                    }
+                    None => true,
+                }
         })
         .collect();
     keys.sort_unstable();
