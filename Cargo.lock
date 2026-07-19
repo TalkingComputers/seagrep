@@ -3307,6 +3307,7 @@ dependencies = [
  "regex-syntax",
  "seagrep-core",
  "seagrep-index",
+ "seagrep-query",
  "seagrep-s3",
  "serde",
  "serde_json",
