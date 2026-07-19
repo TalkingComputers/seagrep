@@ -894,16 +894,20 @@ fn run() -> Result<bool> {
             };
             let show_progress = !json && std::io::stderr().is_terminal();
             index::run_index(config, |cycle_rebuild| {
-                build_s3(
+                let result = build_s3(
                     &source,
                     &storage,
                     strategy,
                     cycle_rebuild,
                     purge_deleted,
                     show_progress,
-                )
+                )?;
+                // Remember per cycle, not after run_index returns: in watch
+                // mode that return only happens on shutdown, and concurrent
+                // searches should see the location once cycle 1 publishes.
+                discover::remember_index(&source, &index);
+                Ok(result)
             })?;
-            discover::remember_index(&source, &index);
             Ok(true)
         }
         None if cli.search.files => run_files(cli.search),
