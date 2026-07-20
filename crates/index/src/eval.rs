@@ -21,6 +21,11 @@ const BLOCK_MAX_GRAMS_PER_AND: usize = 64;
 const OFFSET_BITS: u32 = 40;
 const COUNT_BITS: u32 = 24;
 
+/// The largest id count `pack_posting` can store, and therefore the largest
+/// posting id space (candidate blocks for trigram, documents for sparse) one
+/// segment may expose: a gram present at every id must still pack.
+pub(crate) const MAX_POSTING_COUNT: u64 = (1 << COUNT_BITS) - 1;
+
 /// Pack a posting block's byte offset (40 bits, 1 TiB) and id count
 /// (24 bits, 16.7M ids) into one fst value.
 pub(crate) fn pack_posting(offset: u64, count: usize) -> Result<u64> {
@@ -319,6 +324,9 @@ mod tests {
         assert_eq!(unpack_posting(packed), (123_456, 789));
         assert!(pack_posting(1 << 40, 1).is_err());
         assert!(pack_posting(0, 1 << 24).is_err());
+        // MAX_POSTING_COUNT is exactly the largest packable count: an id
+        // space capped there keeps every gram encodable.
+        assert!(pack_posting(0, usize::try_from(MAX_POSTING_COUNT).unwrap()).is_ok());
     }
 
     #[test]

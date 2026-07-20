@@ -40,6 +40,15 @@ pub(super) fn maybe_compact(
                     .saturating_add(segments[i + 1].0.docs_len)
                     <= MERGE_DOCS_CAP
                 && live(&segments[i]).saturating_add(live(&segments[i + 1])) <= SEGMENT_DOC_CAP
+                // The merged posting id space (candidate blocks for trigram)
+                // must stay within the 24-bit `pack_posting` count ceiling.
+                // Summing whole-segment block counts overstates the live
+                // total, which only makes this check conservative.
+                && segments[i]
+                    .0
+                    .block_count
+                    .saturating_add(segments[i + 1].0.block_count)
+                    <= crate::eval::MAX_POSTING_COUNT
         })
         .min_by_key(|&i| live(&segments[i]).saturating_add(live(&segments[i + 1])))
     else {

@@ -587,6 +587,28 @@ impl ChunkIngest<'_> {
             if document_cap.is_some_and(|cap| next_document_count > cap) {
                 return Err(anyhow::Error::new(DocumentCapExceeded));
             }
+            // Trigram postings address candidate blocks and pack per-gram id
+            // counts into 24 bits: a gram present in every block posts
+            // `block_count` ids, so the segment's block id space must stay
+            // within `MAX_POSTING_COUNT`. The per-source decode limit keeps
+            // any single source far below it, so splitting always converges.
+            if strategy == Strategy::Trigram {
+                let next_block_count =
+                    documents
+                        .iter()
+                        .try_fold(*self.next_block_base, |total, document| {
+                            total
+                                .checked_add(
+                                    document
+                                        .decoded_size
+                                        .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64),
+                                )
+                                .context("segment candidate block count overflows")
+                        })?;
+                if next_block_count > crate::eval::MAX_POSTING_COUNT {
+                    return Err(anyhow::Error::new(DocumentCapExceeded));
+                }
+            }
             for document in documents {
                 let doc_id = self.tables.documents.len();
                 let slice = document.content.append(

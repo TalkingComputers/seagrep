@@ -37,8 +37,10 @@ use std::sync::OnceLock;
 pub(crate) mod cache;
 mod compact;
 
-/// Per-segment doc cap: keeps every per-gram posting list far below the
-/// 2^24 `pack_posting` ceiling, and bounds build memory.
+/// Per-segment doc cap: keeps every sparse per-gram posting list far below
+/// the 2^24 `pack_posting` ceiling, and bounds build memory. Trigram
+/// postings address candidate blocks, whose per-segment id space is capped
+/// separately at `eval::MAX_POSTING_COUNT` during ingest and compaction.
 const SEGMENT_DOC_CAP: usize = 4_000_000;
 /// Compact (merge two adjacent segments) when more live segments than this.
 const SEGMENT_COUNT_TARGET: usize = 8;
@@ -1104,6 +1106,12 @@ pub(crate) fn merge_and_put_segment(
     let docs_bytes = postcard::to_allocvec(tables)?;
     let docs_hash = sha256_hex(&[&docs_bytes]);
     let block_count = segment_block_count(strategy, tables);
+    // Backstop for the ingest and compaction caps: a wider id space could
+    // produce per-gram counts that `pack_posting` cannot store.
+    anyhow::ensure!(
+        block_count <= crate::eval::MAX_POSTING_COUNT,
+        "segment posting id space of {block_count} exceeds the 2^24 format limit"
+    );
     let seg_id = random_seg_id()?;
     for pack in packs {
         store.put_file(&pack_blob(pack.hash()), pack.path())?;
@@ -2809,6 +2817,26 @@ mod tests {
                 !maybe_compact(&store, cache_dir.path(), Strategy::Trigram, &mut segments).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn compaction_declines_merges_beyond_the_posting_count_ceiling() {
+        // Trigram postings pack per-gram id counts into 24 bits; merging two
+        // segments whose combined candidate-block space exceeds that could
+        // produce unencodable postings, so no victim pair may qualify.
+        let store_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let store = seagrep_core::LocalBlobStore::new(store_dir.path());
+        let mut segments: Vec<(SegmentMeta, DeadSet)> = (0..=SEGMENT_COUNT_TARGET)
+            .map(|_| {
+                let mut meta = segment();
+                meta.block_count = crate::eval::MAX_POSTING_COUNT / 2 + 1;
+                (meta, DeadSet::default())
+            })
+            .collect();
+        assert!(
+            !maybe_compact(&store, cache_dir.path(), Strategy::Trigram, &mut segments).unwrap()
+        );
     }
 
     #[test]
