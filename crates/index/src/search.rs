@@ -4,9 +4,11 @@
 use crate::{IndexReader, SearchStats};
 use anyhow::{Context, Result};
 use rayon::iter::{ParallelBridge, ParallelIterator};
+#[cfg(test)]
+use seagrep_core::DocumentBody;
 use seagrep_core::{
     bounded_match_len, can_search_as_document, grep_bytes, grep_bytes_fast, has_line_match,
-    has_line_match_fast, DocAddress, DocFetcher, DocumentBody, LineEvent, MatchOptions,
+    has_line_match_fast, DocAddress, DocFetcher, FetchedDocument, LineEvent, MatchOptions,
 };
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -143,50 +145,91 @@ fn search_batch(
     let workers = std::thread::available_parallelism()?
         .get()
         .min(documents.len());
-
     let bytes_fetched = AtomicUsize::new(0);
     let hit_count = AtomicUsize::new(0);
     let hits: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
     let wants_matches = sink.wants_matches();
     let wants_hit_keys = sink.wants_hit_keys();
     let documents_ref = documents;
-    // `re` is cloned per rayon split: the meta engine's shared scratch Cache
-    // contends under exactly this all-threads-search workload.
-    let verify = |re: &regex::bytes::Regex, idx: usize, body: DocumentBody| -> Result<()> {
+    let verify = |re: &regex::bytes::Regex, idx: usize, body: FetchedDocument| -> Result<()> {
         let key = &documents_ref[idx].display_key;
         let started = std::time::Instant::now();
-        let bytes_searched = body.len();
+        let bytes_searched = body.decoded_size();
         let events = if wants_matches {
-            let text = body.into_bytes()?;
-            let events = if whole_document {
-                grep_bytes_fast(text.clone(), re, options)
-            } else {
-                grep_bytes(text.clone(), re, options)
+            let events = match body {
+                FetchedDocument::Whole(body) => {
+                    let text = body.into_bytes()?;
+                    if whole_document {
+                        grep_bytes_fast(text, re, options)
+                    } else {
+                        grep_bytes(text, re, options)
+                    }
+                }
+                FetchedDocument::Regions { regions, .. } => {
+                    let mut events = Vec::new();
+                    let mut matched = 0u64;
+                    for region in regions {
+                        let max_count =
+                            options.max_count.map(|limit| limit.saturating_sub(matched));
+                        if max_count == Some(0) {
+                            break;
+                        }
+                        let regional = MatchOptions {
+                            max_count,
+                            ..options
+                        };
+                        let mut found = if whole_document {
+                            grep_bytes_fast(region.bytes, re, regional)
+                        } else {
+                            grep_bytes(region.bytes, re, regional)
+                        };
+                        matched += found
+                            .iter()
+                            .filter(|event| event.kind == seagrep_core::LineKind::Match)
+                            .count() as u64;
+                        for event in &mut found {
+                            event.line += region.line - 1;
+                            event.offset += region.start;
+                        }
+                        events.extend(found);
+                    }
+                    events
+                }
             };
             if events.is_empty() {
                 return Ok(());
             }
             events
         } else {
-            let can_stream =
-                body.is_file() && bounded_len.is_some_and(|len| len <= FILE_MATCH_OVERLAP_MAX + 1);
-            let matched = if can_stream {
-                let len = body.len();
-                let mut reader = body.into_reader();
-                has_bounded_reader_match(
-                    &mut reader,
-                    len,
-                    re,
-                    bounded_len.expect("bounded length"),
-                )?
-            } else {
-                let text = body.into_bytes()?;
-                if whole_document {
-                    has_line_match_fast(&text, re)
-                } else {
-                    has_line_match(&text, re)
+            let matched = match body {
+                FetchedDocument::Whole(body) => {
+                    let can_stream = body.is_file()
+                        && bounded_len.is_some_and(|len| len <= FILE_MATCH_OVERLAP_MAX + 1);
+                    if can_stream {
+                        let len = body.len();
+                        let mut reader = body.into_reader();
+                        has_bounded_reader_match(
+                            &mut reader,
+                            len,
+                            re,
+                            bounded_len.expect("bounded length"),
+                        )?
+                    } else {
+                        let text = body.into_bytes()?;
+                        if whole_document {
+                            has_line_match_fast(&text, re)
+                        } else {
+                            has_line_match(&text, re)
+                        }
+                    }
                 }
+                FetchedDocument::Regions { regions, .. } => regions.iter().any(|region| {
+                    if whole_document {
+                        has_line_match_fast(&region.bytes, re)
+                    } else {
+                        has_line_match(&region.bytes, re)
+                    }
+                }),
             };
             if !matched {
                 return Ok(());
@@ -207,16 +250,22 @@ fn search_batch(
         }
         Ok(())
     };
-
-    let verify_caught = |re: &regex::bytes::Regex, idx: usize, body: DocumentBody| {
+    let verify_caught = |re: &regex::bytes::Regex, idx: usize, body: FetchedDocument| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(re, idx, body)))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("a search worker panicked")))
     };
-
+    let fetch = |consume: &mut dyn FnMut(usize, FetchedDocument) -> Result<()>| {
+        fetcher.fetch_candidate_each(
+            documents_ref,
+            options.before_context,
+            options.after_context,
+            consume,
+        )
+    };
     let (feed_result, verify_result) = if workers == 1 {
         let mut verified = Ok(());
-        let feed = fetcher.fetch_each(documents_ref, &mut |idx, body| {
-            bytes_fetched.fetch_add(usize::try_from(body.len())?, Ordering::Relaxed);
+        let feed = fetch(&mut |idx, body| {
+            bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
             match verify_caught(re, idx, body) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -227,18 +276,16 @@ fn search_batch(
         });
         (feed, verified)
     } else {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, DocumentBody)>(workers * 2);
-        // One consumer thread drives the rayon pool over the channel. When any
-        // doc errors, the bridge drops `rx`, so the feeder cannot deadlock.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, FetchedDocument)>(workers * 2);
         std::thread::scope(|scope| {
             let consumer = scope.spawn(|| {
                 rx.into_iter().par_bridge().try_for_each_init(
                     || re.clone(),
-                    |re, (idx, bytes)| verify_caught(re, idx, bytes),
+                    |re, (idx, body)| verify_caught(re, idx, body),
                 )
             });
-            let feed = fetcher.fetch_each(documents_ref, &mut |idx, body| {
-                bytes_fetched.fetch_add(usize::try_from(body.len())?, Ordering::Relaxed);
+            let feed = fetch(&mut |idx, body| {
+                bytes_fetched.fetch_add(usize::try_from(body.fetched_size())?, Ordering::Relaxed);
                 tx.send((idx, body))
                     .map_err(|_| anyhow::Error::new(StopEarly))
             });
@@ -249,12 +296,8 @@ fn search_batch(
             (feed, verified)
         })
     };
-
     let stopped = match verify_result {
         Err(err) if err.is::<StopEarly>() => {
-            // A concurrent fetch or decode failure must still fail the
-            // search; only the send-into-closed-channel sentinel is the
-            // expected side effect of stopping early.
             if let Err(err) = feed_result {
                 if !err.is::<StopEarly>() {
                     return Err(err);
@@ -268,7 +311,6 @@ fn search_batch(
             false
         }
     };
-
     let hits = hits
         .into_inner()
         .map_err(|_| anyhow::anyhow!("a search worker panicked"))?;

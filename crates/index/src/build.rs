@@ -151,6 +151,7 @@ struct BuiltDocument {
     /// Longest decoded line when computed eagerly (in-memory paths); the
     /// deferred file/spool paths report it from run-writing instead.
     max_line_len: Option<u64>,
+    block_newlines: Option<Vec<u32>>,
 }
 
 enum IndexOutput {
@@ -323,12 +324,12 @@ impl DecodeSink for IndexDecodeSink {
             .take()
             .context("decoder finished without beginning a document")?;
         let output = std::mem::replace(&mut self.current_output, IndexOutput::Bytes(Vec::new()));
-        let (grams, decoded_size, content, max_line_len) = match output {
+        let (grams, decoded_size, content, max_line_len, block_newlines) = match output {
             IndexOutput::File {
                 grams,
                 len,
                 content,
-            } => (grams, len, BuiltContent::File(content), None),
+            } => (grams, len, BuiltContent::File(content), None, None),
             IndexOutput::Bytes(mut chunks) => {
                 let bytes = match chunks.len() {
                     0 => bytes::Bytes::new(),
@@ -361,7 +362,23 @@ impl DecodeSink for IndexDecodeSink {
                     }
                     _ => None,
                 };
-                (grams, decoded_size, BuiltContent::Bytes(bytes), max_line)
+                let block_newlines = (self.strategy == Strategy::Trigram && self.spool.is_none())
+                    .then(|| {
+                        bytes
+                            .chunks(seagrep_core::CANDIDATE_BLOCK_BYTES)
+                            .map(|block| {
+                                u32::try_from(block.iter().filter(|byte| **byte == b'\n').count())
+                                    .expect("candidate block newline count fits u32")
+                            })
+                            .collect()
+                    });
+                (
+                    grams,
+                    decoded_size,
+                    BuiltContent::Bytes(bytes),
+                    max_line,
+                    block_newlines,
+                )
             }
         };
         let content = self.store_content(content, decoded_size)?;
@@ -385,6 +402,7 @@ impl DecodeSink for IndexDecodeSink {
             decoded_size,
             content,
             max_line_len,
+            block_newlines,
         });
         Ok(())
     }
@@ -595,6 +613,7 @@ impl ChunkIngest<'_> {
                     block_offset: slice.block_offset,
                     max_line_len: u32::try_from(document.max_line_len.unwrap_or(0))
                         .unwrap_or(u32::MAX),
+                    block_newlines: document.block_newlines.unwrap_or_default(),
                 });
             }
             self.tables.sources.push(SourceEntry {
@@ -624,13 +643,14 @@ impl ChunkIngest<'_> {
         let (runs, max_lines) =
             write_posting_runs(grammed, self.strategy, SPARSE_RUN_BYTES, spool)?;
         self.runs.extend(runs);
-        for (doc_id, max_line) in max_lines {
+        for (doc_id, max_line, block_newlines) in max_lines {
             let entry = self
                 .tables
                 .documents
                 .get_mut(doc_id)
                 .context("deferred max-line for an unknown document")?;
             entry.max_line_len = u32::try_from(max_line).unwrap_or(u32::MAX);
+            entry.block_newlines = block_newlines;
         }
         Ok(())
     }

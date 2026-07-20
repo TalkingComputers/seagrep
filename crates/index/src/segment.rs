@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 pub(crate) mod cache;
@@ -976,25 +977,81 @@ fn block_document(id: u32, bases: &[u32]) -> usize {
     bases.partition_point(|base| *base <= id) - 1
 }
 
+fn single_range<T>(range: std::ops::Range<T>) -> Vec<std::ops::Range<T>> {
+    std::iter::once(range).collect()
+}
+
 fn expand_block(id: u32, bases: &[u32], tables: &SegmentTables) -> std::ops::RangeInclusive<u32> {
     let document = block_document(id, bases);
     let start = bases[document];
     let end = bases[document + 1] - 1;
+    if tables.documents[document].max_line_len == u32::MAX {
+        return start..=end;
+    }
     let slack = 1 + tables.documents[document].max_line_len
         / u32::try_from(seagrep_core::CANDIDATE_BLOCK_BYTES)
             .expect("candidate block size fits u32");
     id.saturating_sub(slack).max(start)..=id.saturating_add(slack).min(end)
 }
 
-fn blocks_to_documents(ids: Vec<u32>, bases: &[u32]) -> Vec<u32> {
-    let mut documents = Vec::with_capacity(ids.len());
+fn blocks_to_doc_ranges(ids: Vec<u32>, bases: &[u32]) -> Vec<(u32, Vec<std::ops::Range<u32>>)> {
+    let mut documents: Vec<(u32, Vec<std::ops::Range<u32>>)> = Vec::new();
     for id in ids {
-        let document = u32::try_from(block_document(id, bases)).expect("document ID fits u32");
-        if documents.last() != Some(&document) {
-            documents.push(document);
+        let document_index = block_document(id, bases);
+        let document = u32::try_from(document_index).expect("document ID fits u32");
+        let local = id - bases[document_index];
+        if documents
+            .last()
+            .is_none_or(|(current, _)| *current != document)
+        {
+            documents.push((document, single_range(local..local + 1)));
+            continue;
+        }
+        let ranges = &mut documents.last_mut().expect("document exists").1;
+        let range = ranges.last_mut().expect("document range exists");
+        if range.end == local {
+            range.end += 1;
+        } else {
+            ranges.push(local..local + 1);
         }
     }
     documents
+}
+
+fn candidate_byte_ranges(
+    decoded_size: u64,
+    blocks: &[std::ops::Range<u32>],
+) -> Option<Vec<std::ops::Range<u64>>> {
+    const GAP_BYTES: u64 = 1024 * 1024;
+    const MAX_RANGES: usize = 32;
+    let block_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+    let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+    for blocks in blocks {
+        let range = u64::from(blocks.start) * block_bytes
+            ..(u64::from(blocks.end) * block_bytes).min(decoded_size);
+        if let Some(previous) = ranges.last_mut() {
+            if range.start.saturating_sub(previous.end) <= GAP_BYTES {
+                previous.end = range.end;
+                continue;
+            }
+        }
+        ranges.push(range);
+    }
+    let covered: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+    (ranges.len() <= MAX_RANGES && covered.saturating_mul(2) <= decoded_size).then_some(ranges)
+}
+
+fn has_complete_block_newlines(decoded_size: u64, block_newlines: &[u32]) -> bool {
+    u64::try_from(block_newlines.len()).is_ok_and(|count| {
+        count == decoded_size.div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+    })
+}
+
+struct RegionFetch {
+    index: usize,
+    segment: usize,
+    document: usize,
+    ranges: Vec<std::ops::Range<u64>>,
 }
 
 pub(crate) fn merge_and_put_segment(
@@ -1117,6 +1174,101 @@ pub struct SegmentedReader {
 }
 
 impl SegmentedReader {
+    fn fetch_region(
+        &self,
+        request: &RegionFetch,
+        before_context: usize,
+        after_context: usize,
+    ) -> Result<seagrep_core::FetchedDocument> {
+        let segment = &self.segments[request.segment];
+        let tables = self.classify_index_result(self.segment_tables(segment))?;
+        let document = &tables.documents[request.document];
+        let pack_cache = crate::pack::PackBlockCache {
+            cache_dir: &self.cache_dir,
+            seg_id: &segment.meta.seg_id,
+            note_written: &|bytes| self.note_range_written(bytes),
+        };
+        self.classify_index_result(crate::pack::fetch_regions(
+            self.store.as_ref(),
+            self.range_cache().then_some(&pack_cache),
+            &segment.meta.packs,
+            &tables.blocks,
+            &crate::pack::PackRegionRequest {
+                slice: crate::pack::PackSlice {
+                    first_block: document.first_block,
+                    block_offset: document.block_offset,
+                },
+                decoded_size: document.decoded_size,
+                ranges: &request.ranges,
+                block_newlines: &document.block_newlines,
+            },
+            before_context,
+            after_context,
+        ))
+    }
+
+    fn fetch_regions_parallel(
+        &self,
+        requests: &[RegionFetch],
+        before_context: usize,
+        after_context: usize,
+        consume: &mut dyn FnMut(usize, seagrep_core::FetchedDocument) -> Result<()>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let workers = std::thread::available_parallelism()?
+            .get()
+            .min(requests.len());
+        let next = AtomicUsize::new(0);
+        let cancelled = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<
+            Result<(usize, seagrep_core::FetchedDocument)>,
+        >(workers * 2);
+        let failure = std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let sender = sender.clone();
+                let next = &next;
+                let cancelled = &cancelled;
+                scope.spawn(move || {
+                    while !cancelled.load(Ordering::Relaxed) {
+                        let request_index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(request) = requests.get(request_index) else {
+                            break;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.fetch_region(request, before_context, after_context)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("a region fetch worker panicked")))
+                        .map(|document| (request.index, document));
+                        if result.is_err() {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
+                        if sender.send(result).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            let mut failure = None;
+            while let Ok(delivery) = receiver.recv() {
+                let result = delivery.and_then(|(index, document)| consume(index, document));
+                if let Err(error) = result {
+                    cancelled.store(true, Ordering::Relaxed);
+                    failure = Some(error);
+                    break;
+                }
+            }
+            drop(receiver);
+            failure
+        });
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn range_cache(&self) -> bool {
         self.range_cache_max > 0
     }
@@ -1125,8 +1277,7 @@ impl SegmentedReader {
     /// it within one long-lived reader by re-sweeping after every quarter
     /// cap of fresh writes.
     fn note_range_written(&self, bytes: u64) {
-        self.range_written
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.range_written.fetch_add(bytes, Ordering::Relaxed);
         self.sweep_if_due();
     }
 
@@ -1451,19 +1602,24 @@ impl SegmentedReader {
                         .collect()
                 },
             ))?;
-            let ids = match selection {
-                crate::eval::Selection::All => (0..segment.meta.doc_count).collect(),
+            let documents: Vec<(u32, Option<Vec<std::ops::Range<u32>>>)> = match selection {
+                crate::eval::Selection::All => (0..segment.meta.doc_count)
+                    .map(|document| (document, None))
+                    .collect(),
                 crate::eval::Selection::Ids(ids) => match self.strategy {
-                    Strategy::Trigram => blocks_to_documents(
+                    Strategy::Trigram => blocks_to_doc_ranges(
                         ids,
                         block_bases.expect("trigram block bases are loaded"),
-                    ),
-                    Strategy::Sparse => ids,
+                    )
+                    .into_iter()
+                    .map(|(document, ranges)| (document, Some(ranges)))
+                    .collect(),
+                    Strategy::Sparse => ids.into_iter().map(|document| (document, None)).collect(),
                 },
             };
-            let mut live = ids
+            let mut live = documents
                 .into_iter()
-                .filter(|id| segment.dead.documents.binary_search(id).is_err())
+                .filter(|(id, _)| segment.dead.documents.binary_search(id).is_err())
                 .peekable();
             if live.peek().is_none() {
                 continue;
@@ -1471,7 +1627,7 @@ impl SegmentedReader {
             let tables = self.classify_index_result(self.segment_tables(segment))?;
             let capacity = batch_size.min(usize::try_from(segment.meta.doc_count)?);
             let mut batch = Vec::with_capacity(capacity);
-            for id in live {
+            for (id, blocks) in live {
                 let document = &tables.documents[id as usize];
                 if batch.len() >= batch_size {
                     if !visit(std::mem::take(&mut batch))? {
@@ -1490,6 +1646,7 @@ impl SegmentedReader {
                     index: Some(IndexAddress {
                         segment: u32::try_from(segment_id)?,
                         document: id,
+                        blocks,
                     }),
                 });
             }
@@ -2027,6 +2184,76 @@ impl seagrep_core::DocFetcher for SegmentedReader {
         }
         Ok(())
     }
+
+    fn fetch_candidate_each(
+        &self,
+        documents: &[DocAddress],
+        before_context: usize,
+        after_context: usize,
+        consume: &mut dyn FnMut(usize, seagrep_core::FetchedDocument) -> Result<()>,
+    ) -> Result<()> {
+        let mut whole = Vec::new();
+        let mut regional = Vec::new();
+        for (index, address) in documents.iter().enumerate() {
+            let indexed = address
+                .index
+                .as_ref()
+                .context("candidate has no index snapshot address")?;
+            let segment = self
+                .segments
+                .get(usize::try_from(indexed.segment)?)
+                .context("candidate segment is out of bounds")?;
+            let tables = self.classify_index_result(self.segment_tables(segment))?;
+            let document = tables
+                .documents
+                .get(usize::try_from(indexed.document)?)
+                .context("candidate document is out of bounds")?;
+            anyhow::ensure!(
+                document.display_key == address.display_key,
+                "candidate display key differs from its index entry"
+            );
+            if !has_complete_block_newlines(document.decoded_size, &document.block_newlines) {
+                whole.push(index);
+                continue;
+            }
+            debug_assert_eq!(
+                u64::try_from(document.block_newlines.len()).ok(),
+                Some(
+                    document
+                        .decoded_size
+                        .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64)
+                )
+            );
+            let Some(ranges) = indexed
+                .blocks
+                .as_deref()
+                .and_then(|blocks| candidate_byte_ranges(document.decoded_size, blocks))
+            else {
+                whole.push(index);
+                continue;
+            };
+            regional.push(RegionFetch {
+                index,
+                segment: usize::try_from(indexed.segment)?,
+                document: usize::try_from(indexed.document)?,
+                ranges,
+            });
+        }
+        self.fetch_regions_parallel(&regional, before_context, after_context, consume)?;
+        if !whole.is_empty() {
+            let selected = whole
+                .iter()
+                .map(|index| documents[*index].clone())
+                .collect::<Vec<_>>();
+            self.fetch_each(&selected, &mut |selected_index, body| {
+                consume(
+                    whole[selected_index],
+                    seagrep_core::FetchedDocument::Whole(body),
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2248,6 +2475,7 @@ mod tests {
                 first_block: 0,
                 block_offset: 0,
                 max_line_len: 0,
+                block_newlines: Vec::new(),
             }],
             blocks: vec![crate::pack::PackBlock {
                 pack: 0,
@@ -2320,6 +2548,63 @@ mod tests {
     }
 
     #[test]
+    fn saturated_max_line_expands_to_the_whole_document() {
+        let tables = SegmentTables {
+            sources: Vec::new(),
+            documents: vec![DocEntry {
+                display_key: "large".into(),
+                source_id: 0,
+                member_path: None,
+                decoded_size: 4 * seagrep_core::CANDIDATE_BLOCK_BYTES as u64,
+                first_block: 0,
+                block_offset: 0,
+                max_line_len: u32::MAX,
+                block_newlines: Vec::new(),
+            }],
+            blocks: Vec::new(),
+        };
+        let bases = build_block_bases(&tables).unwrap();
+
+        assert_eq!(expand_block(2, &bases, &tables), 0..=3);
+        let grouped = blocks_to_doc_ranges(expand_block(2, &bases, &tables).collect(), &bases);
+        assert_eq!(grouped, vec![(0, single_range(0..4))]);
+        assert_eq!(
+            candidate_byte_ranges(tables.documents[0].decoded_size, &grouped[0].1),
+            None
+        );
+    }
+
+    #[test]
+    fn block_candidates_group_and_merge_per_document() {
+        assert_eq!(
+            blocks_to_doc_ranges(vec![0, 1, 3, 4, 5, 7], &[0, 4, 8]),
+            vec![(0, vec![0..2, 3..4]), (1, vec![0..2, 3..4])]
+        );
+    }
+
+    #[test]
+    fn candidate_ranges_coalesce_and_fall_back_on_majority_coverage() {
+        let block = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+        assert_eq!(
+            candidate_byte_ranges(20 * block, &[0..1, 8..9]),
+            Some(single_range(0..9 * block))
+        );
+        assert_eq!(candidate_byte_ranges(4 * block, &single_range(0..3)), None);
+    }
+
+    #[test]
+    fn incomplete_block_newlines_force_whole_document_fetch() {
+        let block = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
+
+        assert!(has_complete_block_newlines(0, &[]));
+        assert!(has_complete_block_newlines(block, &[0]));
+        assert!(has_complete_block_newlines(block + 1, &[0, 0]));
+        assert!(!has_complete_block_newlines(block, &[]));
+        assert!(!has_complete_block_newlines(block + 1, &[0]));
+        assert!(!has_complete_block_newlines(block, &[0, 0]));
+    }
+
+    #[test]
     fn unmergeable_segment_set_converges_without_root_rewrite() {
         let store_dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -2347,6 +2632,7 @@ mod tests {
                     first_block: 0,
                     block_offset: 0,
                     max_line_len: 0,
+                    block_newlines: Vec::new(),
                 }],
                 blocks: vec![crate::pack::PackBlock {
                     pack: 0,

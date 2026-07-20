@@ -28,6 +28,7 @@ pub(crate) struct DocEntry {
     /// candidate-block slack for trigram segments; 0 for sparse segments
     /// (doc-granular postings need no slack) and for empty documents.
     pub max_line_len: u32,
+    pub block_newlines: Vec<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -283,6 +284,7 @@ mod tests {
                     first_block: 0,
                     block_offset: 0,
                     max_line_len: 0,
+                    block_newlines: Vec::new(),
                 },
                 DocEntry {
                     display_key: "a.zip!/b".into(),
@@ -292,6 +294,7 @@ mod tests {
                     first_block: 0,
                     block_offset: 1,
                     max_line_len: 0,
+                    block_newlines: Vec::new(),
                 },
                 DocEntry {
                     display_key: "b".into(),
@@ -301,6 +304,7 @@ mod tests {
                     first_block: 0,
                     block_offset: 2,
                     max_line_len: 0,
+                    block_newlines: Vec::new(),
                 },
             ],
             blocks: vec![PackBlock {

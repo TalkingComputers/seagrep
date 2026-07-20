@@ -33,6 +33,6 @@ pub use grep::{
 };
 pub use progress::{ProgressEvent, ProgressSender};
 pub use store::{
-    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, IndexAddress,
-    LocalBlobStore, SourceObject, StaleSource, StreamingPut,
+    content_version, scan_matching_docs, BlobStore, Corpus, DocAddress, DocFetcher, DocumentRegion,
+    FetchedDocument, IndexAddress, LocalBlobStore, SourceObject, StaleSource, StreamingPut,
 };
