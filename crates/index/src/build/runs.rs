@@ -108,6 +108,62 @@ pub(crate) fn collect_file_trigrams(file: &mut File, start: u64, len: u64) -> Re
     }
 }
 
+/// Longest line of `data` given `carry` bytes already seen since the last
+/// newline; returns the updated carry. Saturating: line lengths cap at
+/// u32::MAX, which the slack computation treats as "whole document".
+pub(crate) fn track_max_line(data: &[u8], carry: &mut u64, max: &mut u64) {
+    for &byte in data {
+        if byte == b'\n' {
+            *max = (*max).max(*carry);
+            *carry = 0;
+        } else {
+            *carry += 1;
+        }
+    }
+    *max = (*max).max(*carry);
+}
+
+/// Stream a file (or spool range) as 128 KiB candidate windows, visiting
+/// the distinct packed trigrams of each window. Every window's slice carries
+/// a 2-byte lookahead, so a gram straddling the boundary is attributed to
+/// the window of its FIRST byte, exactly like `pack_trigram_block_grams` —
+/// file-built and memory-built postings of the same bytes are identical.
+/// Returns the longest line (for the reader's block-slack computation).
+pub(crate) fn visit_file_trigram_blocks(
+    file: &mut File,
+    start: u64,
+    len: u64,
+    mut visit: impl FnMut(u32, &[u32]) -> Result<()>,
+) -> Result<u64> {
+    let window_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; window_bytes + 2];
+    let mut have = 0usize;
+    let mut line_carry = 0u64;
+    let mut max_line = 0u64;
+    let mut pos = 0u64;
+    let mut block = 0u32;
+    while pos < len {
+        let slice_len = usize::try_from((len - pos).min((window_bytes + 2) as u64))?;
+        if slice_len > have {
+            file.read_exact(&mut buf[have..slice_len])?;
+            track_max_line(&buf[have..slice_len], &mut line_carry, &mut max_line);
+        }
+        let grams = seagrep_core::pack_trigram_grams(&buf[..slice_len]);
+        if !grams.is_empty() {
+            visit(block, &grams)?;
+        }
+        let carry = slice_len.saturating_sub(window_bytes);
+        buf.copy_within(slice_len - carry..slice_len, 0);
+        have = carry;
+        pos += window_bytes as u64;
+        block = block
+            .checked_add(1)
+            .context("document exceeds the candidate block id space")?;
+    }
+    Ok(max_line)
+}
+
 struct SparseRunWriter {
     id: DocId,
     entries: rapidhash::RapidHashSet<u64>,
@@ -901,5 +957,55 @@ mod tests {
             Strategy::Sparse,
             TRIGRAM_SHARD_RUN_BYTES
         ));
+    }
+
+    #[test]
+    fn file_block_grams_match_memory_block_grams() {
+        use seagrep_core::{pack_trigram_block_grams, CANDIDATE_BLOCK_BYTES};
+        let w = CANDIDATE_BLOCK_BYTES;
+        for len in [
+            0,
+            2,
+            3,
+            4096,
+            w - 1,
+            w,
+            w + 1,
+            w + 2,
+            w + 3,
+            2 * w,
+            3 * w + 17,
+        ] {
+            let mut state = 0x2545_f491_u32;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    // sprinkle newlines so max-line tracking is exercised
+                    if state % 97 == 0 {
+                        b'\n'
+                    } else {
+                        (state % 11) as u8 + b'a'
+                    }
+                })
+                .collect();
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut file, &data).unwrap();
+            let mut from_file = Vec::new();
+            let max_line =
+                visit_file_trigram_blocks(file.as_file_mut(), 0, len as u64, |block, grams| {
+                    from_file.extend(grams.iter().map(|&g| (block, g)));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(from_file, pack_trigram_block_grams(&data), "length {len}");
+            let expected_max = data
+                .split(|&b| b == b'\n')
+                .map(|line| line.len() as u64)
+                .max()
+                .unwrap_or(0);
+            assert_eq!(max_line, expected_max, "max line, length {len}");
+        }
     }
 }
