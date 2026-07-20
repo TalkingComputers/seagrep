@@ -23,6 +23,8 @@ const TRIGRAM_BITMAP_WORDS: usize = (1 << 24) / 64;
 const TRIGRAM_RUN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const TRIGRAM_SHARD_RUN_BYTES: u64 = 7 * 1024 * 1024;
 
+type PostingRuns = (Vec<TempPath>, Vec<(usize, u64)>);
+
 fn uses_sharded_terms(strategy: Strategy, run_bytes: u64) -> bool {
     strategy == Strategy::Trigram && run_bytes >= TRIGRAM_SHARD_RUN_BYTES
 }
@@ -110,7 +112,7 @@ pub(crate) fn collect_file_trigrams(file: &mut File, start: u64, len: u64) -> Re
 
 /// Longest line of `data` given `carry` bytes already seen since the last
 /// newline; returns the updated carry. Saturating: line lengths cap at
-/// u32::MAX, which the slack computation treats as "whole document".
+/// `u32::MAX`, which the slack computation treats as "whole document".
 pub(crate) fn track_max_line(data: &[u8], carry: &mut u64, max: &mut u64) {
     for &byte in data {
         if byte == b'\n' {
@@ -473,7 +475,7 @@ pub(crate) fn write_posting_runs(
     strategy: Strategy,
     sparse_run_bytes: usize,
     spool: Option<&File>,
-) -> Result<(Vec<TempPath>, Vec<(usize, u64)>)> {
+) -> Result<PostingRuns> {
     match strategy {
         Strategy::Trigram => write_trigram_block_runs(grammed, spool),
         Strategy::Sparse => {
@@ -526,15 +528,12 @@ pub(crate) fn write_posting_runs(
 /// `doc.base + local_block`. Deferred (file/spool) documents stream through
 /// the windowed visitor, which also yields their longest line — returned so
 /// the builder can patch the doc table.
-fn write_trigram_block_runs(
-    grammed: Vec<GrammedDoc>,
-    spool: Option<&File>,
-) -> Result<(Vec<TempPath>, Vec<(usize, u64)>)> {
+fn write_trigram_block_runs(grammed: Vec<GrammedDoc>, spool: Option<&File>) -> Result<PostingRuns> {
     let mut sink = TrigramEntrySink::new();
     let mut max_lines = Vec::new();
     for doc in grammed {
         let base = doc.base;
-        let mut push_window = |sink: &mut TrigramEntrySink, block: u32, grams: &[u32]| {
+        let push_window = |sink: &mut TrigramEntrySink, block: u32, grams: &[u32]| {
             let id = base
                 .checked_add(block)
                 .context("segment exceeds the candidate block id space")?;
@@ -1122,7 +1121,7 @@ mod tests {
                     state ^= state >> 17;
                     state ^= state << 5;
                     // sprinkle newlines so max-line tracking is exercised
-                    if state % 97 == 0 {
+                    if state.is_multiple_of(97) {
                         b'\n'
                     } else {
                         (state % 11) as u8 + b'a'
@@ -1130,7 +1129,7 @@ mod tests {
                 })
                 .collect();
             let mut file = tempfile::NamedTempFile::new().unwrap();
-            std::io::Write::write_all(&mut file, &data).unwrap();
+            Write::write_all(&mut file, &data).unwrap();
             let mut from_file = Vec::new();
             let max_line =
                 visit_file_trigram_blocks(file.as_file_mut(), 0, len as u64, |block, grams| {

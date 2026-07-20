@@ -941,7 +941,7 @@ fn random_seg_id() -> Result<String> {
 }
 
 /// The posting id space for a segment: candidate blocks for trigram
-/// (sum of ceil(decoded_size / BLOCK) over documents), documents for sparse.
+/// (sum of `decoded_size.div_ceil(BLOCK)` over documents), documents for sparse.
 pub(crate) fn segment_block_count(strategy: Strategy, tables: &SegmentTables) -> u64 {
     match strategy {
         Strategy::Sparse => tables.documents.len() as u64,
@@ -954,6 +954,47 @@ pub(crate) fn segment_block_count(strategy: Strategy, tables: &SegmentTables) ->
             })
             .sum(),
     }
+}
+
+fn build_block_bases(tables: &SegmentTables) -> Result<Vec<u32>> {
+    let mut bases = Vec::with_capacity(tables.documents.len() + 1);
+    let mut next = 0u32;
+    bases.push(next);
+    for document in &tables.documents {
+        let blocks = document
+            .decoded_size
+            .div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES as u64);
+        next = next
+            .checked_add(u32::try_from(blocks)?)
+            .context("segment candidate block count overflows u32")?;
+        bases.push(next);
+    }
+    Ok(bases)
+}
+
+fn block_document(id: u32, bases: &[u32]) -> usize {
+    bases.partition_point(|base| *base <= id) - 1
+}
+
+fn expand_block(id: u32, bases: &[u32], tables: &SegmentTables) -> std::ops::RangeInclusive<u32> {
+    let document = block_document(id, bases);
+    let start = bases[document];
+    let end = bases[document + 1] - 1;
+    let slack = 1 + tables.documents[document].max_line_len
+        / u32::try_from(seagrep_core::CANDIDATE_BLOCK_BYTES)
+            .expect("candidate block size fits u32");
+    id.saturating_sub(slack).max(start)..=id.saturating_add(slack).min(end)
+}
+
+fn blocks_to_documents(ids: Vec<u32>, bases: &[u32]) -> Vec<u32> {
+    let mut documents = Vec::with_capacity(ids.len());
+    for id in ids {
+        let document = u32::try_from(block_document(id, bases)).expect("document ID fits u32");
+        if documents.last() != Some(&document) {
+            documents.push(document);
+        }
+    }
+    documents
 }
 
 pub(crate) fn merge_and_put_segment(
@@ -1058,6 +1099,7 @@ struct Segment {
     map: TermMap,
     dead: DeadSet,
     tables: OnceLock<SegmentTables>,
+    block_bases: OnceLock<Vec<u32>>,
     postings_table: OnceLock<std::sync::Arc<crate::postings_table::PostingsTableIndex>>,
 }
 
@@ -1190,6 +1232,22 @@ impl SegmentedReader {
         Ok(segment.tables.get_or_init(|| loaded))
     }
 
+    fn segment_block_bases<'a>(&self, segment: &'a Segment) -> Result<&'a [u32]> {
+        if let Some(bases) = segment.block_bases.get() {
+            return Ok(bases);
+        }
+        let bases = build_block_bases(self.segment_tables(segment)?)?;
+        anyhow::ensure!(
+            bases.last().copied().unwrap_or(0) as u64 == segment.meta.block_count,
+            "segment candidate block count differs from its document table"
+        );
+        segment.block_bases.set(bases).ok();
+        Ok(segment
+            .block_bases
+            .get()
+            .context("segment block bases were not initialized")?)
+    }
+
     /// Can any key with `prefix` live in this segment's `[min_key, max_key]`?
     fn prefix_overlaps(meta: &SegmentMeta, prefix: &str) -> bool {
         if meta.max_key.as_str() < prefix {
@@ -1269,14 +1327,40 @@ impl SegmentedReader {
                     .map(|&(packed, len)| crate::eval::TermValue { packed, len })),
                 None => segment.map.get(gram),
             };
-            let ids = self.classify_index_result(candidates_with(
+            let tables = match self.strategy {
+                Strategy::Trigram => {
+                    Some(self.classify_index_result(self.segment_tables(segment))?)
+                }
+                Strategy::Sparse => None,
+            };
+            let block_bases = match self.strategy {
+                Strategy::Trigram => {
+                    Some(self.classify_index_result(self.segment_block_bases(segment))?)
+                }
+                Strategy::Sparse => None,
+            };
+            let expand_block = |id| {
+                expand_block(
+                    id,
+                    block_bases.expect("trigram block bases are loaded"),
+                    tables.expect("trigram document tables are loaded"),
+                )
+            };
+            let expand = match self.strategy {
+                Strategy::Trigram => {
+                    Some(&expand_block as &dyn Fn(u32) -> std::ops::RangeInclusive<u32>)
+                }
+                Strategy::Sparse => None,
+            };
+            let id_space = u32::try_from(segment.meta.block_count)?;
+            let selection = self.classify_index_result(candidates_with(
                 lookup,
-                segment.meta.doc_count,
+                id_space,
                 q,
+                expand,
                 |needed| {
-                    let doc_count = segment.meta.doc_count;
                     let table = self.postings_table(segment)?;
-                    let ranges = posting_ranges(needed, doc_count, table.data_len)?;
+                    let ranges = posting_ranges(needed, id_space, table.data_len)?;
                     // Fetch at verification-block granularity: every block
                     // checks against the trusted table before any list is
                     // sliced out. Corruption aborts the query loudly —
@@ -1356,10 +1440,10 @@ impl SegmentedReader {
                             };
                             let decoded = match self.strategy {
                                 Strategy::Sparse => crate::delta_blocks::decode_delta_blocks(
-                                    &bytes, count, doc_count,
+                                    &bytes, count, id_space,
                                 )?,
                                 Strategy::Trigram => {
-                                    crate::decode_posting_block(&bytes, count, doc_count)?
+                                    crate::decode_posting_block(&bytes, count, id_space)?
                                 }
                             };
                             Ok((offset, decoded))
@@ -1367,6 +1451,16 @@ impl SegmentedReader {
                         .collect()
                 },
             ))?;
+            let ids = match selection {
+                crate::eval::Selection::All => (0..segment.meta.doc_count).collect(),
+                crate::eval::Selection::Ids(ids) => match self.strategy {
+                    Strategy::Trigram => blocks_to_documents(
+                        ids,
+                        block_bases.expect("trigram block bases are loaded"),
+                    ),
+                    Strategy::Sparse => ids,
+                },
+            };
             let mut live = ids
                 .into_iter()
                 .filter(|id| segment.dead.documents.binary_search(id).is_err())
@@ -1740,6 +1834,7 @@ fn load_segment(
             map: TermMap::SparseRemote { index },
             dead: load_dead(store, cache_dir, meta)?,
             tables: OnceLock::new(),
+            block_bases: OnceLock::new(),
             postings_table: OnceLock::new(),
             meta: meta.clone(),
         });
@@ -1761,6 +1856,7 @@ fn load_segment(
         map,
         dead,
         tables: OnceLock::new(),
+        block_bases: OnceLock::new(),
         postings_table: OnceLock::new(),
         meta: meta.clone(),
     })
@@ -1947,6 +2043,7 @@ mod tests {
         SegmentMeta {
             seg_id: "a".repeat(64),
             doc_count: 1,
+            block_count: 1,
             terms_fst_len: 1,
             terms_fst_hash: "b".repeat(64),
             terms_tail_hash: String::new(),

@@ -46,7 +46,7 @@ use std::fs::File;
 use std::io::Read;
 #[cfg(test)]
 use std::io::{BufReader, Write};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -58,7 +58,7 @@ const LOCAL_BODY_MEMORY_LIMIT: u64 = 1024;
 /// Bumped whenever index semantics change (e.g. grams now cover decompressed
 /// bodies); an index built by an older seagrep must error, not silently
 /// return wrong results.
-const INDEX_FORMAT: u32 = 19;
+const INDEX_FORMAT: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
@@ -252,21 +252,19 @@ pub(crate) fn decode_posting_block(bytes: &[u8], count: u32, doc_count: u32) -> 
 
 /// Shared candidates pipeline: resolve grams against the term dict (no IO),
 /// fetch every needed posting block via `fetch_blocks`, evaluate purely.
-/// Returns local ids in `0..doc_count`.
+/// Returns local ids in `0..id_space`.
 pub(crate) fn candidates_with(
     get: impl Fn(&[u8]) -> Result<Option<eval::TermValue>>,
-    doc_count: u32,
+    id_space: u32,
     q: &Query,
+    expand: Option<&dyn Fn(DocId) -> RangeInclusive<DocId>>,
     fetch_blocks: impl FnOnce(&BTreeMap<u64, (u32, u64)>) -> Result<BTreeMap<u64, Vec<DocId>>>,
-) -> Result<Vec<DocId>> {
-    let resolved = eval::resolve(q, doc_count, &get)?;
+) -> Result<Selection> {
+    let resolved = eval::resolve(q, id_space, &get)?;
     let mut needed = BTreeMap::new();
     eval::blocks_needed(&resolved, &mut needed);
     let blocks = fetch_blocks(&needed)?;
-    match eval::eval(&resolved, &blocks)? {
-        Selection::All => Ok((0..doc_count).collect()),
-        Selection::Ids(ids) => Ok(ids),
-    }
+    eval::eval(&resolved, &blocks, expand)
 }
 
 pub struct LocalCorpus {
