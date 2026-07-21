@@ -1229,8 +1229,7 @@ mod tests {
 
     #[test]
     fn scratch_preflight_preserves_full_collections() {
-        let mut values = Vec::with_capacity(8);
-        values.resize(values.capacity(), 0u8);
+        let mut values = vec![0u8; 8];
         let value_capacity = values.capacity();
         let mut value_bytes = value_capacity;
         let value_limit = value_bytes * 2;

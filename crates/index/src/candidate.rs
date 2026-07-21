@@ -221,12 +221,11 @@ pub(crate) fn add_candidate_selection(
         return Ok(());
     }
     for (document, ranges) in group_candidate_blocks(ids, bases, extent)? {
-        match documents
+        if let Some(current) = documents
             .entry(document)
             .or_insert_with(|| Some(Vec::new()))
         {
-            Some(current) => merge_candidate_ranges(current, ranges),
-            None => {}
+            merge_candidate_ranges(current, ranges);
         }
     }
     Ok(())

@@ -959,9 +959,9 @@ impl<'a> PackBatch<'a> {
         block_newlines: &[u32],
         decoded_size: u64,
         range: Range<u64>,
-        before_context: usize,
-        after_context: usize,
+        context: (usize, usize),
     ) -> Result<Range<u64>> {
+        let (before_context, after_context) = context;
         let block_bytes = seagrep_core::CANDIDATE_BLOCK_BYTES as u64;
         let mut start = range.start;
         let mut needed = before_context
@@ -1139,10 +1139,11 @@ impl<'a> PackBatch<'a> {
                 let document_parts =
                     document_blocks(request.slice, request.decoded_size, self.blocks)?;
                 if request.decoded_size > 0 {
+                    let whole = 0..request.decoded_size;
                     collect_request_blocks(
                         request.slice,
                         request.decoded_size,
-                        &[0..request.decoded_size],
+                        std::slice::from_ref(&whole),
                         self.blocks,
                         &mut block_ids,
                     )?;
@@ -1171,10 +1172,11 @@ impl<'a> PackBatch<'a> {
             match plan_pack_ranges(request)? {
                 None => {
                     if request.decoded_size < LARGE_DOCUMENT_BYTES && request.decoded_size > 0 {
+                        let whole = 0..request.decoded_size;
                         collect_request_blocks(
                             request.slice,
                             request.decoded_size,
-                            &[0..request.decoded_size],
+                            std::slice::from_ref(&whole),
                             self.blocks,
                             &mut block_ids,
                         )?;
@@ -1233,8 +1235,7 @@ impl<'a> PackBatch<'a> {
                                     request.block_newlines,
                                     request.decoded_size,
                                     range.bytes,
-                                    before_context,
-                                    after_context,
+                                    (before_context, after_context),
                                 )?,
                                 read: PlannedRead::FullLines {
                                     before_context,
