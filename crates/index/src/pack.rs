@@ -4,9 +4,7 @@ use seagrep_core::{BlobStore, DocumentBody, DocumentRegion, DocumentSpool, Fetch
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-#[cfg(test)]
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::sync::{Condvar, Mutex};
 
@@ -82,9 +80,43 @@ struct PackRun {
     blocks: Vec<usize>,
 }
 
+#[derive(Clone)]
+enum DecodedBlock {
+    Memory(bytes::Bytes),
+    File {
+        file: std::sync::Arc<Mutex<std::fs::File>>,
+        offset: u64,
+        len: usize,
+    },
+}
+
+impl DecodedBlock {
+    fn read(&self, range: Range<usize>) -> Result<bytes::Bytes> {
+        match self {
+            Self::Memory(bytes) => {
+                let slice = bytes
+                    .get(range)
+                    .context("document block range is out of bounds")?;
+                Ok(bytes.slice_ref(slice))
+            }
+            Self::File { file, offset, len } => {
+                anyhow::ensure!(range.end <= *len, "document block range is out of bounds");
+                let mut bytes = vec![0; range.len()];
+                let start = offset
+                    .checked_add(u64::try_from(range.start)?)
+                    .context("document block range overflows")?;
+                let mut file = file.lock().unwrap();
+                file.seek(SeekFrom::Start(start))?;
+                file.read_exact(&mut bytes)?;
+                Ok(bytes::Bytes::from(bytes))
+            }
+        }
+    }
+}
+
 enum BlockEntry {
     Loading,
-    Ready(bytes::Bytes),
+    Ready(DecodedBlock),
 }
 
 struct BlockState {
@@ -738,6 +770,43 @@ impl<'a> PackBatch<'a> {
         cache: Option<&PackBlockCache<'_>>,
         block_ids: &BTreeSet<usize>,
     ) -> Result<()> {
+        self.load_blocks_with(cache, block_ids, &mut |decoded| {
+            Ok(DecodedBlock::Memory(bytes::Bytes::from(decoded)))
+        })
+    }
+
+    fn load_blocks_to_file(
+        &self,
+        cache: Option<&PackBlockCache<'_>>,
+        block_ids: &BTreeSet<usize>,
+    ) -> Result<()> {
+        let file = std::sync::Arc::new(Mutex::new(tempfile::tempfile()?));
+        let mut offset = 0u64;
+        self.load_blocks_with(cache, block_ids, &mut |decoded| {
+            let len = decoded.len();
+            {
+                let mut file = file.lock().unwrap();
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&decoded)?;
+            }
+            let stored = DecodedBlock::File {
+                file: std::sync::Arc::clone(&file),
+                offset,
+                len,
+            };
+            offset = offset
+                .checked_add(u64::try_from(len)?)
+                .context("decoded block file offset overflows")?;
+            Ok(stored)
+        })
+    }
+
+    fn load_blocks_with(
+        &self,
+        cache: Option<&PackBlockCache<'_>>,
+        block_ids: &BTreeSet<usize>,
+        store_block: &mut dyn FnMut(Vec<u8>) -> Result<DecodedBlock>,
+    ) -> Result<()> {
         if block_ids.is_empty() {
             return Ok(());
         }
@@ -780,11 +849,10 @@ impl<'a> PackBatch<'a> {
             &runs,
             RANGE_BYTES,
             &mut |block_id, decoded| {
+                let decoded = store_block(decoded)?;
                 let mut state = self.state.lock().unwrap();
                 if matches!(state.entries.get(&block_id), Some(BlockEntry::Loading)) {
-                    state
-                        .entries
-                        .insert(block_id, BlockEntry::Ready(bytes::Bytes::from(decoded)));
+                    state.entries.insert(block_id, BlockEntry::Ready(decoded));
                 }
                 Ok(())
             },
@@ -848,14 +916,12 @@ impl<'a> PackBatch<'a> {
                 .offset
                 .checked_add(to)
                 .context("document block range overflows")?;
-            let bytes = decoded
-                .get(start..end)
-                .context("document block range is out of bounds")?;
+            let bytes = decoded.read(start..end)?;
             anyhow::ensure!(
                 bytes.len() == usize::try_from(len)?,
                 "document range is incomplete"
             );
-            return Ok(decoded.slice_ref(bytes));
+            return Ok(bytes);
         }
         let mut output = Vec::with_capacity(usize::try_from(len)?);
         for part in matching {
@@ -877,11 +943,7 @@ impl<'a> PackBatch<'a> {
                 .offset
                 .checked_add(to)
                 .context("document block range overflows")?;
-            output.extend_from_slice(
-                decoded
-                    .get(start..end)
-                    .context("document block range is out of bounds")?,
-            );
+            output.extend_from_slice(&decoded.read(start..end)?);
         }
         anyhow::ensure!(
             output.len() == usize::try_from(len)?,
@@ -1028,6 +1090,30 @@ impl<'a> PackBatch<'a> {
         Ok((line, 0))
     }
 
+    fn fetch_large_reusing_blocks(
+        &self,
+        cache: Option<&PackBlockCache<'_>>,
+        request: &PackRequest,
+        consume: &mut dyn FnMut(usize, DocumentBody) -> Result<()>,
+    ) -> Result<()> {
+        let parts = document_blocks(request.slice, request.decoded_size, self.blocks)?;
+        let block_ids = parts
+            .iter()
+            .map(|part| part.block_id)
+            .collect::<BTreeSet<_>>();
+        self.load_blocks_to_file(cache, &block_ids)?;
+        let mut spool = DocumentSpool::new(request.decoded_size)?;
+        for part in &parts {
+            let end = part
+                .start
+                .checked_add(u64::try_from(part.len)?)
+                .context("document block range overflows")?;
+            let bytes = self.read_range(cache, &parts, part.start..end)?;
+            spool.write_at(part.start, &bytes)?;
+        }
+        consume(request.index, spool.finish()?)
+    }
+
     pub(crate) fn fetch_documents(
         &self,
         cache: Option<&PackBlockCache<'_>>,
@@ -1121,14 +1207,9 @@ impl<'a> PackBatch<'a> {
                             slice: request.slice,
                             decoded_size: request.decoded_size,
                         };
-                        fetch_large(
-                            self.store,
-                            cache,
-                            self.packs,
-                            self.blocks,
-                            &whole,
-                            &mut |index, body| consume(index, FetchedDocument::Whole(body)),
-                        )?;
+                        self.fetch_large_reusing_blocks(cache, &whole, &mut |index, body| {
+                            consume(index, FetchedDocument::Whole(body))
+                        })?;
                     } else {
                         let bytes = self.read_range(cache, &parts, 0..request.decoded_size)?;
                         consume(
@@ -1425,6 +1506,32 @@ mod tests {
             Ok(())
         })?;
         fetched.context("candidate batch returned no document")
+    }
+
+    fn expand_read_blocks(
+        reads: &[(String, u64, u64)],
+        packs: &[PackMeta],
+        blocks: &[PackBlock],
+    ) -> Vec<usize> {
+        reads
+            .iter()
+            .flat_map(|(name, start, len)| {
+                let pack = packs
+                    .iter()
+                    .position(|pack| pack_blob(&pack.hash) == *name)
+                    .unwrap();
+                let end = start + len;
+                blocks
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, block)| {
+                        usize::try_from(block.pack).unwrap() == pack
+                            && block.offset >= *start
+                            && block.offset + u64::from(block.compressed_len) <= end
+                    })
+                    .map(|(block_id, _)| block_id)
+            })
+            .collect()
     }
 
     fn fetch_test_ranges(decoded_size: u64, ranges: &[PackRange]) -> FetchedDocument {
@@ -1900,6 +2007,86 @@ mod tests {
 
         assert_eq!(fetch_batch_bytes(&batch, request).unwrap(), body);
         assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn large_regional_fallback_reads_each_pack_block_once() {
+        let mut body = vec![b'x'; usize::try_from(LARGE_DOCUMENT_BYTES).unwrap()];
+        body[0] = b'a';
+        let last = body.len() - 1;
+        body[last] = b'z';
+        let mut builder = PackBuilder::new(PACK_BLOCK_BYTES, PACK_TARGET_BYTES).unwrap();
+        let slice = builder
+            .append(Cursor::new(&body), body.len() as u64)
+            .unwrap();
+        let built = builder.finish().unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = CountingStore {
+            inner: LocalBlobStore::new(store_dir.path()),
+            reads: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            fault: Mutex::new(None),
+        };
+        for pack in &built.packs {
+            store
+                .put_file(&pack_blob(pack.hash()), pack.path())
+                .unwrap();
+        }
+        let packs = built.packs.iter().map(PackFile::meta).collect::<Vec<_>>();
+        let batch = PackBatch::create(&store, &packs, &built.blocks);
+        let newlines = vec![0; body.len().div_ceil(seagrep_core::CANDIDATE_BLOCK_BYTES)];
+        let tiny = [PackRange::Regional {
+            bytes: 0..1,
+            span: 1,
+        }];
+        let tiny_request = PackRegionRequest {
+            index: 0,
+            slice,
+            decoded_size: body.len() as u64,
+            ranges: &tiny,
+            block_newlines: &newlines,
+        };
+        batch
+            .fetch_regions(None, &[tiny_request], &mut |_, document| {
+                let FetchedDocument::Regions { regions, .. } = document else {
+                    panic!("tiny range should stay regional")
+                };
+                assert_eq!(regions[0].bytes, bytes::Bytes::from_static(b"a"));
+                Ok(())
+            })
+            .unwrap();
+
+        let majority = [PackRange::Regional {
+            bytes: 0..u64::try_from(body.len() / 2 + 1).unwrap(),
+            span: 1,
+        }];
+        let majority_request = PackRegionRequest {
+            index: 0,
+            slice,
+            decoded_size: body.len() as u64,
+            ranges: &majority,
+            block_newlines: &newlines,
+        };
+        batch
+            .fetch_regions(None, &[majority_request], &mut |_, document| {
+                let FetchedDocument::Whole(whole) = document else {
+                    panic!("majority range should fetch the whole document")
+                };
+                assert!(whole.is_file());
+                assert_eq!(whole.into_bytes().unwrap().as_ref(), body.as_slice());
+                Ok(())
+            })
+            .unwrap();
+
+        let fetched = expand_read_blocks(&store.reads.lock().unwrap(), &packs, &built.blocks);
+        let counts =
+            fetched
+                .into_iter()
+                .fold(vec![0usize; built.blocks.len()], |mut counts, block_id| {
+                    counts[block_id] += 1;
+                    counts
+                });
+        assert_eq!(counts, vec![1; built.blocks.len()]);
     }
 
     #[test]
