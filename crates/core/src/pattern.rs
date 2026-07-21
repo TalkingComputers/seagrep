@@ -74,6 +74,7 @@ struct ProofGraph {
     edges: Vec<Vec<usize>>,
 }
 
+const PROOF_NFA_BYTES: usize = 8 * 1024 * 1024;
 const PROOF_DFA_BYTES: usize = 8 * 1024 * 1024;
 const PROOF_SCRATCH_BYTES: usize = 16 * 1024 * 1024;
 const RETAINED_PROOF_BYTES: usize = 32 * 1024 * 1024;
@@ -167,12 +168,7 @@ fn can_match_newline(hir: &regex_syntax::hir::Hir) -> bool {
 }
 
 fn find_proof(hir: &regex_syntax::hir::Hir, direction: ProofDirection) -> Option<ProofCandidate> {
-    let properties = hir.properties();
-    if !properties.look_set().is_empty()
-        || properties.minimum_len() == Some(0)
-        || can_match_newline(hir)
-        || properties.maximum_len().is_some()
-    {
+    if !is_proof_eligible(hir) {
         return None;
     }
     let dense = build_proof_dfa(hir, direction)?;
@@ -191,14 +187,33 @@ fn find_proof(hir: &regex_syntax::hir::Hir, direction: ProofDirection) -> Option
     })
 }
 
+fn is_proof_eligible(hir: &regex_syntax::hir::Hir) -> bool {
+    let properties = hir.properties();
+    properties.look_set().is_empty()
+        && properties
+            .minimum_len()
+            .is_some_and(|bytes| bytes > 0 && bytes <= crate::CANDIDATE_BLOCK_BYTES)
+        && !can_match_newline(hir)
+        && properties.maximum_len().is_none()
+}
+
 fn build_proof_dfa(
     hir: &regex_syntax::hir::Hir,
     direction: ProofDirection,
 ) -> Option<regex_automata::dfa::dense::DFA<Vec<u32>>> {
+    build_proof_dfa_with_nfa_limit(hir, direction, PROOF_NFA_BYTES)
+}
+
+fn build_proof_dfa_with_nfa_limit(
+    hir: &regex_syntax::hir::Hir,
+    direction: ProofDirection,
+    nfa_bytes: usize,
+) -> Option<regex_automata::dfa::dense::DFA<Vec<u32>>> {
     let nfa_config = regex_automata::nfa::thompson::Config::new()
         .which_captures(regex_automata::nfa::thompson::WhichCaptures::None)
         .utf8(false)
-        .reverse(direction == ProofDirection::Reverse);
+        .reverse(direction == ProofDirection::Reverse)
+        .nfa_size_limit(Some(nfa_bytes));
     let mut compiler = regex_automata::nfa::thompson::Compiler::new();
     compiler.configure(nfa_config);
     let nfa = compiler.build_from_hir(hir).ok()?;
@@ -400,7 +415,7 @@ fn reserve_vec<T>(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity();
-    values.try_reserve_exact(additional).ok()?;
+    values.try_reserve(additional).ok()?;
     add_capacity_bytes(
         scratch_bytes,
         values.capacity().checked_sub(before)?,
@@ -416,7 +431,7 @@ fn reserve_bits(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity().div_ceil(8);
-    values.try_reserve_exact(additional).ok()?;
+    values.try_reserve(additional).ok()?;
     let after = values.capacity().div_ceil(8);
     add_capacity_bytes(scratch_bytes, after.checked_sub(before)?, 1, scratch_limit)
 }
@@ -428,7 +443,7 @@ fn reserve_queue<T>(
     scratch_limit: usize,
 ) -> Option<()> {
     let before = values.capacity();
-    values.try_reserve_exact(additional).ok()?;
+    values.try_reserve(additional).ok()?;
     add_capacity_bytes(
         scratch_bytes,
         values.capacity().checked_sub(before)?,
@@ -939,6 +954,44 @@ mod tests {
     }
 
     #[test]
+    fn oversized_minimum_skips_proof_construction() {
+        let hir = parse_pattern("a{4294967295,}").unwrap();
+        assert!(hir.properties().minimum_len().unwrap() > crate::CANDIDATE_BLOCK_BYTES);
+        assert!(!is_proof_eligible(&hir));
+        assert_eq!(
+            get_bound_shape(&analyze_patterns(&[hir]).pop().unwrap()),
+            BoundShape {
+                exact_bytes: None,
+                witness: None,
+                fallback: FallbackExtent::Lines,
+            }
+        );
+    }
+
+    #[test]
+    fn proof_dfa_honors_nfa_limit() {
+        let hir = parse_pattern("[A-Z]{20,}").unwrap();
+        assert!(build_proof_dfa_with_nfa_limit(&hir, ProofDirection::Forward, 1).is_none());
+        assert!(build_proof_dfa(&hir, ProofDirection::Forward).is_some());
+    }
+
+    #[test]
+    fn proof_dfa_honors_production_limits() {
+        let control = parse_pattern(r"[01]*1[01]{15}1[01]*").unwrap();
+        let limited = parse_pattern(r"[01]*1[01]{16}1[01]*").unwrap();
+        for direction in [ProofDirection::Forward, ProofDirection::Reverse] {
+            assert!(
+                build_proof_dfa(&control, direction).is_some(),
+                "{direction:?}"
+            );
+            assert!(
+                build_proof_dfa(&limited, direction).is_none(),
+                "{direction:?}"
+            );
+        }
+    }
+
+    #[test]
     fn proof_witness_returns_concrete_absolute_slice() {
         let forward_hir = parse_pattern("[A-Z0-9]{20,}").unwrap();
         let forward_bound = analyze_patterns(std::slice::from_ref(&forward_hir))
@@ -1019,12 +1072,69 @@ mod tests {
 
     #[test]
     fn proof_graph_honors_scratch_limit() {
-        let hir = parse_pattern("[A-Z]{20,}").unwrap();
-        let dfa = build_proof_dfa(&hir, ProofDirection::Forward).unwrap();
-        assert!(build_proof_graph_with_limit(&dfa, ProofDirection::Forward, 1).is_none());
+        let trivial_hir = parse_pattern("a*").unwrap();
+        let trivial = build_proof_dfa(&trivial_hir, ProofDirection::Forward).unwrap();
+        let growing_hir = parse_pattern("[A-Z]{20,}").unwrap();
+        let growing = build_proof_dfa(&growing_hir, ProofDirection::Forward).unwrap();
+        let traversal_limit = (1..=4_096)
+            .find(|&limit| {
+                build_proof_graph_with_limit(&trivial, ProofDirection::Forward, limit).is_some()
+                    && build_proof_graph_with_limit(&growing, ProofDirection::Forward, limit)
+                        .is_none()
+            })
+            .unwrap();
         assert!(
-            build_proof_graph_with_limit(&dfa, ProofDirection::Forward, PROOF_SCRATCH_BYTES)
+            build_proof_graph_with_limit(&trivial, ProofDirection::Forward, traversal_limit)
                 .is_some()
         );
+        assert!(
+            build_proof_graph_with_limit(&growing, ProofDirection::Forward, traversal_limit)
+                .is_none()
+        );
+        assert!(build_proof_graph_with_limit(
+            &growing,
+            ProofDirection::Forward,
+            PROOF_SCRATCH_BYTES
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn scratch_reservations_are_geometric_and_accounted() {
+        let mut values = Vec::new();
+        let mut value_bytes = 0;
+        let mut value_growths = 0;
+        for value in 0..4_096usize {
+            let before = values.capacity();
+            reserve_vec(&mut values, 1, &mut value_bytes, usize::MAX).unwrap();
+            value_growths += usize::from(values.capacity() != before);
+            values.push(value);
+        }
+        assert!(value_growths < 64, "{value_growths}");
+        assert_eq!(value_bytes, values.capacity() * size_of::<usize>());
+
+        let mut bits = Vec::new();
+        let mut bit_bytes = 0;
+        let mut bit_growths = 0;
+        for value in 0..4_096 {
+            let before = bits.capacity();
+            reserve_bits(&mut bits, 1, &mut bit_bytes, usize::MAX).unwrap();
+            bit_growths += usize::from(bits.capacity() != before);
+            bits.push(value % 2 == 0);
+        }
+        assert!(bit_growths < 64, "{bit_growths}");
+        assert_eq!(bit_bytes, bits.capacity().div_ceil(8));
+
+        let mut queue = std::collections::VecDeque::new();
+        let mut queue_bytes = 0;
+        let mut queue_growths = 0;
+        for value in 0..4_096usize {
+            let before = queue.capacity();
+            reserve_queue(&mut queue, 1, &mut queue_bytes, usize::MAX).unwrap();
+            queue_growths += usize::from(queue.capacity() != before);
+            queue.push_back(value);
+        }
+        assert!(queue_growths < 64, "{queue_growths}");
+        assert_eq!(queue_bytes, queue.capacity() * size_of::<usize>());
     }
 }
