@@ -44,7 +44,7 @@ On the pinned 84-object app-log corpus and the fixed mixed-pattern set:
 - full agent run after the index exists: at most 120 seconds;
 - result counts equal the whole-document oracle for every individual pattern and their union.
 
-The benchmark inventory and oracle hashes live in benchmark notes, not production code. The current inventory SHA-256 is `9c5ed518fc369cc3d6f036103f59066c2646c5fa1a123d1110682fbe61113ff2`; the current oracle SHA-256 is `fe2856ca483a19192007414e36d11323a353e64ff74bde95d7b1abe14a3dcdd2`.
+The benchmark inventory and oracle hashes live in benchmark notes, not production code. The current inventory SHA-256 is `9c5ed518fc369cc3d6f036103f59066c2646c5fa1a123d1110682fbe61113ff2`; the current canonical per-pattern-plus-union count SHA-256 is `fe9cd7d99f2a6a6757975d8e6a30bc77a163bde495274a6ab65ffe81b41a1a54`.
 
 ## Non-Goals
 
