@@ -85,10 +85,11 @@ pub fn grep_matches(
         {
             let matched = finder.next().expect("peeked");
             debug_assert!(matched.start >= pos);
-            debug_assert!(matched.end <= content_end);
+            // A match may cross the newline (unsanitized library patterns):
+            // clamp its end to this line's content per the SubMatch contract.
             subs.push(SubMatch {
                 start: matched.start - pos,
-                end: matched.end - pos,
+                end: matched.end.min(content_end).max(matched.start) - pos,
             });
         }
         if !subs.is_empty() && !done {

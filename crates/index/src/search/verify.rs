@@ -452,14 +452,18 @@ pub(super) fn build_windows(
                     std::slice::from_ref(&seed),
                     RegionRead::Bytes,
                 )?;
-                let FetchedDocument::Regions { regions, .. } = fetched else {
-                    anyhow::bail!("candidate region fetch returned no document");
-                };
-                let region = regions
-                    .into_iter()
-                    .next()
-                    .context("candidate region fetch returned no document")?;
-                (region.bytes, region.start)
+                match fetched {
+                    // Region planning may decline (e.g. the seed covers most
+                    // of the document) and hand back the whole body instead.
+                    FetchedDocument::Whole(body) => (body.into_bytes()?, 0u64),
+                    FetchedDocument::Regions { regions, .. } => {
+                        let region = regions
+                            .into_iter()
+                            .next()
+                            .context("candidate region fetch returned no document")?;
+                        (region.bytes, region.start)
+                    }
+                }
             }
         };
         let source_end = source_offset
