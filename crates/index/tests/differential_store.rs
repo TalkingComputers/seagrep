@@ -323,6 +323,32 @@ fn regional_verification_matches_whole_document_scanning() -> anyhow::Result<()>
 }
 
 #[test]
+fn whole_document_max_count_carries_submatches_into_after_context() -> anyhow::Result<()> {
+    let body = b"hit\nhit\nrest\n".to_vec();
+    let store_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    let reader = open_indexed(
+        store_dir.path(),
+        cache_dir.path(),
+        vec!["small.log".into()],
+        vec![body.clone()],
+    )?;
+    let options = MatchOptions {
+        after_context: 1,
+        max_count: Some(1),
+        ..Default::default()
+    };
+    let hir = parse_pattern("hit")?;
+    let program = PatternProgram::compile(std::slice::from_ref(&hir), &[0])?;
+    let expected = grep_doc(&body, &program, options);
+    let sink = EventSink::default();
+    let stats = search_streaming(&reader, "hit", KeyScope::default(), options, &sink)?;
+    assert_eq!(stats.whole_docs, 1);
+    assert_eq!(sink.events.into_inner().unwrap(), expected);
+    Ok(())
+}
+
+#[test]
 fn candidate_fetches_union_across_documents() -> anyhow::Result<()> {
     const DOCUMENTS: usize = 8;
     const BLOCK: usize = CANDIDATE_BLOCK_BYTES;

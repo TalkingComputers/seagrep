@@ -565,13 +565,14 @@ pub(super) fn verify_document(
                 }
             }
             let bytes = body.into_bytes()?;
-            let matches = find_whole_matches(
-                &bytes,
-                context.plans,
-                context.programs,
-                cache,
-                context.options.max_count,
-            );
+            // FullLines defers the cap to grep_matches so matches past it
+            // still carry submatches onto drained after-context lines.
+            let max_count = match context.detail {
+                SearchDetail::FullLines => None,
+                _ => context.options.max_count,
+            };
+            let matches =
+                find_whole_matches(&bytes, context.plans, context.programs, cache, max_count);
             if matches.is_empty() {
                 return Ok(None);
             }
