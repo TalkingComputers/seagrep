@@ -106,9 +106,10 @@ seagrep 'req-[0-9a-f]+' s3://my-log-bucket --json | jq .
 ```
 
 Repeated `-e` patterns are planned together: one invocation runs every
-pattern through a single segment, posting, and snapshot pass, so sweeping
-for several variants costs about as much as the narrowest one. Default and
-`--json` output always print the exact complete matching lines. For giant
+pattern through a shared segment, posting, and snapshot pass. This removes
+duplicated setup and I/O, though candidate and verification cost still grows
+with the union of the patterns. Default and `--json` output always print the
+exact complete matching lines. For giant
 structured rows (a multi-megabyte JSON line would flood the terminal),
 `--match-window BYTES` is the explicit bounded alternative: it prints at
 most BYTES of content centered on the first confirmed match per matching

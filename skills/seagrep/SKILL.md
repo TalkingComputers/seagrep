@@ -86,10 +86,10 @@ micro-step one query per call:
 
 - **Sweep once, one command**: pass every variant as its own `-e` pattern
   in a single invocation — the engine plans all the patterns together and
-  shares the index, posting, and snapshot work across them, so one
-  multi-pattern query costs about as much as the narrowest single one.
-  Results are exhaustive; a second phrasing of the same idea returns
-  nothing new.
+  shares index, posting, and snapshot work across them. Candidate and
+  verification cost still grows with the union of the supplied patterns.
+  Results are exhaustive for that exact pattern set; different literals or
+  regexes can find additional matches.
 - **Take more per query**: a generous `-m` with `-C1` context usually
   answers the follow-up you were about to ask.
 

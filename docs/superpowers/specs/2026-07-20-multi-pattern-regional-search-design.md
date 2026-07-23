@@ -77,14 +77,14 @@ Official APIs:
 
 ### Do not adopt the alternatives
 
-| Library | Decision | Reason |
-| --- | --- | --- |
-| `grep-searcher` 0.1.17 | Reject | It owns a contiguous reader starting at byte zero, has no regional base-offset API, and its memory lower bound remains the longest line. |
-| `grep-printer` 0.3.1 | Reject | `only_matching` reshapes already-buffered line output; it does not prevent the giant line fetch. Its preview is line-prefix based, not match-centered. |
-| `grep-regex` 0.1.14 | Reject | `build_many` joins alternatives and does not expose per-pattern HIR, identity, proof spans, or regional planning. |
-| `regex-cursor` 0.1.5 | Reject | Its docs call it a prototype, it requires backtracking into retained chunks, and its cursor transitions cannot propagate an S3 fetch error. |
-| `aho-corasick` 1.1.4 | No direct dependency | It is excellent for literal sets, but `regex-automata` already uses literal prefilters and Seagrep's index is the first-stage prefilter. It cannot verify general regexes. |
-| VectorScan/Hyperscan | Reject | Native build complexity and different regex, greediness, ordering, and start-of-match semantics make it unsuitable as the correctness engine. |
+| Library                | Decision             | Reason                                                                                                                                                                     |
+| ---------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `grep-searcher` 0.1.17 | Reject               | It owns a contiguous reader starting at byte zero, has no regional base-offset API, and its memory lower bound remains the longest line.                                   |
+| `grep-printer` 0.3.1   | Reject               | `only_matching` reshapes already-buffered line output; it does not prevent the giant line fetch. Its preview is line-prefix based, not match-centered.                     |
+| `grep-regex` 0.1.14    | Reject               | `build_many` joins alternatives and does not expose per-pattern HIR, identity, proof spans, or regional planning.                                                          |
+| `regex-cursor` 0.1.5   | Reject               | Its docs call it a prototype, it requires backtracking into retained chunks, and its cursor transitions cannot propagate an S3 fetch error.                                |
+| `aho-corasick` 1.1.4   | No direct dependency | It is excellent for literal sets, but `regex-automata` already uses literal prefilters and Seagrep's index is the first-stage prefilter. It cannot verify general regexes. |
+| VectorScan/Hyperscan   | Reject               | Native build complexity and different regex, greediness, ordering, and start-of-match semantics make it unsuitable as the correctness engine.                              |
 
 ## Pattern Model
 
@@ -139,13 +139,13 @@ pub enum FallbackExtent {
 
 The selected regional span depends on the requested result:
 
-| Result | Regional span |
-| --- | --- |
-| document existence, `-q`, `-l` | `witness` |
-| matching-line count, `-c` | `witness` |
-| explicit match window | `witness` |
-| default or JSON full lines | `witness`, followed by exact lazy line fetch and re-verification |
-| exact match count | `exact_bytes`; otherwise whole-line or whole-document path |
+| Result                         | Regional span                                                    |
+| ------------------------------ | ---------------------------------------------------------------- |
+| document existence, `-q`, `-l` | `witness`                                                        |
+| matching-line count, `-c`      | `witness`                                                        |
+| explicit match window          | `witness`                                                        |
+| default or JSON full lines     | `witness`, followed by exact lazy line fetch and re-verification |
+| exact match count              | `exact_bytes`; otherwise whole-line or whole-document path       |
 
 The planner maps a selected finite bound to `SearchExtent::Bytes`. When the required bound is absent, it uses that pattern's `FallbackExtent`; a `Query::All` selection becomes `SearchExtent::Document`. Exact fallback applies only to that pattern and does not poison other patterns.
 
@@ -169,13 +169,13 @@ For an unbounded, non-empty HIR without look assertions or newline matches:
 
 Examples:
 
-| Pattern | Proof |
-| --- | --- |
-| `[A-Z0-9]{20,}` | forward, 20 bytes |
-| `foo.*` | forward, 3 bytes |
-| `.*token` | reverse, 5 bytes |
-| `foo.*bar` | none |
-| `foo|bar.*baz` | none because one accepting branch has an unbounded pre-accept cycle |
+| Pattern                        | Proof                                                               |
+| ------------------------------ | ------------------------------------------------------------------- |
+| `[A-Z0-9]{20,}`                | forward, 20 bytes                                                   |
+| `foo.*`                        | forward, 3 bytes                                                    |
+| `.*token`                      | reverse, 5 bytes                                                    |
+| `foo.*bar`                     | none                                                                |
+| <code>foo&#124;bar.*baz</code> | none because one accepting branch has an unbounded pre-accept cycle |
 
 The graph visits one representative byte from each DFA byte class and retains only unique state edges. After analysis, convert the chosen dense DFA to a sparse DFA and retain it with the proof; drop the construction graph and the other direction. The proof compiler is an optimization only. A look assertion, empty match, quit state, DFA build limit, graph limit, or proof larger than one candidate block produces `None` and records the fallback in search stats. The meta verifier still compiles normally, so proof resource limits cannot reject a valid user regex.
 
