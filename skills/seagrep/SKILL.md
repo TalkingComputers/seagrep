@@ -44,7 +44,7 @@ For a bucket-wide API key or token screen, copy this first-pass command
 exactly and replace only the bucket:
 
 ```sh
-seagrep --region us-east-2 \
+seagrep \
   -e 'sk-ant-[A-Za-z0-9_-]{24,}' \
   -e 'AKIA[A-Z0-9]{16}' \
   -e 'ASIA[A-Z0-9]{16}' \
