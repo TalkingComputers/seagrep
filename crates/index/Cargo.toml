@@ -28,7 +28,7 @@ rapidhash.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 memmap2.workspace = true
-zstd = "0.13.3"
+zstd = "0.14.0"
 getrandom = "0.4"
 
 [dev-dependencies]
